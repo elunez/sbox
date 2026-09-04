@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.4"
+readonly SCRIPT_VERSION="0.0.5"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -3442,11 +3442,621 @@ add_node_flow() {
   pause_prompt
 }
 
-edit_node_flow() {
-  local nodes index old node old_port new_port
+format_node_outbound_summary() {
+  local node=$1
+  local o_type o_server o_port
+  o_type=$(jq -r '.outbound.type // "direct"' <<<"$node")
+  o_server=$(jq -r '.outbound.server // empty' <<<"$node")
+  o_port=$(jq -r '.outbound.port // empty' <<<"$node")
+  case "$o_type" in
+    direct) echo "直连 (Direct)" ;;
+    warp) echo "本地 WARP 出口" ;;
+    socks5|socks) echo "SOCKS5 代理 (${o_server}:${o_port})" ;;
+    http)
+      local is_tls
+      is_tls=$(jq -r '.outbound.tls.enabled // false' <<<"$node")
+      if [[ "$is_tls" == "true" ]]; then
+        echo "HTTPS 代理 (${o_server}:${o_port})"
+      else
+        echo "HTTP 代理 (${o_server}:${o_port})"
+      fi
+      ;;
+    shadowsocks) echo "Shadowsocks 代理 (${o_server}:${o_port})" ;;
+    anytls) echo "AnyTLS 代理 (${o_server}:${o_port})" ;;
+    trojan) echo "Trojan 代理 (${o_server}:${o_port})" ;;
+    hysteria2) echo "Hysteria2 代理 (${o_server}:${o_port})" ;;
+    vless-reality) echo "VLESS+REALITY 代理 (${o_server}:${o_port})" ;;
+    *) echo "${o_type}" ;;
+  esac
+}
+
+format_node_credential_summary() {
+  local node=$1 proto
+  proto=$(jq -r '.protocol // "anytls"' <<<"$node")
+  case "$proto" in
+    anytls|trojan|hysteria2)
+      local pw
+      pw=$(jq -r '.password // empty' <<<"$node")
+      if [[ -n "$pw" ]]; then
+        if (( ${#pw} > 6 )); then
+          echo "密码 (${pw:0:2}******${pw: -2})"
+        else
+          echo "密码 (******)"
+        fi
+      else
+        echo "未设置"
+      fi
+      ;;
+    shadowsocks)
+      local m
+      m=$(jq -r '.method // empty' <<<"$node")
+      echo "加密: ${m}, 密码: 已设置"
+      ;;
+    vless-reality)
+      local u s
+      u=$(jq -r '.uuid // empty' <<<"$node")
+      s=$(jq -r '.reality.handshake_server // "www.microsoft.com"' <<<"$node")
+      echo "UUID: ${u:0:8}..., 伪装: ${s}"
+      ;;
+    socks5)
+      local u
+      u=$(jq -r '.username // empty' <<<"$node")
+      if [[ -n "$u" ]]; then
+        echo "用户: ${u}, 密码: 已设置"
+      else
+        echo "免密认证"
+      fi
+      ;;
+    http)
+      local u is_tls
+      u=$(jq -r '.username // empty' <<<"$node")
+      is_tls=$(jq -r '.tls // false' <<<"$node")
+      local mode_str="明文"
+      [[ "$is_tls" == "true" ]] && mode_str="TLS加密"
+      if [[ -n "$u" ]]; then
+        echo "模式: ${mode_str}, 用户: ${u}, 密码: 已设置"
+      else
+        echo "模式: ${mode_str}, 免密认证"
+      fi
+      ;;
+    *) echo "已配置" ;;
+  esac
+}
+
+format_node_traffic_summary() {
+  local node=$1
+  local limit day
+  limit=$(jq -r '.traffic.monthly_limit // "unlimited"' <<<"$node")
+  day=$(jq -r '.traffic.reset_day // empty' <<<"$node")
+
+  local limit_desc="不限流量"
+  if [[ "$limit" != "unlimited" && "$limit" != "0" ]]; then
+    limit_desc="${limit} (超额阻断)"
+  fi
+
+  local day_desc="无定时重置"
+  [[ -n "$day" && "$day" != "null" ]] && day_desc="每月 ${day} 日重置"
+
+  echo "${limit_desc} / ${day_desc}"
+}
+
+print_node_summary_card() {
+  local node=$1 idx=${2:-1}
+  local name proto port domain cred_str out_str traf_str
+  name=$(jq -r '.name' <<<"$node")
+  proto=$(protocol_label "$(jq -r '.protocol // "anytls"' <<<"$node")")
+  port=$(jq -r '.port' <<<"$node")
+  domain=$(jq -r '.domain // "127.0.0.1"' <<<"$node")
+  cred_str=$(format_node_credential_summary "$node")
+  out_str=$(format_node_outbound_summary "$node")
+  traf_str=$(format_node_traffic_summary "$node")
+
+  echo
+  printf "%s=========================== 正在管理节点 ===========================%s\n" "$C_CYAN" "$C_RESET"
+  printf "  节点序号: [%d]\n" "$idx"
+  printf "  节点名称: %s\n" "$name"
+  printf "  入站协议: %s\n" "$proto"
+  printf "  监听端口: %s\n" "$port"
+  printf "  连接地址: %s\n" "$domain"
+  printf "  认证凭据: %s\n" "$cred_str"
+  printf "  出口分流: %s\n" "$out_str"
+  printf "  流量策略: %s\n" "$traf_str"
+  printf "%s====================================================================%s\n" "$C_CYAN" "$C_RESET"
+}
+
+edit_node_protocol() {
+  local index=$1
+  local nodes old old_proto new_proto old_port new_port name domain
   nodes=$(current_nodes_json)
-  print_node_list "$nodes"
-  index=$(select_node_index "$nodes" "请选择要修改的节点") || return 0
+  old=$(jq -c ".[$index]" <<<"$nodes")
+  name=$(jq -r '.name' <<<"$old")
+  old_proto=$(jq -r '.protocol // "anytls"' <<<"$old")
+  old_port=$(jq -r '.port' <<<"$old")
+  domain=$(jq -r '.domain // empty' <<<"$old")
+  new_proto="$old_proto"
+
+  echo
+  info "修改节点 [${name}] 的入站协议……"
+  choose_protocol new_proto "$old_proto" "请选择新的入站协议" || return 0
+
+  local http_tls="false"
+  if [[ "$new_proto" == "http" ]]; then
+    local http_tls_choice="plain"
+    local default_http_mode="1"
+    if [[ "$(jq -r '.tls // false' <<<"$old")" == "true" ]]; then
+      default_http_mode="2"
+    fi
+    prompt_choice http_tls_choice "HTTP 代理加密模式" "$default_http_mode" \
+      "plain|普通 HTTP 代理 (明文传输)" \
+      "tls|HTTPS 代理 (开启 TLS 证书加密)" || return 0
+    [[ "$http_tls_choice" == "tls" ]] && http_tls="true"
+  fi
+
+  if [[ "$new_proto" == "$old_proto" && "$new_proto" != "http" ]]; then
+    info "协议未发生改变。"
+    return 0
+  fi
+  if [[ "$new_proto" == "$old_proto" && "$new_proto" == "http" && "$http_tls" == "$(jq -r '.tls // false' <<<"$old")" ]]; then
+    info "协议及加密模式未发生改变。"
+    return 0
+  fi
+
+  new_port="$old_port"
+  local default_rec_port
+  case "$new_proto" in
+    anytls|trojan|vless-reality) default_rec_port="443" ;;
+    shadowsocks) default_rec_port="8388" ;;
+    hysteria2) default_rec_port="8443" ;;
+    socks5) default_rec_port="1080" ;;
+    http)
+      if [[ "$http_tls" == "true" ]]; then default_rec_port="8443"; else default_rec_port="8080"; fi
+      ;;
+    *) default_rec_port="443" ;;
+  esac
+
+  local keep_port="Y"
+  read -r -p "是否保留当前监听端口 [${old_port}]？[Y/n，默认: Y]: " keep_port
+  keep_port=${keep_port:-Y}
+  if [[ ! "$keep_port" =~ ^[yY]$ ]]; then
+    new_port="$default_rec_port"
+    prompt_value new_port "请输入监听端口 (Port)" "$new_port"
+    validate_port "$new_port" || { warn "端口无效。"; return 0; }
+  fi
+
+  nodes=$(current_nodes_json)
+  if jq -e --argjson port "$new_port" --argjson index "$index" 'any(to_entries[]; .key != $index and .value.port == $port)' <<<"$nodes" >/dev/null 2>&1; then
+    warn "端口 ${new_port} 已被其他节点占用。"
+    return 0
+  fi
+  if [[ "$new_port" != "$old_port" ]]; then
+    if ! assert_port_available "$new_port"; then
+      return 0
+    fi
+  fi
+
+  local new_domain="$domain"
+  if node_requires_certificate "$new_proto" "$http_tls"; then
+    if ! validate_domain "$new_domain" >/dev/null 2>&1; then
+      prompt_value new_domain "新协议 [$(protocol_label "$new_proto")] 需要 SSL 证书，请输入已解析到本机的有效域名" ""
+      validate_domain "$new_domain" || { warn "域名格式无效，已放弃协议修改。"; return 0; }
+    fi
+  fi
+
+  PROTOCOL="$new_proto"
+  HTTP_TLS="$http_tls"
+  local new_pw="" new_user="" new_ss_method="" new_uuid="" new_priv="" new_pub="" new_sid="" new_hs_server="" new_hs_port=443
+  case "$new_proto" in
+    anytls|trojan|hysteria2)
+      new_pw=$(jq -r '.password // empty' <<<"$old")
+      new_pw=${new_pw:-$(random_password)}
+      prompt_secret new_pw "$(protocol_label "$new_proto") 认证密码" "$new_pw"
+      [[ -n "$new_pw" ]] || { warn "密码不能为空。"; return 0; }
+      ;;
+    shadowsocks)
+      SS_METHOD=$(jq -r '.method // "2022-blake3-aes-128-gcm"' <<<"$old")
+      choose_ss_method || return 0
+      new_ss_method="$SS_METHOD"
+      new_pw=$(jq -r '.password // empty' <<<"$old")
+      new_pw=${new_pw:-$(generate_ss_password "$new_ss_method")}
+      prompt_secret new_pw "Shadowsocks 密码/密钥" "$new_pw"
+      validate_ss_password "$new_ss_method" "$new_pw" || { warn "Shadowsocks 密码格式不匹配。"; return 0; }
+      ;;
+    vless-reality)
+      NODE_UUID=$(jq -r '.uuid // empty' <<<"$old")
+      REALITY_PRIVATE_KEY=$(jq -r '.reality.private_key // empty' <<<"$old")
+      REALITY_PUBLIC_KEY=$(jq -r '.reality.public_key // empty' <<<"$old")
+      REALITY_SHORT_ID=$(jq -r '.reality.short_id // empty' <<<"$old")
+      REALITY_HANDSHAKE_SERVER=$(jq -r '.reality.handshake_server // "www.microsoft.com"' <<<"$old")
+      REALITY_HANDSHAKE_PORT=$(jq -r '.reality.handshake_port // 443' <<<"$old")
+      collect_reality_settings "$old" || return 0
+      new_uuid="$NODE_UUID"
+      new_priv="$REALITY_PRIVATE_KEY"
+      new_pub="$REALITY_PUBLIC_KEY"
+      new_sid="$REALITY_SHORT_ID"
+      new_hs_server="$REALITY_HANDSHAKE_SERVER"
+      new_hs_port="$REALITY_HANDSHAKE_PORT"
+      ;;
+    socks5)
+      new_user=$(jq -r '.username // empty' <<<"$old")
+      new_pw=$(jq -r '.password // empty' <<<"$old")
+      prompt_value new_user "SOCKS5 认证用户名 (可选，留空表示免密认证)" "$new_user"
+      if [[ -n "$new_user" ]]; then
+        new_pw=${new_pw:-$(random_password)}
+        prompt_secret new_pw "SOCKS5 认证密码" "$new_pw"
+        [[ -n "$new_pw" ]] || { warn "配置了认证用户名时，认证密码不能为空。"; return 0; }
+      else
+        new_pw=""
+      fi
+      ;;
+    http)
+      new_user=$(jq -r '.username // empty' <<<"$old")
+      new_pw=$(jq -r '.password // empty' <<<"$old")
+      local p_tag="HTTP"
+      [[ "$http_tls" == "true" ]] && p_tag="HTTPS"
+      prompt_value new_user "${p_tag} 代理认证用户名 (可选，留空表示免密认证)" "$new_user"
+      if [[ -n "$new_user" ]]; then
+        new_pw=${new_pw:-$(random_password)}
+        prompt_secret new_pw "${p_tag} 代理认证密码" "$new_pw"
+        [[ -n "$new_pw" ]] || { warn "配置了认证用户名时，认证密码不能为空。"; return 0; }
+      else
+        new_pw=""
+      fi
+      ;;
+  esac
+
+  local traffic outbound new_node
+  traffic=$(jq -c '.traffic' <<<"$old")
+  outbound=$(jq -c '.outbound' <<<"$old")
+
+  case "$new_proto" in
+    vless-reality)
+      new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
+        --arg uuid "$new_uuid" --arg private_key "$new_priv" --arg public_key "$new_pub" \
+        --arg short_id "$new_sid" --arg handshake_server "$new_hs_server" --argjson handshake_port "$new_hs_port" \
+        --argjson traffic "$traffic" --argjson outbound "$outbound" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,uuid:$uuid,reality:{private_key:$private_key,public_key:$public_key,short_id:$short_id,handshake_server:$handshake_server,handshake_port:$handshake_port},traffic:$traffic,outbound:$outbound}')
+      ;;
+    shadowsocks)
+      new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
+        --arg method "$new_ss_method" --arg password "$new_pw" --argjson traffic "$traffic" --argjson outbound "$outbound" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,method:$method,password:$password,traffic:$traffic,outbound:$outbound}')
+      ;;
+    socks5)
+      new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
+        --arg username "$new_user" --arg password "$new_pw" \
+        --argjson traffic "$traffic" --argjson outbound "$outbound" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,username:$username,password:$password,traffic:$traffic,outbound:$outbound}')
+      ;;
+    http)
+      new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
+        --arg username "$new_user" --arg password "$new_pw" --argjson tls "$http_tls" \
+        --argjson traffic "$traffic" --argjson outbound "$outbound" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,username:$username,password:$password,tls:$tls,traffic:$traffic,outbound:$outbound}')
+      ;;
+    *)
+      new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
+        --arg password "$new_pw" --argjson traffic "$traffic" --argjson outbound "$outbound" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,password:$password,traffic:$traffic,outbound:$outbound}')
+      ;;
+  esac
+
+  if ! ensure_node_certificate "$new_node"; then
+    warn "已取消证书配置，放弃协议修改。"
+    return 0
+  fi
+
+  if [[ "$old_port" != "$new_port" ]]; then
+    traffic_remove_port "$old_port"
+    firewall_remove_port "$old_port" "$(case "$old_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
+  elif [[ "$old_proto" != "$new_proto" ]]; then
+    firewall_remove_port "$old_port" "$(case "$old_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
+  fi
+
+  nodes=$(current_nodes_json)
+  save_nodes_json "$(jq -c --argjson index "$index" --argjson node "$new_node" '.[$index] = $node' <<<"$nodes")"
+  ok "节点 [${name}] 入站协议已成功修改为 [$(protocol_label "$new_proto")]！"
+}
+
+edit_node_outbound() {
+  local index=$1
+  local nodes old name outbound
+  nodes=$(current_nodes_json)
+  old=$(jq -c ".[$index]" <<<"$nodes")
+  name=$(jq -r '.name' <<<"$old")
+  echo
+  info "修改节点 [${name}] 的出口分流……"
+  OUTBOUND=""
+  if ! collect_outbound_settings "$old" outbound; then
+    warn "已取消修改出口分流。"
+    return 0
+  fi
+  nodes=$(current_nodes_json)
+  save_nodes_json "$(jq -c --argjson index "$index" --argjson outbound "$outbound" '.[$index].outbound = $outbound' <<<"$nodes")"
+  ok "节点 [${name}] 出口分流已成功更新！"
+}
+
+edit_node_port() {
+  local index=$1
+  local nodes old old_port new_port old_proto name
+  nodes=$(current_nodes_json)
+  old=$(jq -c ".[$index]" <<<"$nodes")
+  name=$(jq -r '.name' <<<"$old")
+  old_port=$(jq -r '.port' <<<"$old")
+  old_proto=$(jq -r '.protocol // "anytls"' <<<"$old")
+  new_port="$old_port"
+  echo
+  info "修改节点 [${name}] 监听端口……"
+  prompt_value new_port "请输入监听端口 (Port)" "$old_port"
+  validate_port "$new_port" || { warn "监听端口无效。"; return 0; }
+  if [[ "$new_port" == "$old_port" ]]; then
+    info "端口未发生改变。"
+    return 0
+  fi
+  nodes=$(current_nodes_json)
+  if jq -e --argjson port "$new_port" --argjson index "$index" 'any(to_entries[]; .key != $index and .value.port == $port)' <<<"$nodes" >/dev/null 2>&1; then
+    warn "端口 ${new_port} 已被其他节点占用。"
+    return 0
+  fi
+  if ! assert_port_available "$new_port"; then
+    return 0
+  fi
+  traffic_remove_port "$old_port"
+  firewall_remove_port "$old_port" "$(case "$old_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
+  nodes=$(current_nodes_json)
+  save_nodes_json "$(jq -c --argjson index "$index" --argjson port "$new_port" '.[$index].port = $port' <<<"$nodes")"
+  ok "节点 [${name}] 监听端口已成功修改为: ${new_port}！"
+}
+
+edit_node_credentials() {
+  local index=$1
+  local nodes old proto name new_node
+  nodes=$(current_nodes_json)
+  old=$(jq -c ".[$index]" <<<"$nodes")
+  name=$(jq -r '.name' <<<"$old")
+  proto=$(jq -r '.protocol // "anytls"' <<<"$old")
+  echo
+  info "修改节点 [${name}] 认证凭据 (当前协议: $(protocol_label "$proto"))……"
+
+  case "$proto" in
+    anytls|trojan|hysteria2)
+      local old_pw new_pw
+      old_pw=$(jq -r '.password // empty' <<<"$old")
+      new_pw="$old_pw"
+      printf "%s提示：%s直接输入新密码；直接回车保持原密码；输入 [rand] 自动生成16位随机密码。\n" "$C_CYAN" "$C_RESET"
+      prompt_value new_pw "$(protocol_label "$proto") 认证密码" "$old_pw"
+      if [[ "$new_pw" == "rand" ]]; then
+        new_pw=$(random_password)
+        ok "已自动生成新密码: ${new_pw}"
+        read -r -p "请妥善记录上述密码，按回车键继续保存..." _
+      fi
+      [[ -n "$new_pw" ]] || { warn "密码不能为空。"; return 0; }
+      new_node=$(jq -c --arg pw "$new_pw" '.password = $pw' <<<"$old")
+      ;;
+    shadowsocks)
+      local old_m old_pw new_m new_pw ss_sub_choice="1"
+      old_m=$(jq -r '.method // "2022-blake3-aes-128-gcm"' <<<"$old")
+      old_pw=$(jq -r '.password // empty' <<<"$old")
+      echo
+      printf "%s=== Shadowsocks 凭据修改 ===%s\n" "$C_CYAN" "$C_RESET"
+      printf "  1) 修改连接密码 / 密钥\n"
+      printf "  2) 修改加密方法 (Method) 与密码\n"
+      printf "  0) 取消返回\n"
+      prompt_value ss_sub_choice "请选择 [0-2，默认: 1]" "1"
+      case "$ss_sub_choice" in
+        1)
+          new_pw="$old_pw"
+          printf "%s提示：%s输入 [rand] 可自动生成适配算法 [${old_m}] 的合规密码/密钥。\n" "$C_CYAN" "$C_RESET"
+          prompt_value new_pw "Shadowsocks 密码/密钥" "$old_pw"
+          if [[ "$new_pw" == "rand" ]]; then
+            new_pw=$(generate_ss_password "$old_m")
+            ok "已自动生成新密钥: ${new_pw}"
+            read -r -p "请妥善记录上述密钥，按回车键继续保存..." _
+          fi
+          validate_ss_password "$old_m" "$new_pw" || { warn "Shadowsocks 密码格式不匹配。"; return 0; }
+          new_node=$(jq -c --arg p "$new_pw" '.password = $p' <<<"$old")
+          ;;
+        2)
+          SS_METHOD="$old_m"
+          choose_ss_method || return 0
+          new_m="$SS_METHOD"
+          new_pw=$(generate_ss_password "$new_m")
+          printf "%s提示：%s输入 [rand] 可自动生成适配算法 [${new_m}] 的合规密码/密钥。\n" "$C_CYAN" "$C_RESET"
+          prompt_value new_pw "Shadowsocks 密码/密钥" "$new_pw"
+          if [[ "$new_pw" == "rand" ]]; then
+            new_pw=$(generate_ss_password "$new_m")
+            ok "已自动生成新密钥: ${new_pw}"
+            read -r -p "请妥善记录上述密钥，按回车键继续保存..." _
+          fi
+          validate_ss_password "$new_m" "$new_pw" || { warn "Shadowsocks 密码格式不匹配。"; return 0; }
+          new_node=$(jq -c --arg m "$new_m" --arg p "$new_pw" '.method = $m | .password = $p' <<<"$old")
+          ;;
+        0|"") return 0 ;;
+        *) warn "无效选择。"; return 0 ;;
+      esac
+      ;;
+    vless-reality)
+      local cur_uuid cur_priv cur_pub cur_sid cur_server cur_port r_sub_choice="1"
+      cur_uuid=$(jq -r '.uuid // empty' <<<"$old")
+      cur_priv=$(jq -r '.reality.private_key // empty' <<<"$old")
+      cur_pub=$(jq -r '.reality.public_key // empty' <<<"$old")
+      cur_sid=$(jq -r '.reality.short_id // empty' <<<"$old")
+      cur_server=$(jq -r '.reality.handshake_server // "www.microsoft.com"' <<<"$old")
+      cur_port=$(jq -r '.reality.handshake_port // 443' <<<"$old")
+      echo
+      printf "%s=== VLESS + REALITY 凭据修改 ===%s\n" "$C_CYAN" "$C_RESET"
+      printf "  1) 修改 / 重新生成 UUID\n"
+      printf "  2) 重新生成 REALITY 密钥对与 Short ID\n"
+      printf "  3) 修改 REALITY 握手伪装域名及端口\n"
+      printf "  4) 自定义全部 REALITY 参数\n"
+      printf "  0) 取消返回\n"
+      prompt_value r_sub_choice "请选择 [0-4，默认: 1]" "1"
+      case "$r_sub_choice" in
+        1)
+          local new_u=""
+          printf "%s提示：%s直接按回车可自动生成全新随机 UUID，或手动输入。\n" "$C_CYAN" "$C_RESET"
+          prompt_value new_u "VLESS UUID (回车自动随机生成)" "$(generate_uuid)"
+          validate_uuid "$new_u" || { warn "UUID 格式无效。"; return 0; }
+          new_node=$(jq -c --arg u "$new_u" '.uuid = $u' <<<"$old")
+          ;;
+        2)
+          local kp priv pub sid
+          kp=$(generate_reality_keypair)
+          priv=$(echo "$kp" | awk '{print $1}')
+          pub=$(echo "$kp" | awk '{print $2}')
+          sid=$(openssl rand -hex 8)
+          new_node=$(jq -c --arg priv "$priv" --arg pub "$pub" --arg sid "$sid" \
+            '.reality.private_key = $priv | .reality.public_key = $pub | .reality.short_id = $sid' <<<"$old")
+          ok "已成功重新生成 REALITY 密钥对与 Short ID！"
+          info "新公钥 (Public Key): ${pub}"
+          info "新私钥 (Private Key): ${priv}"
+          info "新 Short ID: ${sid}"
+          read -r -p "请妥善记录上述公私钥及 Short ID，按回车键继续保存..." _
+          ;;
+        3)
+          local s="$cur_server" p="$cur_port"
+          prompt_value s "REALITY 握手伪装域名" "$cur_server"
+          prompt_value p "REALITY 握手端口" "$cur_port"
+          validate_host "$s" && validate_port "$p" || { warn "握手域名或端口无效。"; return 0; }
+          new_node=$(jq -c --arg s "$s" --argjson p "$p" \
+            '.reality.handshake_server = $s | .reality.handshake_port = $p' <<<"$old")
+          ;;
+        4)
+          NODE_UUID="$cur_uuid"
+          REALITY_PRIVATE_KEY="$cur_priv"
+          REALITY_PUBLIC_KEY="$cur_pub"
+          REALITY_SHORT_ID="$cur_sid"
+          REALITY_HANDSHAKE_SERVER="$cur_server"
+          REALITY_HANDSHAKE_PORT="$cur_port"
+          collect_reality_settings "$old" || return 0
+          new_node=$(jq -c --arg u "$NODE_UUID" --arg priv "$REALITY_PRIVATE_KEY" --arg pub "$REALITY_PUBLIC_KEY" \
+            --arg sid "$REALITY_SHORT_ID" --arg s "$REALITY_HANDSHAKE_SERVER" --argjson p "$REALITY_HANDSHAKE_PORT" \
+            '.uuid = $u | .reality.private_key = $priv | .reality.public_key = $pub | .reality.short_id = $sid | .reality.handshake_server = $s | .reality.handshake_port = $p' <<<"$old")
+          ;;
+        0|"") return 0 ;;
+        *) warn "无效选择。"; return 0 ;;
+      esac
+      ;;
+    socks5|http)
+      local old_u old_p new_u new_p p_title="SOCKS5"
+      [[ "$proto" == "http" ]] && p_title="HTTP"
+      old_u=$(jq -r '.username // empty' <<<"$old")
+      old_p=$(jq -r '.password // empty' <<<"$old")
+      new_u="$old_u"
+      if [[ -n "$old_u" ]]; then
+        printf "%s提示：%s输入新用户名；直接回车保持 [${old_u}]；输入 [none] 或 [0] 清除凭据切换为免密认证。\n" "$C_CYAN" "$C_RESET"
+        prompt_value new_u "${p_title} 认证用户名" "$old_u"
+        if [[ "$new_u" == "none" || "$new_u" == "0" || "$new_u" == "clear" ]]; then
+          new_u=""
+          new_p=""
+          info "已切换为免密认证模式。"
+        fi
+      else
+        prompt_value new_u "${p_title} 认证用户名 (可选，留空表示免密认证)" ""
+      fi
+      if [[ -n "$new_u" ]]; then
+        new_p="$old_p"
+        prompt_secret new_p "${p_title} 认证密码" "$old_p"
+        [[ -n "$new_p" ]] || { warn "设置了用户名时，认证密码不能为空。"; return 0; }
+      else
+        new_p=""
+      fi
+      new_node=$(jq -c --arg u "$new_u" --arg p "$new_p" '.username = $u | .password = $p' <<<"$old")
+      ;;
+    *)
+      warn "暂不支持修改协议 [${proto}] 的凭据。"
+      return 0
+      ;;
+  esac
+
+  nodes=$(current_nodes_json)
+  save_nodes_json "$(jq -c --argjson index "$index" --argjson node "$new_node" '.[$index] = $node' <<<"$nodes")"
+  ok "节点 [${name}] 认证凭据已成功修改！"
+}
+
+edit_node_name() {
+  local index=$1
+  local nodes old old_name new_name
+  nodes=$(current_nodes_json)
+  old=$(jq -c ".[$index]" <<<"$nodes")
+  old_name=$(jq -r '.name' <<<"$old")
+  new_name="$old_name"
+  echo
+  info "修改节点名称……"
+  prompt_value new_name "请输入新的节点名称" "$old_name"
+  [[ -n "$new_name" ]] || { warn "节点名称不能为空。"; return 0; }
+  if [[ "$new_name" == "$old_name" ]]; then
+    info "节点名称未发生改变。"
+    return 0
+  fi
+  nodes=$(current_nodes_json)
+  if jq -e --arg name "$new_name" --argjson index "$index" 'any(to_entries[]; .key != $index and .value.name == $name)' <<<"$nodes" >/dev/null 2>&1; then
+    warn "节点名称 [${new_name}] 已被其他节点使用，请换一个名称。"
+    return 0
+  fi
+  save_nodes_json "$(jq -c --argjson index "$index" --arg name "$new_name" '.[$index].name = $name' <<<"$nodes")"
+  ok "节点名称已成功修改为: [${new_name}]！"
+}
+
+edit_node_domain() {
+  local index=$1
+  local nodes old name proto tls old_domain new_domain cand_node
+  nodes=$(current_nodes_json)
+  old=$(jq -c ".[$index]" <<<"$nodes")
+  name=$(jq -r '.name' <<<"$old")
+  proto=$(jq -r '.protocol // "anytls"' <<<"$old")
+  tls=$(jq -r '.tls // false' <<<"$old")
+  old_domain=$(jq -r '.domain // empty' <<<"$old")
+  new_domain="$old_domain"
+
+  echo
+  info "修改节点 [${name}] 的连接地址……"
+  if node_requires_certificate "$proto" "$tls"; then
+    prompt_value new_domain "节点连接地址 (域名，需解析到本机公网 IP)" "$old_domain"
+    validate_domain "$new_domain" || { warn "当前协议需要 SSL 证书，请输入有效域名。"; return 0; }
+  else
+    prompt_value new_domain "节点连接地址 (域名或公网 IP)" "$old_domain"
+    validate_host "$new_domain" || { warn "连接地址无效。"; return 0; }
+  fi
+
+  if [[ "$new_domain" == "$old_domain" ]]; then
+    info "连接地址未发生改变。"
+    return 0
+  fi
+
+  cand_node=$(jq -c --arg d "$new_domain" '.domain = $d' <<<"$old")
+  if node_requires_certificate "$proto" "$tls"; then
+    if ! ensure_node_certificate "$cand_node"; then
+      warn "已放弃证书申请，取消修改连接地址。"
+      return 0
+    fi
+  fi
+
+  nodes=$(current_nodes_json)
+  save_nodes_json "$(jq -c --argjson index "$index" --argjson node "$cand_node" '.[$index] = $node' <<<"$nodes")"
+  ok "节点 [${name}] 连接地址已成功修改为: ${new_domain}！"
+}
+
+edit_node_traffic() {
+  local index=$1
+  local nodes old name traffic
+  nodes=$(current_nodes_json)
+  old=$(jq -c ".[$index]" <<<"$nodes")
+  name=$(jq -r '.name' <<<"$old")
+  echo
+  info "修改节点 [${name}] 的流量策略……"
+  if ! collect_traffic_settings "$old" traffic; then
+    warn "已取消修改流量策略。"
+    return 0
+  fi
+  nodes=$(current_nodes_json)
+  save_nodes_json "$(jq -c --argjson index "$index" --argjson traffic "$traffic" '.[$index].traffic = $traffic' <<<"$nodes")"
+  ok "节点 [${name}] 流量策略已更新！"
+}
+
+edit_node_wizard() {
+  local index=$1
+  local nodes old old_port new_port node
+  nodes=$(current_nodes_json)
   old=$(jq -c ".[$index]" <<<"$nodes")
   old_port=$(jq -r '.port' <<<"$old")
   PROTOCOL=$(jq -r '.protocol // "anytls"' <<<"$old")
@@ -3459,13 +4069,15 @@ edit_node_flow() {
   HTTP_TLS=$(jq -r '.tls // false' <<<"$old")
   OUTBOUND=""
   SS_METHOD=""
+
   echo
-  info "修改节点：$(jq -r '.name' <<<"$old")……"
+  info "完整重新配置节点：$(jq -r '.name' <<<"$old")……"
   if ! collect_node_json "$old" node; then
-    warn "已放弃修改节点，返回上级菜单。"
+    warn "已放弃重新配置，返回修改菜单。"
     return 0
   fi
   new_port=$(jq -r '.port' <<<"$node")
+  nodes=$(current_nodes_json)
   if jq -e --argjson port "$new_port" --argjson index "$index" 'any(to_entries[]; .key != $index and .value.port == $port)' <<<"$nodes" >/dev/null 2>&1; then
     warn "端口 ${new_port} 已被其他节点占用。"
     return 0
@@ -3474,16 +4086,74 @@ edit_node_flow() {
     if ! assert_port_available "$new_port"; then
       return 0
     fi
+    local old_proto
+    old_proto=$(jq -r '.protocol // "anytls"' <<<"$old")
     traffic_remove_port "$old_port"
+    firewall_remove_port "$old_port" "$(case "$old_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
   fi
   if ! ensure_node_certificate "$node"; then
-    warn "已放弃证书申请，取消修改节点。"
+    warn "已放弃证书申请，取消重新配置。"
     return 0
   fi
-  save_nodes_json "$(jq -c --argjson index "$index" --argjson node "$node" '.[ $index ] = $node' <<<"$nodes")"
-  ok "节点修改成功！"
-  show_client
-  pause_prompt
+  nodes=$(current_nodes_json)
+  save_nodes_json "$(jq -c --argjson index "$index" --argjson node "$node" '.[$index] = $node' <<<"$nodes")"
+  ok "节点已成功完整重新配置！"
+}
+
+edit_single_node_menu() {
+  local index=$1
+  local choice nodes node
+
+  while true; do
+    nodes=$(current_nodes_json)
+    node=$(jq -c ".[$index]" <<<"$nodes")
+    if [[ -z "$node" || "$node" == "null" ]]; then
+      warn "目标节点不存在或已被删除。"
+      return 0
+    fi
+
+    print_node_summary_card "$node" "$((index + 1))"
+    echo
+    printf "%s=== 节点修改选项 ===%s\n" "$C_CYAN" "$C_RESET"
+    printf "  1) 修改入站协议\n"
+    printf "  2) 修改出口分流\n"
+    printf "  3) 修改监听端口\n"
+    printf "  4) 修改认证凭据\n"
+    printf "  5) 修改节点名称\n"
+    printf "  6) 修改连接地址\n"
+    printf "  7) 修改流量策略\n"
+    printf "  8) 完整重新配置\n"
+    printf "  0) 返回节点列表\n"
+    read -r -p "请输入选择 [0-8，默认: 0]: " choice
+    choice=${choice:-0}
+    case "$choice" in
+      1) edit_node_protocol "$index" ;;
+      2) edit_node_outbound "$index" ;;
+      3) edit_node_port "$index" ;;
+      4) edit_node_credentials "$index" ;;
+      5) edit_node_name "$index" ;;
+      6) edit_node_domain "$index" ;;
+      7) edit_node_traffic "$index" ;;
+      8) edit_node_wizard "$index" ;;
+      0|"") return 0 ;;
+      *)
+        warn "无效选择。"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
+edit_node_flow() {
+  local nodes index
+  nodes=$(current_nodes_json)
+  if (( $(node_count "$nodes") == 0 )); then
+    warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
+    return 0
+  fi
+  print_node_list "$nodes"
+  index=$(select_node_index "$nodes" "请选择要修改的节点") || return 0
+  edit_single_node_menu "$index"
 }
 
 delete_node_flow() {
