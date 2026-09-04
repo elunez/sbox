@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.3"
+readonly SCRIPT_VERSION="0.0.4"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -602,6 +602,10 @@ prompt_choice() {
     if [[ "$choice" == "0" || "$choice" == "$back_index" ]]; then
       return 1
     fi
+    if [[ "$choice" == *"://"* ]]; then
+      printf -v "$target" "%s" "$choice"
+      return 0
+    fi
     if [[ "$choice" =~ ^[0-9]+$ ]]; then
       local c_idx=$((10#$choice))
       if (( c_idx >= 1 && c_idx <= ${#items[@]} )); then
@@ -665,6 +669,294 @@ choose_ss_method() {
     "aes-128-gcm|aes-128-gcm" \
     "chacha20-ietf-poly1305|chacha20-ietf-poly1305"
 }
+
+parse_proxy_link() {
+  local link=$1 target_var=${2:-}
+  link=$(printf "%s" "$link" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  [[ -n "$link" ]] || return 1
+  ensure_python3
+
+  local parsed_json
+  parsed_json=$(python3 - "$link" <<'EOF_PY' 2>&1
+import sys, urllib.parse, base64, json
+
+def decode_b64(s):
+    s = s.strip()
+    missing = len(s) % 4
+    if missing:
+        s += "=" * (4 - missing)
+    for fn in (base64.urlsafe_b64decode, base64.b64decode):
+        try:
+            return fn(s.encode()).decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+    return ""
+
+def parse(link):
+    link = link.strip()
+    if not link:
+        raise ValueError("链接为空")
+    u = urllib.parse.urlsplit(link)
+    scheme = u.scheme.lower()
+    params = dict(urllib.parse.parse_qsl(u.query))
+
+    if scheme in ("anytls",):
+        password = urllib.parse.unquote(u.username or "")
+        host = u.hostname or ""
+        port = int(u.port or 443)
+        sni = params.get("sni") or params.get("peer") or host
+        if not host or not password:
+            raise ValueError("AnyTLS 链接缺少主机或认证密码")
+        return {
+            "type": "anytls",
+            "server": host,
+            "port": port,
+            "password": password,
+            "server_name": sni
+        }
+
+    elif scheme in ("hy2", "hysteria2"):
+        password = urllib.parse.unquote(u.username or "")
+        host = u.hostname or ""
+        port = int(u.port or 443)
+        sni = params.get("sni") or params.get("peer") or host
+        if not host or not password:
+            raise ValueError("Hysteria2 链接缺少主机或认证密码")
+        return {
+            "type": "hysteria2",
+            "server": host,
+            "port": port,
+            "password": password,
+            "server_name": sni
+        }
+
+    elif scheme in ("trojan",):
+        password = urllib.parse.unquote(u.username or "")
+        host = u.hostname or ""
+        port = int(u.port or 443)
+        sni = params.get("sni") or params.get("peer") or host
+        if not host or not password:
+            raise ValueError("Trojan 链接缺少主机或密码")
+        return {
+            "type": "trojan",
+            "server": host,
+            "port": port,
+            "password": password,
+            "server_name": sni
+        }
+
+    elif scheme in ("vless",):
+        uuid = urllib.parse.unquote(u.username or "")
+        host = u.hostname or ""
+        port = int(u.port or 443)
+        sni = params.get("sni") or host
+        pbk = params.get("pbk") or params.get("public_key") or ""
+        sid = params.get("sid") or params.get("short_id") or ""
+        if not host or not uuid:
+            raise ValueError("VLESS 链接缺少主机或 UUID")
+        if not pbk:
+            raise ValueError("VLESS 链接缺少 REALITY 公钥 (pbk)")
+        return {
+            "type": "vless-reality",
+            "server": host,
+            "port": port,
+            "uuid": uuid,
+            "server_name": sni,
+            "public_key": pbk,
+            "short_id": sid
+        }
+
+    elif scheme in ("ss",):
+        raw_netloc = u.netloc
+        host = u.hostname or ""
+        port = u.port
+        userinfo = u.username or ""
+        method = ""
+        password = ""
+
+        if ("@" not in raw_netloc) and raw_netloc:
+            decoded = decode_b64(raw_netloc)
+            if "@" in decoded:
+                userpart, hostpart = decoded.rsplit("@", 1)
+                if ":" in userpart:
+                    method, password = userpart.split(":", 1)
+                if ":" in hostpart:
+                    host, port_str = hostpart.split(":", 1)
+                    try:
+                        port = int(port_str)
+                    except ValueError:
+                        port = 8388
+                else:
+                    host = hostpart
+                    port = 8388
+
+        if not method and userinfo:
+            decoded = decode_b64(userinfo)
+            if ":" in decoded:
+                method, password = decoded.split(":", 1)
+            elif ":" in userinfo:
+                method, password = userinfo.split(":", 1)
+            else:
+                password = decoded or userinfo
+
+        if not password and u.password:
+            password = u.password
+
+        port = int(port or 8388)
+        if not host or not method or not password:
+            raise ValueError("Shadowsocks 链接缺少主机、加密方式或密码")
+        return {
+            "type": "shadowsocks",
+            "server": host,
+            "port": port,
+            "method": method.lower(),
+            "password": password
+        }
+
+    elif scheme in ("socks5", "socks"):
+        host = u.hostname or ""
+        port = int(u.port or 1080)
+        username = urllib.parse.unquote(u.username or "")
+        password = urllib.parse.unquote(u.password or "")
+        if username and not password and ":" in username:
+            username, password = username.split(":", 1)
+        elif username and not password:
+            decoded = decode_b64(username)
+            if ":" in decoded:
+                username, password = decoded.split(":", 1)
+        if not host:
+            raise ValueError("SOCKS5 链接缺少主机")
+        return {
+            "type": "socks5",
+            "server": host,
+            "port": port,
+            "username": username,
+            "password": password
+        }
+
+    elif scheme in ("http", "https"):
+        host = u.hostname or ""
+        is_tls = (scheme == "https")
+        default_port = 8443 if is_tls else 8080
+        port = int(u.port or (443 if is_tls else default_port))
+        username = urllib.parse.unquote(u.username or "")
+        password = urllib.parse.unquote(u.password or "")
+        sni = params.get("sni") or host
+        if username and not password and ":" in username:
+            username, password = username.split(":", 1)
+        elif username and not password:
+            decoded = decode_b64(username)
+            if ":" in decoded:
+                username, password = decoded.split(":", 1)
+        if not host:
+            raise ValueError("HTTP 代理链接缺少主机")
+        return {
+            "type": "http",
+            "server": host,
+            "port": port,
+            "username": username,
+            "password": password,
+            "tls": {
+                "enabled": is_tls,
+                "server_name": (sni if is_tls else "")
+            }
+        }
+    else:
+        raise ValueError("不支持的协议链接：" + scheme + "://")
+
+try:
+    res = parse(sys.argv[1])
+    print(json.dumps(res, ensure_ascii=False))
+except Exception as e:
+    sys.stderr.write(str(e) + "\n")
+    sys.exit(1)
+EOF_PY
+)
+  local status=$?
+  if (( status != 0 )) || [[ -z "$parsed_json" ]]; then
+    warn "分享链接解析失败：${parsed_json:-未知错误}"
+    return 1
+  fi
+
+  local p_type p_server p_port
+  p_type=$(jq -r '.type // empty' <<<"$parsed_json")
+  p_server=$(jq -r '.server // empty' <<<"$parsed_json")
+  p_port=$(jq -r '.port // empty' <<<"$parsed_json")
+  if [[ -z "$p_type" || -z "$p_server" || -z "$p_port" ]]; then
+    warn "解析失败：缺少协议类型、服务器地址或端口。"
+    return 1
+  fi
+  validate_host "$p_server" && validate_port "$p_port" || {
+    warn "解析失败：服务器地址或端口无效 (${p_server}:${p_port})。"
+    return 1
+  }
+
+  case "$p_type" in
+    shadowsocks)
+      local ss_m ss_p
+      ss_m=$(jq -r '.method' <<<"$parsed_json")
+      ss_p=$(jq -r '.password' <<<"$parsed_json")
+      validate_ss_method "$ss_m" || { warn "解析失败：Shadowsocks 加密方法不受支持 ($ss_m)。"; return 1; }
+      validate_ss_password "$ss_m" "$ss_p" || { warn "解析失败：Shadowsocks 密码格式不符合 $ss_m 要求。"; return 1; }
+      ;;
+    vless-reality)
+      local v_uuid v_pbk
+      v_uuid=$(jq -r '.uuid' <<<"$parsed_json")
+      v_pbk=$(jq -r '.public_key' <<<"$parsed_json")
+      validate_uuid "$v_uuid" || { warn "解析失败：VLESS UUID 格式无效 ($v_uuid)。"; return 1; }
+      [[ -n "$v_pbk" ]] || { warn "解析失败：REALITY 公钥 (pbk) 不能为空。"; return 1; }
+      ;;
+    anytls|trojan|hysteria2)
+      local p_pwd
+      p_pwd=$(jq -r '.password // empty' <<<"$parsed_json")
+      [[ -n "$p_pwd" ]] || { warn "解析失败：密码不能为空。"; return 1; }
+      ;;
+  esac
+
+  echo
+  info "成功解析出口节点分享链接："
+  printf "  出口协议:   %s\n" "$(protocol_label "$p_type")"
+  printf "  服务器地址: %s\n" "$p_server"
+  printf "  连接端口:   %s\n" "$p_port"
+  case "$p_type" in
+    shadowsocks)
+      printf "  加密方式:   %s\n" "$(jq -r '.method' <<<"$parsed_json")"
+      ;;
+    anytls|trojan|hysteria2)
+      local s_sni
+      s_sni=$(jq -r '.server_name // empty' <<<"$parsed_json")
+      [[ -n "$s_sni" ]] && printf "  TLS 域名:   %s\n" "$s_sni"
+      ;;
+    vless-reality)
+      printf "  UUID:       %s\n" "$(jq -r '.uuid' <<<"$parsed_json")"
+      printf "  REALITY公钥:%s\n" "$(jq -r '.public_key' <<<"$parsed_json")"
+      local sid
+      sid=$(jq -r '.short_id // empty' <<<"$parsed_json")
+      [[ -n "$sid" ]] && printf "  Short ID:   %s\n" "$sid"
+      printf "  伪装域名:   %s\n" "$(jq -r '.server_name' <<<"$parsed_json")"
+      ;;
+    socks5|http)
+      local u_name
+      u_name=$(jq -r '.username // empty' <<<"$parsed_json")
+      if [[ -n "$u_name" ]]; then
+        printf "  认证用户:   %s\n" "$u_name"
+      else
+        printf "  认证方式:   免密/无认证\n"
+      fi
+      if [[ "$p_type" == "http" && "$(jq -r '.tls.enabled // false' <<<"$parsed_json")" == "true" ]]; then
+        printf "  传输加密:   HTTPS (TLS)\n"
+      fi
+      ;;
+  esac
+
+  if [[ -n "$target_var" ]]; then
+    printf -v "$target_var" "%s" "$parsed_json"
+  else
+    printf "%s" "$parsed_json"
+  fi
+  return 0
+}
+
 
 derive_dnspod_zone() {
   local domain last_two last_three
@@ -2148,8 +2440,53 @@ collect_inbound_settings() {
 
 collect_outbound_settings() {
   local old=${1:-} target=${2:-}
-  local mode outbound_json
-  if [[ -n "$OUTBOUND" ]]; then
+  local mode outbound_json=""
+
+  if [[ "$OUTBOUND" == *"://"* ]]; then
+    if parse_proxy_link "$OUTBOUND" outbound_json; then
+      if [[ -n "$target" ]]; then
+        printf -v "$target" "%s" "$outbound_json"
+      else
+        printf "%s" "$outbound_json"
+      fi
+      return 0
+    else
+      warn "命令行传入的出口分享链接解析失败。"
+    fi
+  fi
+
+  if (( ! NON_INTERACTIVE )); then
+    echo
+    info "配置节点出口分流路由……"
+    printf "%s提示：%s可直接粘贴出口节点分享链接 (支持 anytls://, ss://, vless://, trojan://, hy2://, socks5://, http://)\n" "$C_CYAN" "$C_RESET"
+    printf "      直接按回车，则进入出口协议菜单进行手动选择配置。\n"
+    local outbound_link=""
+    prompt_value outbound_link "出口节点分享链接 (可直接粘贴，留空手动选择)" ""
+    if [[ "$outbound_link" == "0" ]]; then
+      return 1
+    fi
+    if [[ -n "$outbound_link" ]]; then
+      if parse_proxy_link "$outbound_link" outbound_json; then
+        local confirm_use=""
+        read -r -p "确认使用此出口配置？[Y/n，默认: Y]: " confirm_use
+        confirm_use=${confirm_use:-Y}
+        if [[ "$confirm_use" =~ ^[Yy]$ ]]; then
+          ok "已采用分享链接导入的出口配置！"
+          if [[ -n "$target" ]]; then
+            printf -v "$target" "%s" "$outbound_json"
+          else
+            printf "%s" "$outbound_json"
+          fi
+          return 0
+        fi
+        warn "已取消使用该分享链接，进入手动协议配置菜单。"
+      else
+        warn "分享链接解析失败，进入手动协议配置菜单。"
+      fi
+    fi
+  fi
+
+  if [[ -n "$OUTBOUND" && "$OUTBOUND" != *"://"* ]]; then
     mode="$OUTBOUND"
   else
     mode=$(jq -r '.outbound.type // "direct"' <<<"${old:-"{}"}")
@@ -2157,6 +2494,21 @@ collect_outbound_settings() {
   OUTBOUND="$mode"
   [[ "$OUTBOUND" == "ss" ]] && OUTBOUND="shadowsocks"
   choose_outbound_protocol OUTBOUND "$OUTBOUND" "出口协议设置" || return 1
+
+  if [[ "$OUTBOUND" == *"://"* ]]; then
+    if parse_proxy_link "$OUTBOUND" outbound_json; then
+      ok "已采用分享链接导入的出口配置！"
+      if [[ -n "$target" ]]; then
+        printf -v "$target" "%s" "$outbound_json"
+      else
+        printf "%s" "$outbound_json"
+      fi
+      return 0
+    else
+      warn "分享链接解析失败，已退出出口配置。"
+      return 1
+    fi
+  fi
   case "$OUTBOUND" in
     direct)
       outbound_json=$(jq -cn '{type:"direct"}')
@@ -2298,8 +2650,12 @@ collect_node_json() {
   else
     HTTP_TLS="false"
   fi
-  NODE_NAME=$(jq -r '.name // empty' <<<"${old:-"{}"}")
-  NODE_NAME=${NODE_NAME:-"节点1"}
+  local default_node_name
+  default_node_name=$(jq -r '.name // empty' <<<"${old:-"{}"}")
+  if [[ -z "$default_node_name" ]]; then
+    default_node_name=$(generate_default_node_name)
+  fi
+  NODE_NAME="${NODE_NAME:-$default_node_name}"
   prompt_value NODE_NAME "节点名称" "$NODE_NAME"
   NODE_DOMAIN="${NODE_DOMAIN:-$default_domain}"
   NODE_DOMAIN=${NODE_DOMAIN:-${DOMAIN:-$(json_get "$STATE_FILE" '.domain')}}
@@ -2412,6 +2768,38 @@ current_nodes_json() {
   [[ -r "$STATE_FILE" ]] || { echo "[]"; return; }
   jq -c '.nodes // []' "$STATE_FILE"
 }
+
+generate_default_node_name() {
+  local nodes name max_num=0 count=0 n
+  nodes=$(current_nodes_json 2>/dev/null || echo "[]")
+  count=$(jq 'length' <<<"$nodes" 2>/dev/null || echo 0)
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if [[ "$name" =~ ^节点([0-9]+)$ ]]; then
+      n="${BASH_REMATCH[1]}"
+      if (( 10#$n > max_num )); then
+        max_num=$((10#$n))
+      fi
+    fi
+  done < <(jq -r '.[].name // empty' <<<"$nodes" 2>/dev/null || true)
+
+  local next_num
+  if (( max_num > 0 )); then
+    next_num=$((max_num + 1))
+  else
+    next_num=$((count + 1))
+  fi
+
+  while true; do
+    local candidate="节点${next_num}"
+    if ! jq -e --arg name "$candidate" '.[] | select(.name == $name)' <<<"$nodes" >/dev/null 2>&1; then
+      printf "%s" "$candidate"
+      return 0
+    fi
+    next_num=$((next_num + 1))
+  done
+}
+
 
 node_count() {
   local nodes=${1:-$(current_nodes_json)}
