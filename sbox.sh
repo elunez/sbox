@@ -4860,6 +4860,15 @@ update_self_script() {
 
   rm -f "$tmp_file"
   ok "sbox 脚本已成功更新至 v${remote_version}！"
+
+  # 自动同步刷新定时任务、证书续期钩子与防火墙规则
+  if service_is_installed || [[ -r "$STATE_FILE" ]]; then
+    install_deploy_hook 2>/dev/null || true
+    sync_traffic_cron 2>/dev/null || true
+    sync_traffic_rules 2>/dev/null || true
+    info "后台定时重置任务与证书续签钩子已同步刷新。"
+  fi
+
   if [[ "$mode" == "silent" || "$mode" == "quiet" ]]; then
     return 0
   fi
