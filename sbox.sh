@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.1"
+readonly SCRIPT_VERSION="0.0.2"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -1674,7 +1674,7 @@ upgrade_sing_box() {
     sing-box check -c "$CONFIG_FILE" || die "新版本下配置校验失败，请检查 ${CONFIG_FILE}。"
     service_restart "$SYSTEMD_SERVICE"
   fi
-  update_self_script "cli" 2>/dev/null || true
+  update_self_script "silent" 2>/dev/null || true
   local new_ver
   new_ver=$(sing-box version 2>/dev/null | head -n 1 || echo "未知")
   ok "sing-box 核心已更新：${new_ver}"
@@ -4265,9 +4265,13 @@ update_self_script() {
 
   rm -f "$tmp_file"
   ok "sbox 脚本已成功更新至 v${remote_version}！"
-  if [[ "$mode" == "menu" ]]; then
+  if [[ "$mode" == "silent" || "$mode" == "quiet" ]]; then
+    return 0
+  fi
+
+  if [[ -t 0 ]]; then
     echo
-    info "正在重新载入新版本管理面板..."
+    info "正在自动打开 sbox 管理面板..."
     sleep 1
     if [[ -x "$SCRIPT_INSTALL_PATH" ]]; then
       exec "$SCRIPT_INSTALL_PATH"
@@ -4275,7 +4279,7 @@ update_self_script() {
       exec "$0"
     fi
   else
-    ok "sbox 命令行工具已更新完成，可直接在终端中继续使用。"
+    ok "sbox 命令行工具已更新完成。"
     return 0
   fi
 }
