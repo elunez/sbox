@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.2"
+readonly SCRIPT_VERSION="0.0.3"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -397,9 +397,23 @@ ss2022_key_bytes() {
   esac
 }
 
+normalize_quota() {
+  local val=${1:-unlimited}
+  val=$(printf "%s" "$val" | tr -d '[:space:]')
+  if [[ -z "$val" || "$val" == "0" || "$val" =~ ^[uU][nN][lL][iI][mM][iI][tT][eE][dD]$ ]]; then
+    echo "unlimited"
+    return 0
+  fi
+  if [[ "$val" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "${val}GB"
+    return 0
+  fi
+  echo "$val"
+}
+
 validate_quota() {
   local val=$1
-  [[ "$val" == "unlimited" || "$val" == "0" || "$val" =~ ^[0-9]+([kKmMgGtT][bB]?|[bB])?$ ]]
+  [[ "$val" == "unlimited" || "$val" == "0" || "$val" =~ ^[0-9]+(\.[0-9]+)?([kKmMgGtT][bB]?|[bB])?$ ]]
 }
 
 validate_reset_day() {
@@ -416,6 +430,57 @@ generate_uuid() {
     cat /proc/sys/kernel/random/uuid
   else
     openssl rand -hex 16 | sed -E "s/(.{8})(.{4})(.{4})(.{4})(.{12})/\1-\2-\3-\4-\5/"
+  fi
+}
+
+pause_prompt() {
+  local prompt_msg=${1:-"按回车键继续……"}
+  if [[ -t 0 ]]; then
+    local dummy
+    while read -r -t 0.05 -n 1000 dummy; do :; done 2>/dev/null || true
+    read -r -p "$prompt_msg" _ || true
+  fi
+}
+
+firewall_allow_port() {
+  local port=$1 proto=${2:-both}
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if [[ "$proto" == "both" ]]; then
+      ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+      ufw allow "${port}/udp" >/dev/null 2>&1 || true
+    else
+      ufw allow "${port}/${proto}" >/dev/null 2>&1 || true
+    fi
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    if [[ "$proto" == "both" ]]; then
+      firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --permanent --add-port="${port}/udp" >/dev/null 2>&1 || true
+    else
+      firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || true
+    fi
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
+firewall_remove_port() {
+  local port=$1 proto=${2:-both}
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    if [[ "$proto" == "both" ]]; then
+      ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+      ufw delete allow "${port}/udp" >/dev/null 2>&1 || true
+    else
+      ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+    fi
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    if [[ "$proto" == "both" ]]; then
+      firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --permanent --remove-port="${port}/udp" >/dev/null 2>&1 || true
+    else
+      firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
+    fi
+    firewall-cmd --reload >/dev/null 2>&1 || true
   fi
 }
 
@@ -649,19 +714,23 @@ die() { printf "[DNSPod] %s\n" "$*" >&2; exit 1; }
 
 check_txt_record() {
   local target=$1 expected=$2 txt_resp
+  txt_resp=$(curl -fsS --connect-timeout 3 --max-time 4 "https://1.1.1.1/dns-query?name=${target}&type=TXT" -H "accept: application/dns-json" 2>/dev/null || true)
+  if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
+    return 0
+  fi
+  txt_resp=$(curl -fsS --connect-timeout 3 --max-time 4 "https://doh.pub/dns-query?name=${target}&type=TXT" -H "accept: application/dns-json" 2>/dev/null || true)
+  if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
+    return 0
+  fi
+  txt_resp=$(curl -fsS --connect-timeout 3 --max-time 4 "https://dns.alidns.com/resolve?name=${target}&type=TXT" 2>/dev/null || true)
+  if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
+    return 0
+  fi
   if command -v dig >/dev/null 2>&1; then
     txt_resp=$(dig +short TXT "$target" @1.1.1.1 2>/dev/null || true)
     if [[ "$txt_resp" == *"$expected"* ]]; then
       return 0
     fi
-  fi
-  txt_resp=$(curl -fsS --connect-timeout 3 --max-time 4 "https://1.1.1.1/dns-query?name=${target}&type=TXT" -H "accept: application/dns-json" 2>/dev/null || true)
-  if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
-    return 0
-  fi
-  txt_resp=$(curl -fsS --connect-timeout 3 --max-time 4 "https://dns.google/resolve?name=${target}&type=TXT" -H "accept: application/dns-json" 2>/dev/null || true)
-  if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
-    return 0
   fi
   return 1
 }
@@ -1447,7 +1516,13 @@ service_group() {
 
 port_listener() {
   local port=$1
-  ss -H -ltnp "sport = :${port}" 2>/dev/null || true
+  if command -v ss >/dev/null 2>&1; then
+    ss -H -ltunp "sport = :${port}" 2>/dev/null || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -tunlp 2>/dev/null | grep -E "[: ]${port} " || true
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -i ":${port}" 2>/dev/null || true
+  fi
 }
 
 assert_port_available() {
@@ -1455,7 +1530,7 @@ assert_port_available() {
   listeners=$(port_listener "$port")
   if [[ -n "$listeners" && "$listeners" != *sing-box* ]]; then
     printf "%s\n" "$listeners" >&2
-    warn "TCP 端口 ${port} 已被其他进程占用。"
+    warn "端口 ${port} 已被其他进程占用。"
     return 1
   fi
   return 0
@@ -1504,6 +1579,7 @@ Wants=network-online.target
 [Service]
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+ExecStartPre=-/usr/local/bin/sbox --sync-traffic
 ExecStart=${bin_path} -D /var/lib/sing-box -c ${CONFIG_FILE} run
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
@@ -1534,6 +1610,10 @@ error_log="/var/log/sing-box.log"
 depend() {
     need net
     after firewall
+}
+
+start_pre() {
+    /usr/local/bin/sbox --sync-traffic >/dev/null 2>&1 || true
 }
 EOF
     chmod 0755 "$rc_file"
@@ -1652,7 +1732,7 @@ install_dependencies_and_core() {
       ;;
     apk)
       apk update
-      apk add --no-cache bash ca-certificates curl gnupg jq openssl certbot iproute2 nftables tzdata python3 tar gzip coreutils dcron
+      apk add --no-cache bash ca-certificates curl gnupg jq openssl certbot iproute2 nftables tzdata python3 tar gzip coreutils dcron gcompat
       rc-update add dcron default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || true
       rc-service dcron start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
       ensure_certbot_environment
@@ -1684,21 +1764,22 @@ size_to_bytes() {
   local size_str=$1
   [[ "$size_str" == "unlimited" || "$size_str" == "0" || -z "$size_str" ]] && { echo "0"; return 0; }
   local number unit
-  if [[ "$size_str" =~ ^([0-9]+)([A-Za-z]*)$ ]]; then
+  if [[ "$size_str" =~ ^([0-9]+(\.[0-9]+)?)([A-Za-z]*)$ ]]; then
     number="${BASH_REMATCH[1]}"
-    unit=$(printf "%s" "${BASH_REMATCH[2]}" | tr '[:lower:]' '[:upper:]')
+    unit=$(printf "%s" "${BASH_REMATCH[3]}" | tr '[:lower:]' '[:upper:]')
   else
     echo "0"
     return 0
   fi
-  case "$unit" in
-    "MB"|"M") echo $((number * 1048576)) ;;
-    "GB"|"G") echo $((number * 1073741824)) ;;
-    "TB"|"T") echo $((number * 1099511627776)) ;;
-    "KB"|"K") echo $((number * 1024)) ;;
-    "B"|"")   echo "$number" ;;
-    *) echo "0" ;;
-  esac
+  awk -v num="$number" -v u="$unit" 'BEGIN {
+    mult = 1;
+    if (u == "MB" || u == "M") mult = 1048576;
+    else if (u == "GB" || u == "G" || u == "") mult = 1073741824;
+    else if (u == "TB" || u == "T") mult = 1099511627776;
+    else if (u == "KB" || u == "K") mult = 1024;
+    else if (u == "B") mult = 1;
+    printf "%.0f", num * mult;
+  }'
 }
 
 bytes_to_human() {
@@ -1800,28 +1881,77 @@ traffic_install_port() {
     fi
   fi
 
-  setup_traffic_cron "$node"
+  sync_traffic_cron
 }
 
-setup_traffic_cron() {
-  local node=$1 port day tmp
-  port=$(jq -r '.port' <<<"$node")
-  day=$(jq -r '.traffic.reset_day // empty' <<<"$node")
+get_days_in_current_month() {
+  local year month
+  year=$(date +%Y)
+  month=$((10#$(date +%m)))
+  case "$month" in
+    1|3|5|7|8|10|12) echo 31 ;;
+    4|6|9|11) echo 30 ;;
+    2)
+      if (( (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) )); then
+        echo 29
+      else
+        echo 28
+      fi
+      ;;
+    *) echo 30 ;;
+  esac
+}
+
+check_traffic_reset_all() {
+  require_root
+  [[ -r "$STATE_FILE" ]] || return 0
+  local current_day days_in_month nodes node port day name
+  current_day=$((10#$(date +%d)))
+  days_in_month=$(get_days_in_current_month)
+
+  nodes=$(current_nodes_json)
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    port=$(jq -r '.port' <<<"$node")
+    day=$(jq -r '.traffic.reset_day // empty' <<<"$node")
+    name=$(jq -r '.name // empty' <<<"$node")
+    [[ -n "$day" && "$day" =~ ^[0-9]+$ ]] || continue
+    day=$((10#$day))
+    (( day >= 1 && day <= 31 )) || continue
+
+    local should_reset=0
+    if (( day == current_day )); then
+      should_reset=1
+    elif (( day > days_in_month && current_day == days_in_month )); then
+      should_reset=1
+    fi
+
+    if (( should_reset )); then
+      reset_traffic_port "$port" "$name" 1
+    fi
+  done < <(jq -c '.[]?' <<<"$nodes")
+}
+
+sync_traffic_cron() {
+  local has_reset_node=0
+  if [[ -r "$STATE_FILE" ]]; then
+    local any_reset
+    any_reset=$(jq -r '.nodes[]?.traffic.reset_day // empty' "$STATE_FILE" 2>/dev/null | grep -E '^[1-9][0-9]?$' | head -n 1 || true)
+    [[ -n "$any_reset" ]] && has_reset_node=1
+  fi
+
+  local tmp
   tmp=$(mktemp)
-  (crontab -l 2>/dev/null || true) | awk -v tag="${CRON_TAG}-${port}" 'index($0, tag) == 0' >"$tmp" || true
-  if [[ -n "$day" && "$day" =~ ^[0-9]+$ && "$day" -ge 1 && "$day" -le 31 ]]; then
-    echo "5 0 $day * * ${SCRIPT_INSTALL_PATH} --reset-traffic $port >/dev/null 2>&1 # ${CRON_TAG}-${port}" >>"$tmp"
+  (crontab -l 2>/dev/null || true) | awk -v tag="${CRON_TAG}" 'index($0, tag) == 0' >"$tmp" || true
+  if (( has_reset_node )); then
+    echo "5 0 * * * ${SCRIPT_INSTALL_PATH} --check-traffic-reset >/dev/null 2>&1 # ${CRON_TAG}-global" >>"$tmp"
   fi
   crontab "$tmp" >/dev/null 2>&1 || true
   rm -f "$tmp"
 }
 
 remove_traffic_cron() {
-  local port=$1 tmp
-  tmp=$(mktemp)
-  (crontab -l 2>/dev/null || true) | awk -v tag="${CRON_TAG}-${port}" 'index($0, tag) == 0' >"$tmp" || true
-  crontab "$tmp" >/dev/null 2>&1 || true
-  rm -f "$tmp"
+  sync_traffic_cron
 }
 
 sync_traffic_rules() {
@@ -1896,8 +2026,9 @@ collect_traffic_settings() {
       "single|单向计费（仅统计出站/下行流量）" \
       "double|双向计费（同时统计入站与出站流量）" || return 1
   fi
-  prompt_value TRAFFIC_LIMIT "月流量配额（如 100GB、1TB，输入 0 或 unlimited 表示不限额）" "$TRAFFIC_LIMIT"
-  validate_quota "$TRAFFIC_LIMIT" || die "流量配额格式无效，请输入类似 100MB、500GB、2TB 或 unlimited。"
+  prompt_value TRAFFIC_LIMIT "月流量配额（如 100、1.5、100GB、1.5TB，未填单位默认 GB，输入 0 或 unlimited 表示不限额）" "$TRAFFIC_LIMIT"
+  TRAFFIC_LIMIT=$(normalize_quota "$TRAFFIC_LIMIT")
+  validate_quota "$TRAFFIC_LIMIT" || die "流量配额格式无效，请输入类似 100、1.5、100MB、500GB、2TB 或 unlimited。"
   [[ "$TRAFFIC_LIMIT" == "0" ]] && TRAFFIC_LIMIT="unlimited"
   prompt_value TRAFFIC_RESET_DAY "每月重置日（1-31日，输入 0 或留空表示不自动重置）" "${TRAFFIC_RESET_DAY:-1}"
   if [[ -n "$TRAFFIC_RESET_DAY" && "$TRAFFIC_RESET_DAY" != "0" ]]; then
@@ -2371,7 +2502,6 @@ generate_config_from_state() {
           tag: ("in-" + (($i + 1)|tostring)),
           listen: "::",
           listen_port: $n.port,
-          network: "tcp",
           method: $n.method,
           password: $n.password
         }
@@ -2607,6 +2737,14 @@ save_nodes_json() {
   rm -f "$candidate" "$state_tmp"
   install_deploy_hook
   sync_traffic_rules "$nodes"
+  sync_traffic_cron
+  local n_item n_port n_proto
+  while IFS= read -r n_item; do
+    [[ -n "$n_item" ]] || continue
+    n_port=$(jq -r '.port' <<<"$n_item")
+    n_proto=$(jq -r '.protocol // "anytls"' <<<"$n_item")
+    firewall_allow_port "$n_port" "$(case "$n_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
+  done < <(jq -c '.[]?' <<<"$nodes")
   ensure_sbox_cli
 }
 
@@ -2836,6 +2974,12 @@ install_flow() {
   SKIP_PROTOCOL_PROMPT=1
   collect_node_json "$old" node || { warn "已取消首节点配置。"; return 0; }
   SKIP_PROTOCOL_PROMPT=0
+  local first_port
+  first_port=$(jq -r '.port' <<<"$node")
+  if ! assert_port_available "$first_port"; then
+    warn "端口 ${first_port} 已被占用，请更换端口后重试。"
+    return 1
+  fi
   ensure_node_certificate "$node" || { warn "已取消证书申请。"; return 0; }
   if state_has_nodes; then
     nodes=$(current_nodes_json)
@@ -2855,7 +2999,8 @@ install_flow() {
   rm -f "$candidate" "$state_tmp"
   install_deploy_hook
   sync_traffic_rules "$nodes"
-  if [[ "" == "systemd" ]]; then
+  sync_traffic_cron
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     systemctl enable --now certbot.timer >/dev/null 2>&1 || true
   else
     local cert_cron_tmp
@@ -2870,7 +3015,7 @@ install_flow() {
   ok "服务安装完成！已启用首节点 [$(protocol_label "$PROTOCOL")]。"
   ok "快捷指令已就绪：今后在任意目录下输入 sbox 即可快捷打开管理面板。"
   show_client
-  read -r -p "按回车键继续……" _
+  pause_prompt
 }
 
 add_node_flow() {
@@ -2906,7 +3051,7 @@ add_node_flow() {
   save_nodes_json "$(jq -c --argjson node "$node" '. + [$node]' <<<"$nodes")"
   ok "新节点添加成功！"
   show_client
-  read -r -p "按回车键继续……" _
+  pause_prompt
 }
 
 edit_node_flow() {
@@ -2950,7 +3095,7 @@ edit_node_flow() {
   save_nodes_json "$(jq -c --argjson index "$index" --argjson node "$node" '.[ $index ] = $node' <<<"$nodes")"
   ok "节点修改成功！"
   show_client
-  read -r -p "按回车键继续……" _
+  pause_prompt
 }
 
 delete_node_flow() {
@@ -2971,10 +3116,13 @@ delete_node_flow() {
     read -r -p "确认删除节点 [${name}] (端口: ${port})？[y/N]: " answer
   fi
   [[ "$answer" =~ ^[yY]$ ]] || { warn "已取消删除。"; return 0; }
+  local del_proto
+  del_proto=$(jq -r ".[$index].protocol // empty" <<<"$nodes")
   traffic_remove_port "$port"
+  firewall_remove_port "$port" "$(case "$del_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
   save_nodes_json "$(jq -c --argjson index "$index" 'del(.[$index])' <<<"$nodes")"
   ok "节点 [${name}] 已成功删除。"
-  read -r -p "按回车键继续……" _
+  pause_prompt
 }
 
 outbound_flow() {
@@ -2998,7 +3146,91 @@ outbound_flow() {
   save_nodes_json "$new_nodes"
   ok "节点 [${name}] 的出口配置已更新！"
   show_client
-  read -r -p "按回车键继续……" _
+  pause_prompt
+}
+
+generate_client_outbound_json() {
+  local node=$1
+  local proto name domain port
+  proto=$(jq -r '.protocol' <<<"$node")
+  name=$(jq -r '.name' <<<"$node")
+  domain=$(jq -r '.domain' <<<"$node")
+  port=$(jq -r '.port' <<<"$node")
+
+  case "$proto" in
+    anytls)
+      local pass
+      pass=$(jq -r '.password' <<<"$node")
+      jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg pw "$pass" \
+        '{type:"anytls",tag:$tag,server:$s,server_port:$p,password:$pw,tls:{enabled:true,server_name:$s}}'
+      ;;
+    shadowsocks)
+      local m pw
+      m=$(jq -r '.method' <<<"$node")
+      pw=$(jq -r '.password' <<<"$node")
+      jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg m "$m" --arg pw "$pw" \
+        '{type:"shadowsocks",tag:$tag,server:$s,server_port:$p,method:$m,password:$pw}'
+      ;;
+    trojan)
+      local pw
+      pw=$(jq -r '.password' <<<"$node")
+      jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg pw "$pass" \
+        '{type:"trojan",tag:$tag,server:$s,server_port:$p,password:$pw,tls:{enabled:true,server_name:$s}}'
+      ;;
+    hysteria2)
+      local pw
+      pw=$(jq -r '.password' <<<"$node")
+      jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg pw "$pass" \
+        '{type:"hysteria2",tag:$tag,server:$s,server_port:$p,password:$pw,tls:{enabled:true,server_name:$s}}'
+      ;;
+    vless-reality)
+      local uuid pbk sid sni
+      uuid=$(jq -r '.uuid' <<<"$node")
+      pbk=$(jq -r '.reality.public_key' <<<"$node")
+      sid=$(jq -r '.reality.short_id' <<<"$node")
+      sni=$(jq -r '.reality.handshake_server' <<<"$node")
+      jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg u "$uuid" --arg pbk "$pbk" --arg sid "$sid" --arg sni "$sni" \
+        '{type:"vless",tag:$tag,server:$s,server_port:$p,uuid:$u,flow:"xtls-rprx-vision",tls:{enabled:true,server_name:$sni,reality:{enabled:true,public_key:$pbk,short_id:$sid}},packet_encoding:"xudp"}'
+      ;;
+    socks5)
+      local u pw
+      u=$(jq -r '.username // empty' <<<"$node")
+      pw=$(jq -r '.password // empty' <<<"$node")
+      if [[ -n "$u" ]]; then
+        jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg u "$u" --arg pw "$pw" \
+          '{type:"socks",tag:$tag,server:$s,server_port:$p,username:$u,password:$pw}'
+      else
+        jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" \
+          '{type:"socks",tag:$tag,server:$s,server_port:$p}'
+      fi
+      ;;
+    http)
+      local u pw is_tls
+      u=$(jq -r '.username // empty' <<<"$node")
+      pw=$(jq -r '.password // empty' <<<"$node")
+      is_tls=$(jq -r '.tls // false' <<<"$node")
+      if [[ "$is_tls" == "true" ]]; then
+        if [[ -n "$u" ]]; then
+          jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg u "$u" --arg pw "$pw" \
+            '{type:"http",tag:$tag,server:$s,server_port:$p,username:$u,password:$pw,tls:{enabled:true,server_name:$s}}'
+        else
+          jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" \
+            '{type:"http",tag:$tag,server:$s,server_port:$p,tls:{enabled:true,server_name:$s}}'
+        fi
+      else
+        if [[ -n "$u" ]]; then
+          jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg u "$u" --arg pw "$pw" \
+            '{type:"http",tag:$tag,server:$s,server_port:$p,username:$u,password:$pw}'
+        else
+          jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" \
+            '{type:"http",tag:$tag,server:$s,server_port:$p}'
+        fi
+      fi
+      ;;
+    *)
+      echo "{}"
+      ;;
+  esac
 }
 
 show_client() {
@@ -3077,9 +3309,12 @@ show_client() {
         h_user=$(jq -r '.username // empty' <<<"$node")
         h_pass=$(jq -r '.password // empty' <<<"$node")
         h_tls=$(jq -r '.tls // false' <<<"$node")
-        local scheme="http"
-        [[ "$h_tls" == "true" ]] && scheme="https"
-        printf "  代理协议:   %s\n" "${scheme^^} 代理"
+        local scheme="http" scheme_upper="HTTP"
+        if [[ "$h_tls" == "true" ]]; then
+          scheme="https"
+          scheme_upper="HTTPS"
+        fi
+        printf "  代理协议:   %s\n" "${scheme_upper} 代理"
         if [[ -n "$h_user" ]]; then
           printf "  认证用户名: %s\n" "$h_user"
           printf "  认证密码:   %s\n" "$h_pass"
@@ -3095,8 +3330,15 @@ show_client() {
     index=$((index + 1))
   done < <(jq -c '.[]?' <<<"$nodes")
   echo
-  info "sing-box 客户端参考 outbounds 配置："
-  jq -c '.outbounds' "$CONFIG_FILE" 2>/dev/null || true
+  info "sing-box 客户端参考 outbounds 配置 (可直接复制到客户端 outbounds 数组中)："
+  local all_client_outbounds="[]"
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    local ob
+    ob=$(generate_client_outbound_json "$node")
+    [[ "$ob" != "{}" ]] && all_client_outbounds=$(jq --argjson item "$ob" '. + [$item]' <<<"$all_client_outbounds")
+  done < <(jq -c '.[]?' <<<"$nodes")
+  jq . <<<"$all_client_outbounds" 2>/dev/null || echo "$all_client_outbounds"
   printf "%s====================================================================%s\n" "$C_CYAN" "$C_RESET"
 }
 
@@ -3134,7 +3376,7 @@ nodes_menu() {
       2)
         if (( $(node_count "$nodes") == 0 )); then
           warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
-          read -r -p "按回车键继续……" _
+          pause_prompt
         else
           edit_node_flow
         fi
@@ -3142,7 +3384,7 @@ nodes_menu() {
       3)
         if (( $(node_count "$nodes") == 0 )); then
           warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
-          read -r -p "按回车键继续……" _
+          pause_prompt
         else
           outbound_flow
         fi
@@ -3150,7 +3392,7 @@ nodes_menu() {
       4)
         if (( $(node_count "$nodes") == 0 )); then
           warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
-          read -r -p "按回车键继续……" _
+          pause_prompt
         else
           configure_traffic_flow "$nodes"
         fi
@@ -3158,7 +3400,7 @@ nodes_menu() {
       5)
         if (( $(node_count "$nodes") == 0 )); then
           warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
-          read -r -p "按回车键继续……" _
+          pause_prompt
         else
           delete_node_flow
         fi
@@ -3166,10 +3408,10 @@ nodes_menu() {
       6)
         if (( $(node_count "$nodes") == 0 )); then
           warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
-          read -r -p "按回车键继续……" _
+          pause_prompt
         else
           show_client
-          read -r -p "按回车键继续……" _
+          pause_prompt
         fi
         ;;
       0|"") return ;;
@@ -3197,7 +3439,7 @@ configure_traffic_flow() {
   save_nodes_json "$new_nodes"
   ok "节点 [${name}] 的流量管理策略已更新！"
   show_client
-  read -r -p "按回车键继续……" _
+  pause_prompt
 }
 
 immediate_traffic_reset_flow() {
@@ -3245,9 +3487,12 @@ import subprocess
 import urllib.parse
 import json
 import sys
+import time
 
 SCRIPT_INSTALL_PATH = os.environ.get("SBOX_SCRIPT_PATH", "/usr/local/bin/sbox")
 API_CONFIG_FILE = os.environ.get("SBOX_API_CONFIG", "/etc/sbox/api.json")
+_CACHE = {}
+_CACHE_TTL = 2.0
 
 def load_api_config():
     try:
@@ -3259,6 +3504,12 @@ def load_api_config():
     return {"port": 6666, "host": "0.0.0.0", "token": ""}
 
 def get_traffic_from_script(port=None):
+    now = time.time()
+    cache_key = port or "all"
+    cached = _CACHE.get(cache_key)
+    if cached and (now - cached["time"] < _CACHE_TTL):
+        return cached["data"]
+
     script = SCRIPT_INSTALL_PATH if os.path.exists(SCRIPT_INSTALL_PATH) else "./sbox.sh"
     cmd = ["bash", script, "--api-json"]
     if port:
@@ -3266,7 +3517,9 @@ def get_traffic_from_script(port=None):
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
         if res.returncode == 0 and res.stdout.strip():
-            return json.loads(res.stdout.strip())
+            parsed = json.loads(res.stdout.strip())
+            _CACHE[cache_key] = {"time": now, "data": parsed}
+            return parsed
     except Exception as e:
         return {"error": "ExecutionError", "message": str(e)}
     return {"error": "FailedToRetrieveData", "message": "Script returned no data"}
@@ -3486,7 +3739,10 @@ start_api_service() {
     install_api_service
     return
   fi
+  local port
+  port=$(get_api_port)
   service_start "$API_SYSTEMD_SERVICE"
+  firewall_allow_port "$port" "tcp"
   ok "API 服务已启动。"
 }
 
@@ -3504,7 +3760,10 @@ restart_api_service() {
 
 uninstall_api_service() {
   require_root
+  local port
+  port=$(get_api_port 2>/dev/null || echo "")
   service_disable "$API_SYSTEMD_SERVICE"
+  service_stop "$API_SYSTEMD_SERVICE"
   rm -f "/etc/systemd/system/${API_SYSTEMD_SERVICE}" "/etc/init.d/sbox-api" >/dev/null 2>&1 || true
   service_daemon_reload
   init_api_config
@@ -3513,6 +3772,7 @@ uninstall_api_service() {
   jq '.enabled=false' "$API_CONFIG_FILE" > "$tmp"
   install -m 0600 "$tmp" "$API_CONFIG_FILE"
   rm -f "$tmp"
+  [[ -n "$port" ]] && firewall_remove_port "$port" "tcp"
   ok "API 服务已卸载。"
 }
 
@@ -3735,7 +3995,7 @@ traffic_menu() {
     read -r -p "请输入选择 [0-6，默认: 0]: " choice
     choice=${choice:-0}
     case "$choice" in
-      1) print_node_list "$nodes"; read -r -p "按回车键继续……" _ ;;
+      1) print_node_list "$nodes"; pause_prompt ;;
       2)
         if (( $(node_count "$nodes") == 0 )); then
           warn "当前暂无任何节点配置，请先在节点管理中添加节点。"
@@ -3867,73 +4127,7 @@ disable_service() {
   ok "已禁用 sing-box 开机自启。"
 }
 
-bbr_status() {
-  local cc
-  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-  if [[ "$cc" == *"bbr"* ]]; then
-    echo "enabled"
-  else
-    echo "disabled"
-  fi
-}
 
-bbr_menu() {
-  echo
-  printf "%s=== BBR 加速控制 ===%s\n" "$C_CYAN" "$C_RESET"
-  local current_status
-  current_status=$(bbr_status)
-  if [[ "$current_status" == "enabled" ]]; then
-    printf "当前状态: %s已开启 (bbr)%s\n\n" "$C_GREEN" "$C_RESET"
-    printf "  1) 重新应用 BBR 系统参数\n"
-    printf "  2) 关闭 BBR 加速 (恢复 cubic)\n"
-    printf "  0) 返回上级菜单\n"
-    local choice
-    read -r -p "请选择操作 [0-2]: " choice
-    case "$choice" in
-      1)
-        install -d -m 0755 /etc/sysctl.d
-        cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-        sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1 || true
-        ok "BBR 参数已刷新。"
-        ;;
-      2)
-        rm -f /etc/sysctl.d/99-bbr.conf
-        sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1 || true
-        sysctl -w net.core.default_qdisc=fq_codel >/dev/null 2>&1 || true
-        ok "已关闭 BBR。"
-        ;;
-      0|"") return ;;
-      *) warn "无效选择。" ;;
-    esac
-  else
-    printf "当前状态: %s未开启%s\n\n" "$C_YELLOW" "$C_RESET"
-    printf "  1) 开启 BBR 加速 (fq + bbr)\n"
-    printf "  0) 返回上级菜单\n"
-    local choice
-    read -r -p "请选择操作 [0-1]: " choice
-    case "$choice" in
-      1)
-        modprobe tcp_bbr 2>/dev/null || true
-        install -d -m 0755 /etc/sysctl.d
-        cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-EOF
-        sysctl --system >/dev/null 2>&1 || sysctl -p /etc/sysctl.d/99-bbr.conf >/dev/null 2>&1 || true
-        if [[ "$(bbr_status)" == "enabled" ]]; then
-          ok "BBR 加速开启成功！"
-        else
-          warn "已写入 BBR 配置，若未立即生效，可能需重启内核生效。"
-        fi
-        ;;
-      0|"") return ;;
-      *) warn "无效选择。" ;;
-    esac
-  fi
-}
 
 status_flow() {
   echo
@@ -3959,7 +4153,20 @@ status_flow() {
   printf "服务运行状态:      %s\n" "$active_str"
   printf "开机自启状态:      %s\n" "$enabled_str"
   printf "日志记录级别:      %s\n" "$(get_log_level)"
-  printf "BBR 拥塞控制:      %s (%s)\n" "$(bbr_status)" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")"
+  printf "TCP 拥塞控制:      %s\n" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")"
+  local api_active_str api_port api_token
+  if service_is_running "$API_SYSTEMD_SERVICE"; then
+    api_port=$(get_api_port)
+    api_token=$(get_api_token)
+    if [[ -n "$api_token" ]]; then
+      api_active_str="运行中 (端口: ${api_port}，已启用 Token 鉴权)"
+    else
+      api_active_str="运行中 (端口: ${api_port}，无鉴权开放)"
+    fi
+  else
+    api_active_str="已停止"
+  fi
+  printf "流量 API 服务:     %s\n" "$api_active_str"
   local nodes
   nodes=$(current_nodes_json)
   print_node_list "$nodes"
@@ -4090,7 +4297,7 @@ logs_menu() {
           tail -n 50 /var/log/sing-box.log 2>/dev/null || warn "暂无日志文件 (/var/log/sing-box.log)。"
         fi
         echo
-        read -r -p "按回车键继续……" _
+        pause_prompt
         ;;
       2)
         echo
@@ -4103,11 +4310,11 @@ logs_menu() {
         ;;
       3)
         change_log_level_flow
-        read -r -p "按回车键继续……" _
+        pause_prompt
         ;;
       4)
         clean_system_logs
-        read -r -p "按回车键继续……" _
+        pause_prompt
         ;;
       0|"") return ;;
       *)
@@ -4346,17 +4553,17 @@ menu() {
     case "$choice" in
       0|q|Q|exit) echo; exit 0 ;;
       1) install_flow ;;
-      2) upgrade_sing_box; read -r -p "按回车键继续……" _ ;;
+      2) upgrade_sing_box; pause_prompt ;;
       3) nodes_menu ;;
       4) traffic_menu ;;
       5) api_service_menu ;;
-      6) start_service; read -r -p "按回车键继续……" _ ;;
-      7) stop_service; read -r -p "按回车键继续……" _ ;;
-      8) restart_service; read -r -p "按回车键继续……" _ ;;
-      9) status_flow; read -r -p "按回车键继续……" _ ;;
+      6) start_service; pause_prompt ;;
+      7) stop_service; pause_prompt ;;
+      8) restart_service; pause_prompt ;;
+      9) status_flow; pause_prompt ;;
       10) logs_menu ;;
-      11) cert_flow; read -r -p "按回车键继续……" _ ;;
-      12) update_self_script "menu"; read -r -p "按回车键继续……" _ ;;
+      11) cert_flow; pause_prompt ;;
+      12) update_self_script "menu"; pause_prompt ;;
       13) uninstall_flow ;;
       *) warn "无效选项，请输入 0 到 13 之间的数字。"; sleep 1 ;;
     esac
@@ -4424,7 +4631,7 @@ parse_options() {
       --cert-mode) [[ $# -ge 2 ]] || die "--cert-mode 缺少值"; CERT_MODE=$2; shift 2;;
       --webroot) [[ $# -ge 2 ]] || die "--webroot 缺少值"; WEBROOT=$2; shift 2;;
       --outbound) [[ $# -ge 2 ]] || die "--outbound 缺少值"; OUTBOUND=$2; shift 2;;
-      --traffic-limit) [[ $# -ge 2 ]] || die "--traffic-limit 缺少值"; TRAFFIC_LIMIT=$2; shift 2;;
+      --traffic-limit) [[ $# -ge 2 ]] || die "--traffic-limit 缺少值"; TRAFFIC_LIMIT=$(normalize_quota "$2"); shift 2;;
       --reset-day) [[ $# -ge 2 ]] || die "--reset-day 缺少值"; TRAFFIC_RESET_DAY=$2; shift 2;;
       --ss-server) [[ $# -ge 2 ]] || die "--ss-server 缺少值"; SS_SERVER=$2; shift 2;;
       --ss-port) [[ $# -ge 2 ]] || die "--ss-port 缺少值"; SS_PORT=$2; shift 2;;
@@ -4474,7 +4681,6 @@ main() {
     restart) parse_options "$@"; restart_service ;;
     enable) parse_options "$@"; enable_service ;;
     disable) parse_options "$@"; disable_service ;;
-    bbr) parse_options "$@"; bbr_menu ;;
     update-script|update|self-update) parse_options "$@"; update_self_script "cli" ;;
     uninstall) parse_options "$@"; uninstall_flow ;;
     api)
@@ -4502,6 +4708,16 @@ main() {
     --reset-traffic-all)
       require_root
       reset_traffic_all
+      ;;
+    --sync-traffic)
+      require_root
+      sync_traffic_rules
+      exit 0
+      ;;
+    --check-traffic-reset)
+      require_root
+      check_traffic_reset_all
+      exit 0
       ;;
     -h|--help|help) usage ;;
     *) die "未知命令：${command}。使用 --help 查看帮助。" ;;

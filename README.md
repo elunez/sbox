@@ -200,7 +200,6 @@ sudo sbox stop             # 停止服务
 sudo sbox restart          # 重启服务
 sudo sbox enable           # 开启开机自启
 sudo sbox disable          # 关闭开机自启
-sudo sbox bbr              # BBR 拥塞控制配置
 
 # 流量重置
 sudo sbox --reset-traffic 443   # 立即重置 443 端口流量
