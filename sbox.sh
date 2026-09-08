@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.5"
+readonly SCRIPT_VERSION="0.0.6"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -2729,6 +2729,14 @@ collect_node_json() {
         --argjson traffic "$traffic" --argjson outbound "$outbound" \
         '{name:$name,protocol:$protocol,domain:$domain,port:$port,username:$username,password:$password,tls:$tls,traffic:$traffic,outbound:$outbound}')
       ;;
+    anytls)
+      local old_pad
+      old_pad=$(jq -c '.padding_scheme // empty' <<<"${old:-"{}"}")
+      node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
+        --arg password "$NODE_PASSWORD" --argjson traffic "$traffic" --argjson outbound "$outbound" \
+        --argjson pad "${old_pad:-null}" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,password:$password,traffic:$traffic,outbound:$outbound} + (if ($pad | type == "array" and length > 0) then {padding_scheme:$pad} else {} end)')
+      ;;
     *)
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
         --arg password "$NODE_PASSWORD" --argjson traffic "$traffic" --argjson outbound "$outbound" \
@@ -2813,6 +2821,14 @@ validate_nodes_state() {
     [[ -n "$node" ]] || continue
     protocol=$(jq -r '.protocol' <<<"$node")
     case "$protocol" in
+      anytls)
+        [[ -n "$(jq -r '.password // empty' <<<"$node")" ]] || die "AnyTLS 密码不能为空。"
+        local pad_type
+        pad_type=$(jq -r '.padding_scheme | type' <<<"$node")
+        if [[ "$pad_type" != "null" ]]; then
+          [[ "$pad_type" == "array" ]] || die "AnyTLS padding_scheme 必须为规则数组格式。"
+        fi
+        ;;
       vless-reality)
         validate_uuid "$(jq -r '.uuid // empty' <<<"$node")" || die "VLESS UUID 无效。"
         [[ -n "$(jq -r '.reality.private_key // empty' <<<"$node")" && -n "$(jq -r '.reality.public_key // empty' <<<"$node")" ]] || die "REALITY 密钥不能为空。"
@@ -2871,7 +2887,7 @@ generate_config_from_state() {
           listen: "::",
           listen_port: $n.port,
           users: [{name: $n.name, password: $n.password}],
-          padding_scheme: [
+          padding_scheme: (if ($n.padding_scheme | type == "array" and length > 0) then $n.padding_scheme else [
             "stop=8",
             "0=32-76",
             "1=84-252",
@@ -2881,7 +2897,7 @@ generate_config_from_state() {
             "5=60-204",
             "6=44-172",
             "7=28-140"
-          ],
+          ] end),
           tls: cert_tls($n)
         }
       elif $n.protocol == "shadowsocks" then
@@ -3542,14 +3558,26 @@ format_node_traffic_summary() {
 
 print_node_summary_card() {
   local node=$1 idx=${2:-1}
-  local name proto port domain cred_str out_str traf_str
+  local name raw_proto proto port domain cred_str out_str traf_str pad_str=""
   name=$(jq -r '.name' <<<"$node")
-  proto=$(protocol_label "$(jq -r '.protocol // "anytls"' <<<"$node")")
+  raw_proto=$(jq -r '.protocol // "anytls"' <<<"$node")
+  proto=$(protocol_label "$raw_proto")
   port=$(jq -r '.port' <<<"$node")
   domain=$(jq -r '.domain // "127.0.0.1"' <<<"$node")
   cred_str=$(format_node_credential_summary "$node")
   out_str=$(format_node_outbound_summary "$node")
   traf_str=$(format_node_traffic_summary "$node")
+
+  if [[ "$raw_proto" == "anytls" ]]; then
+    if jq -e '.padding_scheme | type == "array" and length > 0' <<<"$node" >/dev/null 2>&1; then
+      local pad_cnt pad_stop
+      pad_cnt=$(jq '.padding_scheme | length' <<<"$node")
+      pad_stop=$(jq -r '.padding_scheme[] | select(startswith("stop=")) // empty' <<<"$node" | head -n1)
+      pad_str="${C_GREEN}自定义 (${pad_stop:-stop=*}, 共 ${pad_cnt} 项)${C_RESET}"
+    else
+      pad_str="${C_YELLOW}系统默认 (stop=8, 8 轮混淆)${C_RESET}"
+    fi
+  fi
 
   echo
   printf "%s=========================== 正在管理节点 ===========================%s\n" "$C_CYAN" "$C_RESET"
@@ -3559,6 +3587,9 @@ print_node_summary_card() {
   printf "  监听端口: %s\n" "$port"
   printf "  连接地址: %s\n" "$domain"
   printf "  认证凭据: %s\n" "$cred_str"
+  if [[ -n "$pad_str" ]]; then
+    printf "  混淆策略: %s\n" "$pad_str"
+  fi
   printf "  出口分流: %s\n" "$out_str"
   printf "  流量策略: %s\n" "$traf_str"
   printf "%s====================================================================%s\n" "$C_CYAN" "$C_RESET"
@@ -3732,6 +3763,14 @@ edit_node_protocol() {
         --arg username "$new_user" --arg password "$new_pw" --argjson tls "$http_tls" \
         --argjson traffic "$traffic" --argjson outbound "$outbound" \
         '{name:$name,protocol:$protocol,domain:$domain,port:$port,username:$username,password:$password,tls:$tls,traffic:$traffic,outbound:$outbound}')
+      ;;
+    anytls)
+      local old_pad
+      old_pad=$(jq -c '.padding_scheme // empty' <<<"$old")
+      new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
+        --arg password "$new_pw" --argjson traffic "$traffic" --argjson outbound "$outbound" \
+        --argjson pad "${old_pad:-null}" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,password:$password,traffic:$traffic,outbound:$outbound} + (if ($pad | type == "array" and length > 0) then {padding_scheme:$pad} else {} end)')
       ;;
     *)
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
@@ -4053,6 +4092,176 @@ edit_node_traffic() {
   ok "节点 [${name}] 流量策略已更新！"
 }
 
+collect_and_apply_padding_scheme() {
+  local index=$1
+  local nodes old name
+  nodes=$(current_nodes_json)
+  old=$(jq -c ".[$index]" <<<"$nodes")
+  name=$(jq -r '.name' <<<"$old")
+
+  echo
+  printf "%s----------------------------------------------------------------------%s\n" "$C_CYAN" "$C_RESET"
+  printf "%s请直接整段粘贴 Padding Scheme 规则内容（支持多行连续粘贴）：%s\n" "$C_GREEN" "$C_RESET"
+  printf "说明：\n"
+  printf "  1. 支持整段直接粘贴；若包含注释（如 # 美西、# 亚太）会自动过滤。\n"
+  printf "  2. %s若未显式指定 stop=*，脚本将根据步骤自动推导并补全 stop=*。%s\n" "$C_YELLOW" "$C_RESET"
+  printf "  3. %s粘贴完成后，请在新的一行输入 [ok] 并按回车提交（输入 [q] 可取消）。%s\n" "$C_GREEN" "$C_RESET"
+  printf "%s----------------------------------------------------------------------%s\n" "$C_CYAN" "$C_RESET"
+
+  local raw_lines=() line
+  while true; do
+    if ! IFS= read -r line; then
+      # EOF (Ctrl+D)
+      break
+    fi
+    line=$(tr -d '\r' <<<"$line")
+    local trimmed
+    trimmed=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$line")
+    if [[ "$trimmed" =~ ^(?i)(ok|done)$ ]]; then
+      break
+    fi
+    if [[ "$trimmed" =~ ^(?i)(q|quit|cancel)$ ]]; then
+      warn "已取消输入。"
+      return 1
+    fi
+    raw_lines+=("$trimmed")
+  done
+
+  local cleaned_rules=() has_stop=0 user_stop="" max_step=-1
+  for item in "${raw_lines[@]}"; do
+    item=$(tr -d '\r' <<<"$item")
+    item=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$item")
+    [[ -z "$item" ]] && continue
+    # 忽略注释行
+    [[ "$item" =~ ^([#]|//|/\*) ]] && continue
+    # 清理包裹引号与尾随逗号、分号
+    item=$(sed -e 's/^["'\'' ]*//' -e 's/["'\'',; ]*$//' <<<"$item")
+    [[ -z "$item" ]] && continue
+
+    if [[ "$item" =~ ^stop=([0-9]+)$ ]]; then
+      has_stop=1
+      user_stop="${BASH_REMATCH[1]}"
+      continue
+    fi
+
+    if [[ "$item" =~ ^([0-9]+)= ]]; then
+      local step_num="${BASH_REMATCH[1]}"
+      if (( step_num > max_step )); then
+        max_step=$step_num
+      fi
+    fi
+
+    if ! [[ "$item" =~ ^[0-9a-zA-Z_=,-]+$ ]]; then
+      warn "规则包含非法字符: [${item}]"
+      return 1
+    fi
+
+    cleaned_rules+=("$item")
+  done
+
+  if (( ${#cleaned_rules[@]} == 0 )); then
+    warn "未检测到任何有效的规则项，已放弃修改。"
+    return 1
+  fi
+
+  local final_stop
+  if (( has_stop )); then
+    final_stop="$user_stop"
+  else
+    if (( max_step >= 0 )); then
+      final_stop=$(( max_step + 1 ))
+    else
+      final_stop=${#cleaned_rules[@]}
+    fi
+    info "检测到未显式指定 stop 参数，已根据规则自动补全为: [stop=${final_stop}]"
+  fi
+
+  local final_rules=("stop=${final_stop}" "${cleaned_rules[@]}")
+  local rules_json
+  rules_json=$(printf '%s\n' "${final_rules[@]}" | jq -R . | jq -s .)
+
+  echo
+  info "正在更新节点 [${name}] 的混淆策略并进行配置安全预检……"
+  nodes=$(current_nodes_json)
+  local new_nodes
+  new_nodes=$(jq -c --argjson idx "$index" --argjson pad "$rules_json" '.[$idx].padding_scheme = $pad' <<<"$nodes")
+
+  save_nodes_json "$new_nodes"
+  ok "节点 [${name}] 的 AnyTLS Padding Scheme 规则已成功更新并永久生效！"
+  echo
+  printf "已生效混淆规则:\n"
+  jq -r '.[]' <<<"$rules_json" | sed 's/^/  /'
+  echo
+  pause_prompt
+  return 0
+}
+
+edit_node_padding_scheme() {
+  local index=$1
+  local nodes old name proto cur_scheme pad_cnt
+  nodes=$(current_nodes_json)
+  old=$(jq -c ".[$index]" <<<"$nodes")
+  name=$(jq -r '.name' <<<"$old")
+  proto=$(jq -r '.protocol // "anytls"' <<<"$old")
+
+  if [[ "$proto" != "anytls" ]]; then
+    warn "当前节点协议为 [$(protocol_label "$proto")]，不支持 Padding Scheme。"
+    return 0
+  fi
+
+  while true; do
+    nodes=$(current_nodes_json)
+    old=$(jq -c ".[$index]" <<<"$nodes")
+    cur_scheme=$(jq -c '.padding_scheme // empty' <<<"$old")
+
+    echo
+    printf "%s=== 节点 [%s] AnyTLS 混淆策略 (Padding Scheme) ===%s\n" "$C_CYAN" "$name" "$C_RESET"
+    if [[ -n "$cur_scheme" && "$cur_scheme" != "null" ]] && jq -e 'type == "array" and length > 0' <<<"$cur_scheme" >/dev/null 2>&1; then
+      pad_cnt=$(jq 'length' <<<"$cur_scheme")
+      printf "  当前状态: %s自定义规则 (共 %d 项)%s\n" "$C_GREEN" "$pad_cnt" "$C_RESET"
+      printf "  规则列表:\n"
+      jq -r '.[]' <<<"$cur_scheme" | sed 's/^/    /'
+    else
+      printf "  当前状态: %s系统默认规则 (8 轮阶梯混淆，stop=8)%s\n" "$C_YELLOW" "$C_RESET"
+      printf "  默认规则:\n"
+      printf "    stop=8\n    0=32-76\n    1=84-252\n    2=204-508,c,276-668,c,116-332\n    3=68-204,c,124-324\n    4=88-268\n    5=60-204\n    6=44-172\n    7=28-140\n"
+    fi
+
+    echo
+    printf "  1) 粘贴/输入自定义规则 (多行直接粘贴，输入 ok 提交)\n"
+    printf "  2) 还原为系统默认规则\n"
+    printf "  0) 返回上级修改菜单\n"
+    local pad_choice
+    read -r -p "请输入选择 [0-2，默认: 0]: " pad_choice
+    pad_choice=${pad_choice:-0}
+    case "$pad_choice" in
+      1)
+        if collect_and_apply_padding_scheme "$index"; then
+          return 0
+        fi
+        ;;
+      2)
+        local confirm_reset
+        read -r -p "确认还原节点 [${name}] 的 Padding 规则为系统默认？[Y/n]: " confirm_reset
+        confirm_reset=${confirm_reset:-Y}
+        if [[ "$confirm_reset" =~ ^[yY]$ ]]; then
+          nodes=$(current_nodes_json)
+          local updated_nodes
+          updated_nodes=$(jq -c --argjson idx "$index" '.[$idx] |= del(.padding_scheme)' <<<"$nodes")
+          save_nodes_json "$updated_nodes"
+          ok "已还原节点 [${name}] 的 Padding 规则为系统默认！"
+          pause_prompt
+          return 0
+        else
+          info "已取消还原。"
+        fi
+        ;;
+      0|"") return 0 ;;
+      *) warn "无效选择。"; sleep 1 ;;
+    esac
+  done
+}
+
 edit_node_wizard() {
   local index=$1
   local nodes old old_port new_port node
@@ -4102,7 +4311,7 @@ edit_node_wizard() {
 
 edit_single_node_menu() {
   local index=$1
-  local choice nodes node
+  local choice nodes node proto
 
   while true; do
     nodes=$(current_nodes_json)
@@ -4111,6 +4320,8 @@ edit_single_node_menu() {
       warn "目标节点不存在或已被删除。"
       return 0
     fi
+
+    proto=$(jq -r '.protocol // "anytls"' <<<"$node")
 
     print_node_summary_card "$node" "$((index + 1))"
     echo
@@ -4122,25 +4333,51 @@ edit_single_node_menu() {
     printf "  5) 修改节点名称\n"
     printf "  6) 修改连接地址\n"
     printf "  7) 修改流量策略\n"
-    printf "  8) 完整重新配置\n"
-    printf "  0) 返回节点列表\n"
-    read -r -p "请输入选择 [0-8，默认: 0]: " choice
+    if [[ "$proto" == "anytls" ]]; then
+      printf "  8) 修改混淆规则 (AnyTLS Padding Scheme)\n"
+      printf "  9) 完整重新配置\n"
+      printf "  0) 返回节点列表\n"
+      read -r -p "请输入选择 [0-9，默认: 0]: " choice
+    else
+      printf "  8) 完整重新配置\n"
+      printf "  0) 返回节点列表\n"
+      read -r -p "请输入选择 [0-8，默认: 0]: " choice
+    fi
     choice=${choice:-0}
-    case "$choice" in
-      1) edit_node_protocol "$index" ;;
-      2) edit_node_outbound "$index" ;;
-      3) edit_node_port "$index" ;;
-      4) edit_node_credentials "$index" ;;
-      5) edit_node_name "$index" ;;
-      6) edit_node_domain "$index" ;;
-      7) edit_node_traffic "$index" ;;
-      8) edit_node_wizard "$index" ;;
-      0|"") return 0 ;;
-      *)
-        warn "无效选择。"
-        sleep 1
-        ;;
-    esac
+    if [[ "$proto" == "anytls" ]]; then
+      case "$choice" in
+        1) edit_node_protocol "$index" ;;
+        2) edit_node_outbound "$index" ;;
+        3) edit_node_port "$index" ;;
+        4) edit_node_credentials "$index" ;;
+        5) edit_node_name "$index" ;;
+        6) edit_node_domain "$index" ;;
+        7) edit_node_traffic "$index" ;;
+        8) edit_node_padding_scheme "$index" ;;
+        9) edit_node_wizard "$index" ;;
+        0|"") return 0 ;;
+        *)
+          warn "无效选择。"
+          sleep 1
+          ;;
+      esac
+    else
+      case "$choice" in
+        1) edit_node_protocol "$index" ;;
+        2) edit_node_outbound "$index" ;;
+        3) edit_node_port "$index" ;;
+        4) edit_node_credentials "$index" ;;
+        5) edit_node_name "$index" ;;
+        6) edit_node_domain "$index" ;;
+        7) edit_node_traffic "$index" ;;
+        8) edit_node_wizard "$index" ;;
+        0|"") return 0 ;;
+        *)
+          warn "无效选择。"
+          sleep 1
+          ;;
+      esac
+    fi
   done
 }
 
@@ -4313,6 +4550,11 @@ show_client() {
       anytls)
         pass=$(jq -r '.password' <<<"$node")
         printf "  AnyTLS 密码: %s\n" "$pass"
+        if jq -e '.padding_scheme | type == "array" and length > 0' <<<"$node" >/dev/null 2>&1; then
+          printf "  Padding 混淆: 自定义规则 (共 %s 项)\n" "$(jq '.padding_scheme | length' <<<"$node")"
+        else
+          printf "  Padding 混淆: 系统默认 (stop=8)\n"
+        fi
         printf "  分享链接: anytls://%s@%s:%s?sni=%s#%s\n" "$pass" "$domain" "$port" "$domain" "$(printf "%s" "$name" | jq -sRr @uri)"
         ;;
       shadowsocks)
