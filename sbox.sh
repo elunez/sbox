@@ -5,9 +5,12 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.6"
+readonly SCRIPT_VERSION="0.0.7"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
+
+readonly DEFAULT_ANYTLS_PADDING_JSON='["stop=8","0=32-80","1=80-240","2=200-480,c,240-580,c,100-280","3=60-180,c,100-260","4=80-220","5=56-180","6=40-150","7=28-120"]'
+readonly LEGACY_ANYTLS_PADDING_JSON='["stop=8","0=32-76","1=84-252","2=204-508,c,276-668,c,116-332","3=68-204,c,124-324","4=88-268","5=60-204","6=44-172","7=28-140"]'
 
 readonly CONFIG_DIR="${CONFIG_DIR:-/etc/sing-box}"
 readonly CONFIG_FILE="${CONFIG_FILE:-${CONFIG_DIR}/config.json}"
@@ -288,6 +291,7 @@ migrate_legacy_state() {
 
 auto_heal_service() {
   migrate_legacy_state
+  sync_anytls_default_padding
   if [[ -s "$CONFIG_FILE" ]] && command -v sing-box >/dev/null 2>&1; then
     ensure_service_file
     if ! service_is_running; then
@@ -2889,14 +2893,14 @@ generate_config_from_state() {
           users: [{name: $n.name, password: $n.password}],
           padding_scheme: (if ($n.padding_scheme | type == "array" and length > 0) then $n.padding_scheme else [
             "stop=8",
-            "0=32-76",
-            "1=84-252",
-            "2=204-508,c,276-668,c,116-332",
-            "3=68-204,c,124-324",
-            "4=88-268",
-            "5=60-204",
-            "6=44-172",
-            "7=28-140"
+            "0=32-80",
+            "1=80-240",
+            "2=200-480,c,240-580,c,100-280",
+            "3=60-180,c,100-260",
+            "4=80-220",
+            "5=56-180",
+            "6=40-150",
+            "7=28-120"
           ] end),
           tls: cert_tls($n)
         }
@@ -3150,6 +3154,52 @@ save_nodes_json() {
     firewall_allow_port "$n_port" "$(case "$n_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
   done < <(jq -c '.[]?' <<<"$nodes")
   ensure_sbox_cli
+}
+
+sync_anytls_default_padding() {
+  [[ -r "$STATE_FILE" ]] || return 0
+  state_has_nodes || return 0
+
+  local nodes modified=0
+  nodes=$(current_nodes_json 2>/dev/null || echo "[]")
+  [[ "$nodes" != "[]" ]] || return 0
+
+  # 1. 检查 state.json 中是否有节点被显式写入了旧版默认规则
+  # 若显式配置刚好是旧版默认规则，清除该节点的 padding_scheme 使其自动采用最新默认；
+  # 若是用户配置的其他自定义规则（如美西规则或任意定制 padding），则予以保留绝对不修改。
+  if jq -e --argjson leg "$LEGACY_ANYTLS_PADDING_JSON" '
+    any(.[]?; .protocol == "anytls" and (.padding_scheme // null) != null and .padding_scheme == $leg)
+  ' <<<"$nodes" >/dev/null 2>&1; then
+    nodes=$(jq -c --argjson leg "$LEGACY_ANYTLS_PADDING_JSON" '
+      map(if .protocol == "anytls" and (.padding_scheme // null) != null and .padding_scheme == $leg then del(.padding_scheme) else . end)
+    ' <<<"$nodes")
+    modified=1
+  fi
+
+  # 2. 检查当前已生成的 config.json 中 AnyTLS 默认节点是否仍在使用旧版规则特征
+  # （例如包含旧版特征 "0=32-76" 且存在未设置自定义规则的 AnyTLS 节点）
+  local need_refresh_config=0
+  if (( modified )); then
+    need_refresh_config=1
+  elif [[ -s "$CONFIG_FILE" ]] && grep -q '"0=32-76"' "$CONFIG_FILE" 2>/dev/null; then
+    if jq -e 'any(.[]?; .protocol == "anytls" and ((.padding_scheme // null) == null or (.padding_scheme | length) == 0))' <<<"$nodes" >/dev/null 2>&1; then
+      need_refresh_config=1
+    fi
+  fi
+
+  if (( need_refresh_config )); then
+    if service_is_installed && command -v sing-box >/dev/null 2>&1; then
+      info "检测到 AnyTLS 默认 Padding Scheme 混淆策略升级，正在自动同步并重载服务..."
+      save_nodes_json "$nodes"
+      ok "AnyTLS 默认混淆规则已自动更新为最新推荐策略！"
+    elif (( modified )); then
+      local tmp
+      tmp=$(mktemp)
+      jq --argjson nodes "$nodes" '.nodes = $nodes' "$STATE_FILE" >"$tmp"
+      install -m 0600 "$tmp" "$STATE_FILE"
+      rm -f "$tmp"
+    fi
+  fi
 }
 
 render_node_table_fallback() {
@@ -4224,7 +4274,7 @@ edit_node_padding_scheme() {
     else
       printf "  当前状态: %s系统默认规则 (8 轮阶梯混淆，stop=8)%s\n" "$C_YELLOW" "$C_RESET"
       printf "  默认规则:\n"
-      printf "    stop=8\n    0=32-76\n    1=84-252\n    2=204-508,c,276-668,c,116-332\n    3=68-204,c,124-324\n    4=88-268\n    5=60-204\n    6=44-172\n    7=28-140\n"
+      printf "    stop=8\n    0=32-80\n    1=80-240\n    2=200-480,c,240-580,c,100-280\n    3=60-180,c,100-260\n    4=80-220\n    5=56-180\n    6=40-150\n    7=28-120\n"
     fi
 
     echo
@@ -5778,6 +5828,7 @@ update_self_script() {
     install_deploy_hook 2>/dev/null || true
     sync_traffic_cron 2>/dev/null || true
     sync_traffic_rules 2>/dev/null || true
+    sync_anytls_default_padding 2>/dev/null || true
     info "后台定时重置任务与证书续签钩子已同步刷新。"
   fi
 
