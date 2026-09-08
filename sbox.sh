@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.7"
+readonly SCRIPT_VERSION="0.0.8"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -4155,25 +4155,43 @@ collect_and_apply_padding_scheme() {
   printf "说明：\n"
   printf "  1. 支持整段直接粘贴；若包含注释（如 # 美西、# 亚太）会自动过滤。\n"
   printf "  2. %s若未显式指定 stop=*，脚本将根据步骤自动推导并补全 stop=*。%s\n" "$C_YELLOW" "$C_RESET"
-  printf "  3. %s粘贴完成后，请在新的一行输入 [ok] 并按回车提交（输入 [q] 可取消）。%s\n" "$C_GREEN" "$C_RESET"
+  printf "  3. %s粘贴完成后，直接按一次 [回车] 即可确认提交！%s\n" "$C_GREEN" "$C_RESET"
+  printf "     • 也可使用快捷键立即提交：\n"
+  printf "       - %sMac 用户%s:      按快捷键 [ %scontrol + d%s ] 提交\n" "$C_CYAN" "$C_RESET" "$C_GREEN" "$C_RESET"
+  printf "       - %sWindows 用户%s:  按快捷键 [ %sCtrl + D%s ] 提交 (或 Ctrl+Z 回车)\n" "$C_CYAN" "$C_RESET" "$C_GREEN" "$C_RESET"
+  printf "       - %s取消输入%s:      直接输入 [q] 并回车\n" "$C_CYAN" "$C_RESET"
   printf "%s----------------------------------------------------------------------%s\n" "$C_CYAN" "$C_RESET"
 
   local raw_lines=() line
   while true; do
     if ! IFS= read -r line; then
-      # EOF (Ctrl+D)
+      # 捕获 EOF (Mac: control + d, Windows: Ctrl + D)
       break
     fi
     line=$(tr -d '\r' <<<"$line")
     local trimmed
     trimmed=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$line")
-    if [[ "$trimmed" =~ ^(?i)(ok|done)$ ]]; then
+    local lower
+    lower=$(printf '%s' "$trimmed" | tr '[:upper:]' '[:lower:]')
+
+    # 支持 Windows 部分终端传入的 Ctrl+Z (ASCII 0x1a / ^Z)
+    if [[ "$trimmed" == $'\x1a'* || "$lower" == "^z" ]]; then
       break
     fi
-    if [[ "$trimmed" =~ ^(?i)(q|quit|cancel)$ ]]; then
+
+    if [[ "$lower" == "q" || "$lower" == "quit" || "$lower" == "cancel" ]]; then
       warn "已取消输入。"
       return 1
     fi
+
+    # 直接回车提交：只要已有输入规则，遇到空行（直接按回车）立即结束并提交
+    if [[ -z "$trimmed" ]]; then
+      if (( ${#raw_lines[@]} > 0 )); then
+        break
+      fi
+      continue
+    fi
+
     raw_lines+=("$trimmed")
   done
 
@@ -4278,7 +4296,7 @@ edit_node_padding_scheme() {
     fi
 
     echo
-    printf "  1) 粘贴/输入自定义规则 (多行直接粘贴，输入 ok 提交)\n"
+    printf "  1) 粘贴/输入自定义规则 (多行直接粘贴，直接回车或快捷键提交)\n"
     printf "  2) 还原为系统默认规则\n"
     printf "  0) 返回上级修改菜单\n"
     local pad_choice
