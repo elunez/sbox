@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.8"
+readonly SCRIPT_VERSION="0.0.9"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -19,6 +19,7 @@ readonly STATE_DIR="${STATE_DIR:-/etc/sbox}"
 readonly STATE_FILE="${STATE_FILE:-${STATE_DIR}/state.json}"
 readonly BACKUP_DIR="${BACKUP_DIR:-${STATE_DIR}/backups}"
 readonly TRAFFIC_LOG="${TRAFFIC_LOG:-${STATE_DIR}/traffic_reset.log}"
+readonly PADDING_CONF_FILE="${PADDING_CONF_FILE:-${STATE_DIR}/anytls_padding.conf}"
 
 readonly DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/sing-box"
 readonly DNSPOD_CREDENTIAL_FILE="${STATE_DIR}/dnspod.json"
@@ -2873,10 +2874,81 @@ validate_nodes_state() {
   done < <(jq -c '.nodes[]?' "$state_file")
 }
 
+parse_padding_scheme_text() {
+  local input=$1
+  local cleaned_rules=() has_stop=0 user_stop="" max_step=-1 item
+  while IFS= read -r item || [[ -n "$item" ]]; do
+    item=$(tr -d '\r' <<<"$item")
+    item=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$item")
+    [[ -z "$item" ]] && continue
+    [[ "$item" =~ ^([#]|//|/\*) ]] && continue
+    item=$(sed -e 's/^["'\'' ]*//' -e 's/["'\'',; ]*$//' <<<"$item")
+    [[ -z "$item" ]] && continue
+
+    if [[ "$item" =~ ^stop=([0-9]+)$ ]]; then
+      has_stop=1
+      user_stop="${BASH_REMATCH[1]}"
+      continue
+    fi
+
+    if [[ "$item" =~ ^([0-9]+)= ]]; then
+      local step_num="${BASH_REMATCH[1]}"
+      if (( step_num > max_step )); then
+        max_step=$step_num
+      fi
+    fi
+
+    if ! [[ "$item" =~ ^[0-9a-zA-Z_=,-]+$ ]]; then
+      return 1
+    fi
+
+    cleaned_rules+=("$item")
+  done <<<"$input"
+
+  if (( ${#cleaned_rules[@]} == 0 )); then
+    return 1
+  fi
+
+  local final_stop
+  if (( has_stop )); then
+    final_stop="$user_stop"
+  else
+    if (( max_step >= 0 )); then
+      final_stop=$(( max_step + 1 ))
+    else
+      final_stop=${#cleaned_rules[@]}
+    fi
+  fi
+
+  local final_rules=("stop=${final_stop}" "${cleaned_rules[@]}")
+  printf '%s\n' "${final_rules[@]}" | jq -R . | jq -s .
+}
+
+parse_padding_scheme_file() {
+  local file=$1
+  [[ -s "$file" ]] || return 1
+  local content
+  content=$(cat "$file")
+  parse_padding_scheme_text "$content"
+}
+
+get_default_padding_scheme_json() {
+  if [[ -s "$PADDING_CONF_FILE" ]]; then
+    local parsed
+    if parsed=$(parse_padding_scheme_file "$PADDING_CONF_FILE" 2>/dev/null) && jq -e 'type == "array" and length > 0' <<<"$parsed" >/dev/null 2>&1; then
+      echo "$parsed"
+      return 0
+    fi
+  fi
+  echo "$DEFAULT_ANYTLS_PADDING_JSON"
+}
+
 generate_config_from_state() {
   local output=$1 state_file=${2:-$STATE_FILE}
   validate_nodes_state "$state_file"
-  jq --arg cert_dir "$CERT_DIR" '
+  local default_pad
+  default_pad=$(get_default_padding_scheme_json)
+  jq --arg cert_dir "$CERT_DIR" --argjson default_pad "$default_pad" '
     def cert_tls($n): {
       enabled: true,
       server_name: $n.domain,
@@ -2891,17 +2963,7 @@ generate_config_from_state() {
           listen: "::",
           listen_port: $n.port,
           users: [{name: $n.name, password: $n.password}],
-          padding_scheme: (if ($n.padding_scheme | type == "array" and length > 0) then $n.padding_scheme else [
-            "stop=8",
-            "0=32-80",
-            "1=80-240",
-            "2=200-480,c,240-580,c,100-280",
-            "3=60-180,c,100-260",
-            "4=80-220",
-            "5=56-180",
-            "6=40-150",
-            "7=28-120"
-          ] end),
+          padding_scheme: (if ($n.padding_scheme | type == "array" and length > 0) then $n.padding_scheme else $default_pad end),
           tls: cert_tls($n)
         }
       elif $n.protocol == "shadowsocks" then
@@ -3156,7 +3218,45 @@ save_nodes_json() {
   ensure_sbox_cli
 }
 
+ensure_default_padding_conf_file() {
+  if [[ ! -s "$PADDING_CONF_FILE" ]]; then
+    install -d -m 0700 "$STATE_DIR"
+    local script_dir
+    script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")
+    if [[ -n "$script_dir" && -s "${script_dir}/conf/anytls_padding.conf" ]]; then
+      cp -f "${script_dir}/conf/anytls_padding.conf" "$PADDING_CONF_FILE"
+    else
+      cat >"$PADDING_CONF_FILE" <<'EOF'
+# AnyTLS 默认 Padding Scheme 混淆策略配置文件
+#
+# 说明：
+# 1. 每一行为一条步骤混淆规则，格式为：[步骤]=[包长区间] 或 stop=[总轮数]
+# 2. 支持在行内或独立行使用 # 或 // 注释，脚本会自动忽略注释行与两端空白。
+# 3. 若未显式配置 stop=*，脚本会自动根据步骤数量推导并补全 stop=*。
+# 4. 此文件定义系统 AnyTLS 节点的默认混淆策略：
+#    - 修改此文件后，更新脚本或启动面板将自动同步并平滑重载 sing-box 服务。
+#    - 若在节点管理中对某一节点单独配置了自定义规则，该节点不受此文件影响。
+# 5. VPS 本地修改支持：
+#    - 配置文件在 VPS 上安装于 /etc/sbox/anytls_padding.conf
+#    - 你也可以直接用 nano 在本地修改它，脚本启动自愈时感知到变动也会自动重载生效。
+
+stop=8
+0=32-80
+1=80-240
+2=200-480,c,240-580,c,100-280
+3=60-180,c,100-260
+4=80-220
+5=56-180
+6=40-150
+7=28-120
+EOF
+    fi
+    chmod 0644 "$PADDING_CONF_FILE"
+  fi
+}
+
 sync_anytls_default_padding() {
+  ensure_default_padding_conf_file
   [[ -r "$STATE_FILE" ]] || return 0
   state_has_nodes || return 0
 
@@ -3176,22 +3276,31 @@ sync_anytls_default_padding() {
     modified=1
   fi
 
-  # 2. 检查当前已生成的 config.json 中 AnyTLS 默认节点是否仍在使用旧版规则特征
-  # （例如包含旧版特征 "0=32-76" 且存在未设置自定义规则的 AnyTLS 节点）
-  local need_refresh_config=0
+  # 2. 检查当前 config.json 中 AnyTLS 默认节点是否需要同步更新
+  local current_default_pad need_refresh_config=0
+  current_default_pad=$(get_default_padding_scheme_json)
+
   if (( modified )); then
     need_refresh_config=1
-  elif [[ -s "$CONFIG_FILE" ]] && grep -q '"0=32-76"' "$CONFIG_FILE" 2>/dev/null; then
+  elif [[ -s "$CONFIG_FILE" ]]; then
     if jq -e 'any(.[]?; .protocol == "anytls" and ((.padding_scheme // null) == null or (.padding_scheme | length) == 0))' <<<"$nodes" >/dev/null 2>&1; then
-      need_refresh_config=1
+      local active_default_pad
+      active_default_pad=$(jq -c '
+        [.inbounds[]? | select(.type == "anytls") | .padding_scheme // []] | .[0] // []
+      ' "$CONFIG_FILE" 2>/dev/null || echo "[]")
+      if [[ "$active_default_pad" != "[]" && "$active_default_pad" != "$current_default_pad" ]]; then
+        need_refresh_config=1
+      elif grep -q '"0=32-76"' "$CONFIG_FILE" 2>/dev/null; then
+        need_refresh_config=1
+      fi
     fi
   fi
 
   if (( need_refresh_config )); then
     if service_is_installed && command -v sing-box >/dev/null 2>&1; then
-      info "检测到 AnyTLS 默认 Padding Scheme 混淆策略升级，正在自动同步并重载服务..."
+      info "检测到 AnyTLS 默认混淆规则变更或需同步，正在自动生成新配置并重载服务..."
       save_nodes_json "$nodes"
-      ok "AnyTLS 默认混淆规则已自动更新为最新推荐策略！"
+      ok "AnyTLS 默认混淆规则已自动同步更新并重载生效！"
     elif (( modified )); then
       local tmp
       tmp=$(mktemp)
@@ -4195,58 +4304,13 @@ collect_and_apply_padding_scheme() {
     raw_lines+=("$trimmed")
   done
 
-  local cleaned_rules=() has_stop=0 user_stop="" max_step=-1
-  for item in "${raw_lines[@]}"; do
-    item=$(tr -d '\r' <<<"$item")
-    item=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$item")
-    [[ -z "$item" ]] && continue
-    # 忽略注释行
-    [[ "$item" =~ ^([#]|//|/\*) ]] && continue
-    # 清理包裹引号与尾随逗号、分号
-    item=$(sed -e 's/^["'\'' ]*//' -e 's/["'\'',; ]*$//' <<<"$item")
-    [[ -z "$item" ]] && continue
-
-    if [[ "$item" =~ ^stop=([0-9]+)$ ]]; then
-      has_stop=1
-      user_stop="${BASH_REMATCH[1]}"
-      continue
-    fi
-
-    if [[ "$item" =~ ^([0-9]+)= ]]; then
-      local step_num="${BASH_REMATCH[1]}"
-      if (( step_num > max_step )); then
-        max_step=$step_num
-      fi
-    fi
-
-    if ! [[ "$item" =~ ^[0-9a-zA-Z_=,-]+$ ]]; then
-      warn "规则包含非法字符: [${item}]"
-      return 1
-    fi
-
-    cleaned_rules+=("$item")
-  done
-
-  if (( ${#cleaned_rules[@]} == 0 )); then
-    warn "未检测到任何有效的规则项，已放弃修改。"
+  local raw_text
+  raw_text=$(printf '%s\n' "${raw_lines[@]}")
+  local rules_json
+  if ! rules_json=$(parse_padding_scheme_text "$raw_text" 2>/dev/null) || [[ -z "$rules_json" ]] || ! jq -e 'type == "array" and length > 0' <<<"$rules_json" >/dev/null 2>&1; then
+    warn "规则格式无效或未包含有效规则项，已放弃修改。"
     return 1
   fi
-
-  local final_stop
-  if (( has_stop )); then
-    final_stop="$user_stop"
-  else
-    if (( max_step >= 0 )); then
-      final_stop=$(( max_step + 1 ))
-    else
-      final_stop=${#cleaned_rules[@]}
-    fi
-    info "检测到未显式指定 stop 参数，已根据规则自动补全为: [stop=${final_stop}]"
-  fi
-
-  local final_rules=("stop=${final_stop}" "${cleaned_rules[@]}")
-  local rules_json
-  rules_json=$(printf '%s\n' "${final_rules[@]}" | jq -R . | jq -s .)
 
   echo
   info "正在更新节点 [${name}] 的混淆策略并进行配置安全预检……"
@@ -4290,9 +4354,11 @@ edit_node_padding_scheme() {
       printf "  规则列表:\n"
       jq -r '.[]' <<<"$cur_scheme" | sed 's/^/    /'
     else
-      printf "  当前状态: %s系统默认规则 (8 轮阶梯混淆，stop=8)%s\n" "$C_YELLOW" "$C_RESET"
+      local def_rules
+      def_rules=$(get_default_padding_scheme_json)
+      printf "  当前状态: %s系统默认策略 (跟随 %s)%s\n" "$C_YELLOW" "$PADDING_CONF_FILE" "$C_RESET"
       printf "  默认规则:\n"
-      printf "    stop=8\n    0=32-80\n    1=80-240\n    2=200-480,c,240-580,c,100-280\n    3=60-180,c,100-260\n    4=80-220\n    5=56-180\n    6=40-150\n    7=28-120\n"
+      jq -r '.[]' <<<"$def_rules" | sed 's/^/    /'
     fi
 
     echo
@@ -5840,6 +5906,32 @@ update_self_script() {
 
   rm -f "$tmp_file"
   ok "sbox 脚本已成功更新至 v${remote_version}！"
+
+  # 自动同步远端 AnyTLS 默认混淆策略配置文件 (anytls_padding.conf)
+  local pad_tmp
+  pad_tmp=$(mktemp "/tmp/sbox_pad_XXXXXX.conf" 2>/dev/null || echo "/tmp/sbox_pad_$$.conf")
+  local pad_urls=(
+    "https://raw.githubusercontent.com/elunez/sbox/main/conf/anytls_padding.conf?v=${ts}"
+    "https://raw.gitmirror.com/elunez/sbox/main/conf/anytls_padding.conf?v=${ts}"
+    "https://ghproxy.net/https://raw.githubusercontent.com/elunez/sbox/main/conf/anytls_padding.conf?v=${ts}"
+    "https://fastly.jsdelivr.net/gh/elunez/sbox@main/conf/anytls_padding.conf?v=${ts}"
+    "https://cdn.jsdelivr.net/gh/elunez/sbox@main/conf/anytls_padding.conf?v=${ts}"
+  )
+  for pu in "${pad_urls[@]}"; do
+    if curl -fsSL -H "Cache-Control: no-cache, no-store, must-revalidate" -H "Pragma: no-cache" --connect-timeout 6 -m 15 "$pu" -o "$pad_tmp" 2>/dev/null && [[ -s "$pad_tmp" ]]; then
+      local parsed_pad
+      if parsed_pad=$(parse_padding_scheme_file "$pad_tmp" 2>/dev/null) && jq -e 'type == "array" and length > 0' <<<"$parsed_pad" >/dev/null 2>&1; then
+        if ! cmp -s "$pad_tmp" "$PADDING_CONF_FILE" 2>/dev/null; then
+          install -d -m 0700 "$STATE_DIR"
+          install -m 0644 "$pad_tmp" "$PADDING_CONF_FILE"
+          info "检测到远端 AnyTLS 混淆策略配置文件更新，已同步至本地。"
+        fi
+        break
+      fi
+    fi
+    rm -f "$pad_tmp"
+  done
+  rm -f "$pad_tmp"
 
   # 自动同步刷新定时任务、证书续期钩子与防火墙规则
   if service_is_installed || [[ -r "$STATE_FILE" ]]; then
