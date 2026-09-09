@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.10"
+readonly SCRIPT_VERSION="0.0.11"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -293,6 +293,15 @@ migrate_legacy_state() {
 auto_heal_service() {
   migrate_legacy_state
   sync_anytls_default_padding
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    if timedatectl 2>/dev/null | grep -qi "System clock synchronized: no"; then
+      ensure_time_sync_service 2>/dev/null || true
+    fi
+  elif command -v chronyc >/dev/null 2>&1; then
+    if ! chronyc tracking >/dev/null 2>&1; then
+      ensure_time_sync_service 2>/dev/null || true
+    fi
+  fi
   if [[ -s "$CONFIG_FILE" ]] && command -v sing-box >/dev/null 2>&1; then
     ensure_service_file
     if ! service_is_running; then
@@ -1927,8 +1936,11 @@ ensure_time_sync_service() {
       case "$PKG_MGR" in
         apt)
           export DEBIAN_FRONTEND=noninteractive
-          apt-get install -y --no-install-recommends systemd-timesyncd >/dev/null 2>&1 || \
-            apt-get install -y --no-install-recommends chrony >/dev/null 2>&1 || true
+          if ! apt-get install -y --no-install-recommends systemd-timesyncd >/dev/null 2>&1; then
+            apt-get update -y >/dev/null 2>&1 || true
+            apt-get install -y --no-install-recommends systemd-timesyncd >/dev/null 2>&1 || \
+              apt-get install -y --no-install-recommends chrony >/dev/null 2>&1 || true
+          fi
           ;;
         dnf|yum)
           $PKG_MGR install -y chrony >/dev/null 2>&1 || true
