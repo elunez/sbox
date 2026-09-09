@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.9"
+readonly SCRIPT_VERSION="0.0.10"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -1864,18 +1864,18 @@ ensure_service_file() {
 
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     local unit_file="/etc/systemd/system/${SYSTEMD_SERVICE}"
-    if [[ ! -f "$unit_file" ]] || ! grep -q "\-c ${CONFIG_FILE}" "$unit_file" 2>/dev/null || ! grep -q "LogRateLimitIntervalSec" "$unit_file" 2>/dev/null; then
+    if [[ ! -f "$unit_file" ]] || ! grep -q "\-c ${CONFIG_FILE}" "$unit_file" 2>/dev/null || ! grep -q "LogRateLimitIntervalSec" "$unit_file" 2>/dev/null || ! grep -q "time-sync.target" "$unit_file" 2>/dev/null || ! grep -q "CAP_NET_RAW" "$unit_file" 2>/dev/null; then
       info "配置 ${SYSTEMD_SERVICE} 服务单元……"
       cat > "$unit_file" <<EOF
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target network-online.target
-Wants=network-online.target
+After=network.target nss-lookup.target network-online.target time-sync.target firewalld.service ufw.service nftables.service
+Wants=network-online.target time-sync.target
 
 [Service]
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
 ExecStartPre=-/usr/local/bin/sbox --sync-traffic
 ExecStart=${bin_path} -D /var/lib/sing-box -c ${CONFIG_FILE} run
 ExecReload=/bin/kill -HUP \$MAINPID
@@ -1906,7 +1906,7 @@ error_log="/var/log/sing-box.log"
 
 depend() {
     need net
-    after firewall
+    after firewall chronyd
 }
 
 start_pre() {
@@ -1916,6 +1916,54 @@ EOF
     chmod 0755 "$rc_file"
     rc-update add sing-box default >/dev/null 2>&1 || true
   fi
+}
+
+ensure_time_sync_service() {
+  detect_os
+  info "配置系统时间同步服务 (NTP)……"
+
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    if ! systemctl list-unit-files 2>/dev/null | grep -qE '^(systemd-timesyncd|chronyd?)\.service'; then
+      case "$PKG_MGR" in
+        apt)
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y --no-install-recommends systemd-timesyncd >/dev/null 2>&1 || \
+            apt-get install -y --no-install-recommends chrony >/dev/null 2>&1 || true
+          ;;
+        dnf|yum)
+          $PKG_MGR install -y chrony >/dev/null 2>&1 || true
+          ;;
+      esac
+    fi
+
+    timedatectl set-ntp true >/dev/null 2>&1 || true
+
+    if systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
+      if [[ -f "/etc/systemd/timesyncd.conf" ]]; then
+        if ! grep -q "^NTP=" /etc/systemd/timesyncd.conf 2>/dev/null; then
+          sed -i 's/^[#[:space:]]*NTP=.*/NTP=ntp.aliyun.com time1.cloud.tencent.com time.cloudflare.com pool.ntp.org/' /etc/systemd/timesyncd.conf 2>/dev/null || true
+        fi
+      fi
+      systemctl enable systemd-timesyncd >/dev/null 2>&1 || true
+      systemctl restart systemd-timesyncd >/dev/null 2>&1 || systemctl start systemd-timesyncd >/dev/null 2>&1 || true
+    elif systemctl list-unit-files 2>/dev/null | grep -qE '^chronyd?\.service'; then
+      local chrony_srv
+      chrony_srv=$(systemctl list-unit-files 2>/dev/null | grep -oE 'chronyd?\.service' | head -n 1)
+      systemctl enable "$chrony_srv" >/dev/null 2>&1 || true
+      systemctl restart "$chrony_srv" >/dev/null 2>&1 || systemctl start "$chrony_srv" >/dev/null 2>&1 || true
+      chronyc makestep >/dev/null 2>&1 || true
+    fi
+  else
+    if ! command -v chronyd >/dev/null 2>&1 && [[ "$PKG_MGR" == "apk" ]]; then
+      apk add --no-cache chrony >/dev/null 2>&1 || true
+    fi
+    if command -v chronyd >/dev/null 2>&1; then
+      rc-update add chronyd default >/dev/null 2>&1 || true
+      rc-service chronyd restart >/dev/null 2>&1 || rc-service chronyd start >/dev/null 2>&1 || true
+      chronyc makestep >/dev/null 2>&1 || true
+    fi
+  fi
+  ok "系统时间同步服务已就绪 (当前时间: $(date '+%Y-%m-%d %H:%M:%S %Z'))。"
 }
 
 ensure_systemd_service() {
@@ -2012,24 +2060,28 @@ install_dependencies_and_core() {
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -y
       apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg jq openssl certbot iproute2 nftables cron python3 tar gzip systemd-timesyncd 2>/dev/null || \
+      apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg jq openssl certbot iproute2 nftables cron python3 tar gzip chrony 2>/dev/null || \
+      apt-get install -y --no-install-recommends \
         ca-certificates curl gnupg jq openssl certbot iproute2 nftables cron python3 tar gzip
       ensure_certbot_environment
       ;;
     dnf)
       dnf install -y epel-release 2>/dev/null || true
-      dnf install -y ca-certificates curl gnupg2 jq openssl certbot iproute nftables cronie python3 tar gzip
+      dnf install -y ca-certificates curl gnupg2 jq openssl certbot iproute nftables cronie python3 tar gzip chrony
       systemctl enable --now crond >/dev/null 2>&1 || true
       ensure_certbot_environment
       ;;
     yum)
       yum install -y epel-release 2>/dev/null || true
-      yum install -y ca-certificates curl gnupg2 jq openssl certbot iproute nftables cronie python3 tar gzip
+      yum install -y ca-certificates curl gnupg2 jq openssl certbot iproute nftables cronie python3 tar gzip chrony
       systemctl enable --now crond >/dev/null 2>&1 || true
       ensure_certbot_environment
       ;;
     apk)
       apk update
-      apk add --no-cache bash ca-certificates curl gnupg jq openssl certbot iproute2 nftables tzdata python3 tar gzip coreutils dcron gcompat
+      apk add --no-cache bash ca-certificates curl gnupg jq openssl certbot iproute2 nftables tzdata python3 tar gzip coreutils dcron gcompat chrony
       rc-update add dcron default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || true
       rc-service dcron start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
       ensure_certbot_environment
@@ -2039,6 +2091,7 @@ install_dependencies_and_core() {
       ;;
   esac
 
+  ensure_time_sync_service
   install_singbox_binary
 }
 
@@ -2177,8 +2230,6 @@ traffic_install_port() {
       nft insert rule inet "$NFT_TABLE" output udp sport "$port" quota name "node_${port}_quota" drop >/dev/null 2>&1 || true
     fi
   fi
-
-  sync_traffic_cron
 }
 
 get_days_in_current_month() {
@@ -5586,6 +5637,17 @@ status_flow() {
   fi
   printf "服务运行状态:      %s\n" "$active_str"
   printf "开机自启状态:      %s\n" "$enabled_str"
+  local ntp_synced="no"
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    if timedatectl 2>/dev/null | grep -qi "System clock synchronized: yes"; then
+      ntp_synced="yes"
+    fi
+  elif command -v chronyc >/dev/null 2>&1; then
+    if chronyc tracking >/dev/null 2>&1; then
+      ntp_synced="yes"
+    fi
+  fi
+  printf "系统当前时间:      %s (NTP 状态: %s)\n" "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$(if [[ "$ntp_synced" == "yes" ]]; then echo "${C_GREEN}已同步${C_RESET}"; else echo "${C_YELLOW}未同步或异常${C_RESET}"; fi)"
   printf "日志记录级别:      %s\n" "$(get_log_level)"
   printf "TCP 拥塞控制:      %s\n" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")"
   local api_active_str api_port api_token
@@ -5935,11 +5997,12 @@ update_self_script() {
 
   # 自动同步刷新定时任务、证书续期钩子与防火墙规则
   if service_is_installed || [[ -r "$STATE_FILE" ]]; then
+    ensure_time_sync_service 2>/dev/null || true
     install_deploy_hook 2>/dev/null || true
     sync_traffic_cron 2>/dev/null || true
     sync_traffic_rules 2>/dev/null || true
     sync_anytls_default_padding 2>/dev/null || true
-    info "后台定时重置任务与证书续签钩子已同步刷新。"
+    info "后台定时重置任务、时间同步与证书续签钩子已同步刷新。"
   fi
 
   if [[ "$mode" == "silent" || "$mode" == "quiet" ]]; then
