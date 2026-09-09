@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.12"
+readonly SCRIPT_VERSION="0.0.13"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -3006,7 +3006,7 @@ parse_padding_scheme_text() {
   fi
 
   local final_rules=("stop=${final_stop}" "${cleaned_rules[@]}")
-  printf '%s\n' "${final_rules[@]}" | jq -R . | jq -s .
+  printf '%s\n' "${final_rules[@]}" | jq -R . | jq -s -c .
 }
 
 parse_padding_scheme_file() {
@@ -3021,11 +3021,11 @@ get_default_padding_scheme_json() {
   if [[ -s "$PADDING_CONF_FILE" ]]; then
     local parsed
     if parsed=$(parse_padding_scheme_file "$PADDING_CONF_FILE" 2>/dev/null) && jq -e 'type == "array" and length > 0' <<<"$parsed" >/dev/null 2>&1; then
-      echo "$parsed"
+      jq -c . <<<"$parsed"
       return 0
     fi
   fi
-  echo "$DEFAULT_ANYTLS_PADDING_JSON"
+  jq -c . <<<"$DEFAULT_ANYTLS_PADDING_JSON"
 }
 
 generate_config_from_state() {
@@ -3368,14 +3368,13 @@ sync_anytls_default_padding() {
   if (( modified )); then
     need_refresh_config=1
   elif [[ -s "$CONFIG_FILE" ]]; then
-    if jq -e 'any(.[]?; .protocol == "anytls" and ((.padding_scheme // null) == null or (.padding_scheme | length) == 0))' <<<"$nodes" >/dev/null 2>&1; then
-      local active_default_pad
-      active_default_pad=$(jq -c '
-        [.inbounds[]? | select(.type == "anytls") | .padding_scheme // []] | .[0] // []
-      ' "$CONFIG_FILE" 2>/dev/null || echo "[]")
-      if [[ "$active_default_pad" != "[]" && "$active_default_pad" != "$current_default_pad" ]]; then
-        need_refresh_config=1
-      elif grep -q '"0=32-76"' "$CONFIG_FILE" 2>/dev/null; then
+    local default_ports
+    default_ports=$(jq -c '[.[]? | select(.protocol == "anytls" and ((.padding_scheme // null) == null or (.padding_scheme | length) == 0)) | .port]' <<<"$nodes" 2>/dev/null || echo "[]")
+    if [[ "$default_ports" != "[]" && -n "$default_ports" ]]; then
+      if jq -e --argjson ports "$default_ports" --argjson cur_pad "$current_default_pad" '
+        [ .inbounds[]? | select(.type == "anytls" and (.listen_port as $p | $ports | index($p))) ] as $inbounds
+        | ($inbounds | length > 0) and any($inbounds[]; (.padding_scheme // []) != $cur_pad)
+      ' "$CONFIG_FILE" >/dev/null 2>&1; then
         need_refresh_config=1
       fi
     fi
