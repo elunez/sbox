@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.13"
+readonly SCRIPT_VERSION="0.0.15"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -4446,9 +4446,9 @@ edit_node_padding_scheme() {
     fi
 
     echo
-    printf "  1) 粘贴/输入自定义规则 (多行直接粘贴，直接回车或快捷键提交)\n"
-    printf "  2) 还原为系统默认规则\n"
-    printf "  0) 返回上级修改菜单\n"
+    printf "  1) 自定义规则 (粘贴输入)\n"
+    printf "  2) 还原默认规则\n"
+    printf "  0) 返回上级\n"
     local pad_choice
     read -r -p "请输入选择 [0-2，默认: 0]: " pad_choice
     pad_choice=${pad_choice:-0}
@@ -4543,22 +4543,22 @@ edit_single_node_menu() {
 
     print_node_summary_card "$node" "$((index + 1))"
     echo
-    printf "%s=== 节点修改选项 ===%s\n" "$C_CYAN" "$C_RESET"
-    printf "  1) 修改入站协议\n"
-    printf "  2) 修改出口分流\n"
-    printf "  3) 修改监听端口\n"
-    printf "  4) 修改认证凭据\n"
-    printf "  5) 修改节点名称\n"
-    printf "  6) 修改连接地址\n"
-    printf "  7) 修改流量策略\n"
+    printf "%s=== 节点配置修改 ===%s\n" "$C_CYAN" "$C_RESET"
+    printf "  1) 入站协议\n"
+    printf "  2) 出口配置\n"
+    printf "  3) 监听端口\n"
+    printf "  4) 认证凭据\n"
+    printf "  5) 节点名称\n"
+    printf "  6) 连接地址\n"
+    printf "  7) 流量策略\n"
     if [[ "$proto" == "anytls" ]]; then
-      printf "  8) 修改混淆规则 (AnyTLS Padding Scheme)\n"
-      printf "  9) 完整重新配置\n"
-      printf "  0) 返回节点列表\n"
+      printf "  8) 混淆规则 (AnyTLS)\n"
+      printf "  9) 完整重配\n"
+      printf "  0) 返回上级\n"
       read -r -p "请输入选择 [0-9，默认: 0]: " choice
     else
-      printf "  8) 完整重新配置\n"
-      printf "  0) 返回节点列表\n"
+      printf "  8) 完整重配\n"
+      printf "  0) 返回上级\n"
       read -r -p "请输入选择 [0-8，默认: 0]: " choice
     fi
     choice=${choice:-0}
@@ -4881,11 +4881,11 @@ nodes_menu() {
     echo
     printf "%s=== 节点管理菜单 ===%s\n" "$C_CYAN" "$C_RESET"
     printf "  1) 新增节点\n"
-    printf "  2) 修改节点信息\n"
-    printf "  3) 单独修改节点出口\n"
-    printf "  4) 修改节点流量配额与重置日\n"
+    printf "  2) 修改配置\n"
+    printf "  3) 调整出口\n"
+    printf "  4) 调整流量\n"
     printf "  5) 删除节点\n"
-    printf "  6) 查看客户端配置与分享链接\n"
+    printf "  6) 分享链接\n"
     printf "  0) 返回主菜单\n"
     read -r -p "请输入选择 [0-6，默认: 0]: " choice
     choice=${choice:-0}
@@ -5437,7 +5437,7 @@ api_service_menu() {
     fi
 
     echo
-    printf "%s=== sbox 流量 API 接口服务 ===%s\n" "$C_CYAN" "$C_RESET"
+    printf "%s=== 流量 API 接口服务 ===%s\n" "$C_CYAN" "$C_RESET"
     printf "  服务状态: %s\n" "$status_text"
     printf "  监听地址: %s:%s\n" "$host" "$port"
     if [[ -n "$token" ]]; then
@@ -5450,14 +5450,14 @@ api_service_menu() {
     printf "    - 单端口流量:   http://服务器IP:%s/api/traffic/{端口}\n" "$port"
     printf "    - 健康状态:     http://服务器IP:%s/api/status\n" "$port"
     printf "%s----------------------------------------%s\n" "$C_CYAN" "$C_RESET"
-    printf "  1) 开启 API 服务 (后台自启)\n"
-    printf "  2) 停止 API 服务\n"
-    printf "  3) 重启 API 服务\n"
-    printf "  4) 修改监听端口 (当前: %s)\n" "$port"
-    printf "  5) 设置/清除安全 Token\n"
-    printf "  6) 临时前台测试运行 (Ctrl+C 退出)\n"
-    printf "  7) 卸载并禁用 API 服务\n"
-    printf "  0) 返回流量菜单\n"
+    printf "  1) 启动服务\n"
+    printf "  2) 停止服务\n"
+    printf "  3) 重启服务\n"
+    printf "  4) 修改端口\n"
+    printf "  5) 认证配置 (Token)\n"
+    printf "  6) 前台调试\n"
+    printf "  7) 卸载服务\n"
+    printf "  0) 返回上级\n"
     read -r -p "请输入选择 [0-7，默认: 0]: " choice
     choice=${choice:-0}
     case "$choice" in
@@ -5503,12 +5503,12 @@ traffic_menu() {
     print_node_list "$nodes"
     echo
     printf "%s=== 流量管理与监控 ===%s\n" "$C_CYAN" "$C_RESET"
-    printf "  1) 查看实时流量与配额状态\n"
-    printf "  2) 修改节点流量配额与重置日\n"
-    printf "  3) 立即重置指定节点流量\n"
-    printf "  4) 立即重置所有节点流量\n"
-    printf "  5) 查看流量重置历史记录\n"
-    printf "  6) API 接口服务管理 (开放对外流量监控)\n"
+    printf "  1) 刷新流量状态\n"
+    printf "  2) 调整配额限制\n"
+    printf "  3) 重置单点流量\n"
+    printf "  4) 重置全部流量\n"
+    printf "  5) 查看重置日志\n"
+    printf "  6) API 接口服务\n"
     printf "  0) 返回主菜单\n"
     read -r -p "请输入选择 [0-6，默认: 0]: " choice
     choice=${choice:-0}
@@ -5806,13 +5806,13 @@ logs_menu() {
   while true; do
     cur_lvl=$(get_log_level)
     echo
-    printf "%s=== sing-box 日志管理 ===%s\n" "$C_CYAN" "$C_RESET"
+    printf "%s=== 日志管理与维护 ===%s\n" "$C_CYAN" "$C_RESET"
     printf "  当前日志级别: %s%s%s\n" "$C_GREEN" "$cur_lvl" "$C_RESET"
     printf "%s------------------------------------%s\n" "$C_CYAN" "$C_RESET"
-    printf "  1) 查看最近 50 行运行日志\n"
-    printf "  2) 持续追踪实时日志 (Ctrl+C 退出)\n"
-    printf "  3) 调整日志级别 (当前: %s)\n" "$cur_lvl"
-    printf "  4) 清理系统日志 (释放磁盘空间)\n"
+    printf "  1) 最近运行日志 (50行)\n"
+    printf "  2) 实时跟踪日志 (持续)\n"
+    printf "  3) 调整日志级别\n"
+    printf "  4) 清理系统日志\n"
     printf "  0) 返回主菜单\n"
     read -r -p "请输入选择 [0-4，默认: 1]: " choice
     choice=${choice:-1}
