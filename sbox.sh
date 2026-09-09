@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.11"
+readonly SCRIPT_VERSION="0.0.12"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -294,7 +294,7 @@ auto_heal_service() {
   migrate_legacy_state
   sync_anytls_default_padding
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    if timedatectl 2>/dev/null | grep -qi "System clock synchronized: no"; then
+    if timedatectl 2>/dev/null | grep -qiE "(System clock synchronized: no|NTP service: n/a)"; then
       ensure_time_sync_service 2>/dev/null || true
     fi
   elif command -v chronyc >/dev/null 2>&1; then
@@ -1927,20 +1927,41 @@ EOF
   fi
 }
 
+sync_time_immediately() {
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import urllib.request, os, email.utils
+for url in ["https://www.baidu.com", "https://www.cloudflare.com", "https://www.google.com"]:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            d = resp.headers.get("Date")
+            if d:
+                ts = int(email.utils.parsedate_to_datetime(d).timestamp())
+                if ts > 1700000000:
+                    os.system(f"date -s @{ts} >/dev/null 2>&1")
+                    break
+    except Exception:
+        pass
+' 2>/dev/null || true
+  fi
+}
+
 ensure_time_sync_service() {
   detect_os
   info "配置系统时间同步服务 (NTP)……"
 
+  # 先利用权威 HTTP 响应头执行一次即时步进校准，消除数小时时钟倒流造成的 NTP 守护进程保护性拒步
+  sync_time_immediately
+
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    if ! systemctl list-unit-files 2>/dev/null | grep -qE '^(systemd-timesyncd|chronyd?)\.service'; then
+    if ! command -v chronyd >/dev/null 2>&1 && [[ ! -x "/lib/systemd/systemd-timesyncd" && ! -x "/usr/lib/systemd/systemd-timesyncd" ]]; then
       case "$PKG_MGR" in
         apt)
           export DEBIAN_FRONTEND=noninteractive
-          if ! apt-get install -y --no-install-recommends systemd-timesyncd >/dev/null 2>&1; then
-            apt-get update -y >/dev/null 2>&1 || true
-            apt-get install -y --no-install-recommends systemd-timesyncd >/dev/null 2>&1 || \
-              apt-get install -y --no-install-recommends chrony >/dev/null 2>&1 || true
-          fi
+          apt-get update -y >/dev/null 2>&1 || true
+          apt-get install -y --no-install-recommends systemd-timesyncd >/dev/null 2>&1 || \
+            apt-get install -y --no-install-recommends chrony >/dev/null 2>&1 || true
           ;;
         dnf|yum)
           $PKG_MGR install -y chrony >/dev/null 2>&1 || true
@@ -1948,9 +1969,10 @@ ensure_time_sync_service() {
       esac
     fi
 
+    systemctl unmask systemd-timesyncd >/dev/null 2>&1 || true
     timedatectl set-ntp true >/dev/null 2>&1 || true
 
-    if systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
+    if [[ -x "/lib/systemd/systemd-timesyncd" || -x "/usr/lib/systemd/systemd-timesyncd" ]] || systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
       if [[ -f "/etc/systemd/timesyncd.conf" ]]; then
         if ! grep -q "^NTP=" /etc/systemd/timesyncd.conf 2>/dev/null; then
           sed -i 's/^[#[:space:]]*NTP=.*/NTP=ntp.aliyun.com time1.cloud.tencent.com time.cloudflare.com pool.ntp.org/' /etc/systemd/timesyncd.conf 2>/dev/null || true
@@ -1958,9 +1980,9 @@ ensure_time_sync_service() {
       fi
       systemctl enable systemd-timesyncd >/dev/null 2>&1 || true
       systemctl restart systemd-timesyncd >/dev/null 2>&1 || systemctl start systemd-timesyncd >/dev/null 2>&1 || true
-    elif systemctl list-unit-files 2>/dev/null | grep -qE '^chronyd?\.service'; then
+    elif command -v chronyd >/dev/null 2>&1 || systemctl list-unit-files 2>/dev/null | grep -qE '^chronyd?\.service'; then
       local chrony_srv
-      chrony_srv=$(systemctl list-unit-files 2>/dev/null | grep -oE 'chronyd?\.service' | head -n 1)
+      chrony_srv=$(systemctl list-unit-files 2>/dev/null | grep -oE 'chronyd?\.service' | head -n 1 || echo "chronyd.service")
       systemctl enable "$chrony_srv" >/dev/null 2>&1 || true
       systemctl restart "$chrony_srv" >/dev/null 2>&1 || systemctl start "$chrony_srv" >/dev/null 2>&1 || true
       chronyc makestep >/dev/null 2>&1 || true
