@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.15"
+readonly SCRIPT_VERSION="0.0.16"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -290,17 +290,21 @@ migrate_legacy_state() {
   fi
 }
 
+is_ntp_service_active() {
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    systemctl is-active --quiet systemd-timesyncd 2>/dev/null || \
+    systemctl is-active --quiet chronyd 2>/dev/null || \
+    systemctl is-active --quiet chrony 2>/dev/null
+  else
+    command -v rc-service >/dev/null 2>&1 && rc-service chronyd status >/dev/null 2>&1
+  fi
+}
+
 auto_heal_service() {
   migrate_legacy_state
   sync_anytls_default_padding
-  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    if timedatectl 2>/dev/null | grep -qiE "(System clock synchronized: no|NTP service: n/a)"; then
-      ensure_time_sync_service 2>/dev/null || true
-    fi
-  elif command -v chronyc >/dev/null 2>&1; then
-    if ! chronyc tracking >/dev/null 2>&1; then
-      ensure_time_sync_service 2>/dev/null || true
-    fi
+  if ! is_ntp_service_active; then
+    ensure_time_sync_service 2>/dev/null || true
   fi
   if [[ -s "$CONFIG_FILE" ]] && command -v sing-box >/dev/null 2>&1; then
     ensure_service_file
@@ -1979,12 +1983,16 @@ ensure_time_sync_service() {
         fi
       fi
       systemctl enable systemd-timesyncd >/dev/null 2>&1 || true
-      systemctl restart systemd-timesyncd >/dev/null 2>&1 || systemctl start systemd-timesyncd >/dev/null 2>&1 || true
+      if ! systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+        systemctl restart systemd-timesyncd >/dev/null 2>&1 || systemctl start systemd-timesyncd >/dev/null 2>&1 || true
+      fi
     elif command -v chronyd >/dev/null 2>&1 || systemctl list-unit-files 2>/dev/null | grep -qE '^chronyd?\.service'; then
       local chrony_srv
       chrony_srv=$(systemctl list-unit-files 2>/dev/null | grep -oE 'chronyd?\.service' | head -n 1 || echo "chronyd.service")
       systemctl enable "$chrony_srv" >/dev/null 2>&1 || true
-      systemctl restart "$chrony_srv" >/dev/null 2>&1 || systemctl start "$chrony_srv" >/dev/null 2>&1 || true
+      if ! systemctl is-active --quiet "$chrony_srv" 2>/dev/null; then
+        systemctl restart "$chrony_srv" >/dev/null 2>&1 || systemctl start "$chrony_srv" >/dev/null 2>&1 || true
+      fi
       chronyc makestep >/dev/null 2>&1 || true
     fi
   else
@@ -1993,7 +2001,9 @@ ensure_time_sync_service() {
     fi
     if command -v chronyd >/dev/null 2>&1; then
       rc-update add chronyd default >/dev/null 2>&1 || true
-      rc-service chronyd restart >/dev/null 2>&1 || rc-service chronyd start >/dev/null 2>&1 || true
+      if ! rc-service chronyd status >/dev/null 2>&1; then
+        rc-service chronyd restart >/dev/null 2>&1 || rc-service chronyd start >/dev/null 2>&1 || true
+      fi
       chronyc makestep >/dev/null 2>&1 || true
     fi
   fi
@@ -5674,13 +5684,25 @@ status_flow() {
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     if timedatectl 2>/dev/null | grep -qi "System clock synchronized: yes"; then
       ntp_synced="yes"
+    elif is_ntp_service_active; then
+      ntp_synced="syncing"
     fi
   elif command -v chronyc >/dev/null 2>&1; then
     if chronyc tracking >/dev/null 2>&1; then
       ntp_synced="yes"
+    elif is_ntp_service_active; then
+      ntp_synced="syncing"
     fi
   fi
-  printf "系统当前时间:      %s (NTP 状态: %s)\n" "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$(if [[ "$ntp_synced" == "yes" ]]; then echo "${C_GREEN}已同步${C_RESET}"; else echo "${C_YELLOW}未同步或异常${C_RESET}"; fi)"
+  local ntp_desc
+  if [[ "$ntp_synced" == "yes" ]]; then
+    ntp_desc="${C_GREEN}已同步${C_RESET}"
+  elif [[ "$ntp_synced" == "syncing" ]]; then
+    ntp_desc="${C_GREEN}服务运行中 (授时收敛中)${C_RESET}"
+  else
+    ntp_desc="${C_YELLOW}未运行或异常${C_RESET}"
+  fi
+  printf "系统当前时间:      %s (NTP: %s)\n" "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$ntp_desc"
   printf "日志记录级别:      %s\n" "$(get_log_level)"
   printf "TCP 拥塞控制:      %s\n" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")"
   local api_active_str api_port api_token
