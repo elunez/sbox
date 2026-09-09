@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.16"
+readonly SCRIPT_VERSION="0.0.17"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -1017,30 +1017,41 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 readonly CREDENTIAL_FILE=/etc/sbox/dnspod.json
 readonly API_ENDPOINT="https://dnsapi.cn"
 readonly RUNTIME_DIR=/run/sing-box
-readonly PROPAGATION_SECONDS=60
+readonly PROPAGATION_SECONDS=120
 readonly PROGRESS_INTERVAL=5
 
 die() { printf "[DNSPod] %s\n" "$*" >&2; exit 1; }
 
 check_txt_record() {
-  local target=$1 expected=$2 txt_resp
-  txt_resp=$(curl -fsS --connect-timeout 3 --max-time 4 "https://1.1.1.1/dns-query?name=${target}&type=TXT" -H "accept: application/dns-json" 2>/dev/null || true)
+  local target=$1 expected=$2
+  local cf_ok=0 google_ok=0 txt_resp
+
+  # 1. 检查 Cloudflare 1.1.1.1 (全球最大 Anycast 公共 DNS 之一)
+  txt_resp=$(curl -fsS --connect-timeout 4 --max-time 6 "https://1.1.1.1/dns-query?name=${target}&type=TXT" -H "accept: application/dns-json" 2>/dev/null || true)
   if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
-    return 0
-  fi
-  txt_resp=$(curl -fsS --connect-timeout 3 --max-time 4 "https://doh.pub/dns-query?name=${target}&type=TXT" -H "accept: application/dns-json" 2>/dev/null || true)
-  if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
-    return 0
-  fi
-  txt_resp=$(curl -fsS --connect-timeout 3 --max-time 4 "https://dns.alidns.com/resolve?name=${target}&type=TXT" 2>/dev/null || true)
-  if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
-    return 0
-  fi
-  if command -v dig >/dev/null 2>&1; then
+    cf_ok=1
+  elif command -v dig >/dev/null 2>&1; then
     txt_resp=$(dig +short TXT "$target" @1.1.1.1 2>/dev/null || true)
-    if [[ "$txt_resp" == *"$expected"* ]]; then
-      return 0
+    [[ "$txt_resp" == *"$expected"* ]] && cf_ok=1
+  fi
+
+  # 2. 检查 Google DNS (8.8.8.8 / dns.google，全球覆盖最广的公共递归解析)
+  txt_resp=$(curl -fsS --connect-timeout 4 --max-time 6 "https://dns.google/resolve?name=${target}&type=TXT" 2>/dev/null || true)
+  if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
+    google_ok=1
+  else
+    txt_resp=$(curl -fsS --connect-timeout 4 --max-time 6 "https://8.8.8.8/resolve?name=${target}&type=TXT" 2>/dev/null || true)
+    if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
+      google_ok=1
+    elif command -v dig >/dev/null 2>&1; then
+      txt_resp=$(dig +short TXT "$target" @8.8.8.8 2>/dev/null || true)
+      [[ "$txt_resp" == *"$expected"* ]] && google_ok=1
     fi
+  fi
+
+  # 必须 Cloudflare 与 Google 两个独立公共 DNS 均确认解析成功（多视角交叉确认）
+  if (( cf_ok && google_ok )); then
+    return 0
   fi
   return 1
 }
@@ -1164,9 +1175,10 @@ main() {
       for ((remaining=PROPAGATION_SECONDS; remaining>0; remaining-=PROGRESS_INTERVAL)); do
         notify "DNS 传播等待中，剩余 ${remaining} 秒……"
         sleep "$PROGRESS_INTERVAL"
-        if (( PROPAGATION_SECONDS - remaining >= 20 )); then
+        if (( PROPAGATION_SECONDS - remaining >= 40 )); then
           if check_txt_record "$check_name" "$CERTBOT_VALIDATION"; then
-            notify "检测到 DNS TXT 记录已全网生效，提前结束等待。"
+            notify "检测到主流公共 DNS (Cloudflare & Google) 均已解析生效，安全缓冲 10 秒后提交验证……"
+            sleep 10
             break
           fi
         fi
@@ -1275,7 +1287,7 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 readonly CREDENTIAL_FILE=/etc/sbox/cf.json
 readonly API_ENDPOINT="https://api.cloudflare.com/client/v4"
 readonly RUNTIME_DIR=/run/sing-box
-readonly PROPAGATION_SECONDS=60
+readonly PROPAGATION_SECONDS=90
 readonly PROGRESS_INTERVAL=5
 
 die() { printf "[Cloudflare] %s\n" "$*" >&2; exit 1; }
@@ -1287,20 +1299,35 @@ notify() {
 }
 
 check_txt_record() {
-  local target=$1 expected=$2 txt_resp
-  txt_resp=$(curl -fsS --connect-timeout 3 --max-time 4 "https://1.1.1.1/dns-query?name=${target}&type=TXT" -H "accept: application/dns-json" 2>/dev/null || true)
+  local target=$1 expected=$2
+  local cf_ok=0 google_ok=0 txt_resp
+
+  # 1. 检查 Cloudflare 1.1.1.1 (全球最大 Anycast 公共 DNS 之一)
+  txt_resp=$(curl -fsS --connect-timeout 4 --max-time 6 "https://1.1.1.1/dns-query?name=${target}&type=TXT" -H "accept: application/dns-json" 2>/dev/null || true)
   if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
-    return 0
-  fi
-  txt_resp=$(curl -fsS --connect-timeout 3 --max-time 4 "https://doh.pub/dns-query?name=${target}&type=TXT" -H "accept: application/dns-json" 2>/dev/null || true)
-  if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
-    return 0
-  fi
-  if command -v dig >/dev/null 2>&1; then
+    cf_ok=1
+  elif command -v dig >/dev/null 2>&1; then
     txt_resp=$(dig +short TXT "$target" @1.1.1.1 2>/dev/null || true)
-    if [[ "$txt_resp" == *"$expected"* ]]; then
-      return 0
+    [[ "$txt_resp" == *"$expected"* ]] && cf_ok=1
+  fi
+
+  # 2. 检查 Google DNS (8.8.8.8 / dns.google，全球覆盖最广的公共递归解析)
+  txt_resp=$(curl -fsS --connect-timeout 4 --max-time 6 "https://dns.google/resolve?name=${target}&type=TXT" 2>/dev/null || true)
+  if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
+    google_ok=1
+  else
+    txt_resp=$(curl -fsS --connect-timeout 4 --max-time 6 "https://8.8.8.8/resolve?name=${target}&type=TXT" 2>/dev/null || true)
+    if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
+      google_ok=1
+    elif command -v dig >/dev/null 2>&1; then
+      txt_resp=$(dig +short TXT "$target" @8.8.8.8 2>/dev/null || true)
+      [[ "$txt_resp" == *"$expected"* ]] && google_ok=1
     fi
+  fi
+
+  # 必须 Cloudflare 与 Google 两个独立公共 DNS 均确认解析成功（多视角交叉确认）
+  if (( cf_ok && google_ok )); then
+    return 0
   fi
   return 1
 }
@@ -1403,9 +1430,10 @@ main() {
       for ((remaining=PROPAGATION_SECONDS; remaining>0; remaining-=PROGRESS_INTERVAL)); do
         notify "DNS 传播等待中，剩余 ${remaining} 秒……"
         sleep "$PROGRESS_INTERVAL"
-        if (( PROPAGATION_SECONDS - remaining >= 15 )); then
+        if (( PROPAGATION_SECONDS - remaining >= 25 )); then
           if check_txt_record "$record_name" "$CERTBOT_VALIDATION"; then
-            notify "检测到 DNS TXT 记录已全网生效，提前结束等待。"
+            notify "检测到主流公共 DNS (Cloudflare & Google) 均已解析生效，安全缓冲 10 秒后提交验证……"
+            sleep 10
             break
           fi
         fi
@@ -6054,6 +6082,8 @@ update_self_script() {
   if service_is_installed || [[ -r "$STATE_FILE" ]]; then
     ensure_time_sync_service 2>/dev/null || true
     install_deploy_hook 2>/dev/null || true
+    [[ -r "$DNSPOD_CREDENTIAL_FILE" ]] && install_dnspod_hooks 2>/dev/null || true
+    [[ -r "$CF_CREDENTIAL_FILE" ]] && install_cf_hooks 2>/dev/null || true
     sync_traffic_cron 2>/dev/null || true
     sync_traffic_rules 2>/dev/null || true
     sync_anytls_default_padding 2>/dev/null || true
