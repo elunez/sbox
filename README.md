@@ -6,6 +6,8 @@
 
 - **多协议入站支持**：支持 AnyTLS、Shadowsocks（含 2022-blake3 与传统 AEAD）、Trojan、Hysteria2、VLESS + REALITY、SOCKS5、HTTP / HTTPS。
 - **全能出站路由**：每个节点可独立指定出口方式，支持 Direct、AnyTLS、Shadowsocks、Trojan、Hysteria2、VLESS + REALITY、SOCKS5 / SOCKS5H、HTTP / HTTPS。
+- **出口健康自动回退**：配置非 Direct 出口后自动每 5 秒检测 `http://www.gstatic.com/generate_204`，连续两次失败回退到 Direct，连续两次恢复后自动切回原出口；Direct 节点不启用检测。
+- **旧版配置自动迁移**：升级管理脚本后，首次运行面板、`status`、`start` 或 `restart` 会自动补齐健康检测路由并重载配置。
 - **动态域名与证书联动**：新增或修改节点时支持绑定不同域名。对于需要证书的协议（AnyTLS、Trojan、Hy2），系统会自动检测证书，未申请时可一键通过 Let's Encrypt（首选 DNSPod Token DNS-01 API、次选 Cloudflare DNS-01 API、Web 目录 Webroot 或独立 80 端口 Standalone）免开放端口签发证书；Shadowsocks 与 VLESS REALITY 无需证书，开箱即用。
 - **精准流量监控与配额管理**：
   - 基于内核级 **nftables** 进行端口流量双向/单向高精统计；
@@ -92,6 +94,7 @@ sbox
    - 配置节点出口分流（Direct，或转至外部 AnyTLS / Shadowsocks / Trojan / Hysteria2 / VLESS REALITY / SOCKS5 / HTTP 出口）。
 2. **修改节点**：随时调整现有节点的监听端口、认证密钥、AnyTLS 混淆规则（Padding Scheme，支持多行整段粘贴与自动补全 stop=*，直接回车或快捷键提交）、伪装域名、出口路由或流量策略；
 3. **单独修改出口**：为指定节点无缝切换转发出口或恢复直连；
+   - 配置非 Direct 出口后会自动启用健康检测，无需额外启动或修改客户端配置；
 4. **删除节点**：删除指定节点并自动清理其关联的 nftables 流量监控规则与定时重置任务；
 5. **客户端配置与分享链接**：一键生成各节点的客户端连接链接（如 `anytls://`, `ss://`, `trojan://`, `hy2://`, `vless://`, `socks5://`, `http://`）以及 sing-box 客户端 `outbounds` 配置段落。
 
@@ -218,6 +221,12 @@ sudo sbox api start|stop        # 启停 API 服务
 sudo sbox --api-json [PORT]     # 命令行直接输出流量 JSON
 ```
 
+出口健康检测状态会在 `sudo sbox status` 中显示。systemd 系统查看自动切换日志：
+
+```bash
+journalctl -u sbox-outbound-monitor.service -f
+```
+
 ## 关键目录与文件位置
 
 - sing-box 主配置文件：`/etc/sing-box/config.json`
@@ -228,6 +237,8 @@ sudo sbox --api-json [PORT]     # 命令行直接输出流量 JSON
 - Certbot 自动续签钩子：`/etc/letsencrypt/renewal-hooks/deploy/sing-box`
 - DNSPod Token 凭据文件：`/etc/sbox/dnspod.json`
 - Cloudflare API 密钥文件：`/etc/sbox/cf.json`
+- 出口健康监控脚本：`/etc/sbox/outbound_health_monitor.py`
+- 出口健康监控运行状态：`/run/sbox/outbound-health.json`
 - 流量重置历史审计日志：`/etc/sbox/traffic_reset.log`
 - 配置备份归档目录：`/etc/sbox/backups/`
-- 系统服务单元：`/etc/systemd/system/sing-box.service`（Systemd）或 `/etc/init.d/sing-box`（OpenRC）
+- 系统服务单元：`/etc/systemd/system/sing-box.service` 与 `/etc/systemd/system/sbox-outbound-monitor.service`（Systemd），或对应的 `/etc/init.d/` 服务（OpenRC）

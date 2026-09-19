@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.17"
+readonly SCRIPT_VERSION="0.0.18"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -33,6 +33,15 @@ readonly CF_AUTH_HOOK="${STATE_DIR}/cf-auth"
 readonly CF_CLEANUP_HOOK="${STATE_DIR}/cf-cleanup"
 
 readonly SYSTEMD_SERVICE="sing-box.service"
+readonly OUTBOUND_HEALTH_SERVICE="sbox-outbound-monitor.service"
+readonly OUTBOUND_HEALTH_SCRIPT="${STATE_DIR}/outbound_health_monitor.py"
+readonly OUTBOUND_HEALTH_SECRET_FILE="${STATE_DIR}/outbound_health_api.secret"
+readonly OUTBOUND_HEALTH_RUNTIME_DIR="${OUTBOUND_HEALTH_RUNTIME_DIR:-/run/sbox}"
+readonly OUTBOUND_HEALTH_STATE_FILE="${OUTBOUND_HEALTH_STATE_FILE:-${OUTBOUND_HEALTH_RUNTIME_DIR}/outbound-health.json}"
+readonly OUTBOUND_HEALTH_API_ADDR="${OUTBOUND_HEALTH_API_ADDR:-127.0.0.1:19090}"
+readonly OUTBOUND_HEALTH_URL="${OUTBOUND_HEALTH_URL:-http://www.gstatic.com/generate_204}"
+readonly OUTBOUND_HEALTH_INTERVAL="${OUTBOUND_HEALTH_INTERVAL:-5}"
+readonly OUTBOUND_HEALTH_TIMEOUT_MS="${OUTBOUND_HEALTH_TIMEOUT_MS:-5000}"
 readonly NFT_TABLE="sing_box_traffic"
 readonly CRON_TAG="sing-box-traffic"
 
@@ -191,6 +200,9 @@ service_stop() {
   else
     rc-service "$name" stop >/dev/null 2>&1 || true
   fi
+  if [[ "$service" == "$OUTBOUND_HEALTH_SERVICE" ]]; then
+    rm -f "$OUTBOUND_HEALTH_STATE_FILE"
+  fi
 }
 
 service_restart() {
@@ -238,6 +250,356 @@ service_daemon_reload() {
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
+}
+
+outbound_health_node_count() {
+  [[ -r "$STATE_FILE" ]] || { echo 0; return 0; }
+  jq '[.nodes[]? | select((.outbound.type // "direct") != "direct")] | length' "$STATE_FILE" 2>/dev/null || echo 0
+}
+
+ensure_outbound_health_secret() {
+  install -d -m 0700 "$STATE_DIR"
+  if [[ ! -s "$OUTBOUND_HEALTH_SECRET_FILE" ]]; then
+    local tmp secret
+    tmp=$(mktemp "${STATE_DIR}/outbound_health_secret.XXXXXX")
+    if command -v openssl >/dev/null 2>&1; then
+      secret=$(openssl rand -hex 32 2>/dev/null || true)
+    fi
+    if [[ -z "$secret" ]]; then
+      secret=$(printf '%s:%s:%s' "$$" "$(date +%s%N)" "${RANDOM:-0}" | sha256sum | awk '{print $1}')
+    fi
+    printf '%s\n' "$secret" >"$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$OUTBOUND_HEALTH_SECRET_FILE"
+  fi
+  tr -d '\r\n' <"$OUTBOUND_HEALTH_SECRET_FILE"
+}
+
+install_outbound_health_monitor_script() {
+  install -d -m 0700 "$STATE_DIR" "$OUTBOUND_HEALTH_RUNTIME_DIR"
+  cat >"$OUTBOUND_HEALTH_SCRIPT" <<'PY_OUTBOUND_HEALTH_EOF'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""sbox 出口健康监控：连续两次失败回退 Direct，连续两次成功恢复出口。"""
+import json
+import logging
+import os
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+STATE_FILE = os.environ.get("SBOX_STATE_FILE", "/etc/sbox/state.json")
+RUNTIME_STATE_FILE = os.environ.get("SBOX_HEALTH_STATE_FILE", "/run/sbox/outbound-health.json")
+SECRET_FILE = os.environ.get("SBOX_HEALTH_SECRET_FILE", "/etc/sbox/outbound_health_api.secret")
+API_ENDPOINT = os.environ.get("SBOX_HEALTH_API", "127.0.0.1:19090")
+if API_ENDPOINT.startswith("http://"):
+    API_ENDPOINT = API_ENDPOINT[7:]
+API_BASE = "http://" + API_ENDPOINT
+TEST_URL = os.environ.get("SBOX_HEALTH_URL", "http://www.gstatic.com/generate_204")
+INTERVAL = max(1.0, float(os.environ.get("SBOX_HEALTH_INTERVAL", "5")))
+TIMEOUT_MS = max(1000, int(os.environ.get("SBOX_HEALTH_TIMEOUT_MS", "5000")))
+REQUEST_TIMEOUT = TIMEOUT_MS / 1000.0 + 1.0
+MAX_WORKERS = max(1, int(os.environ.get("SBOX_HEALTH_MAX_WORKERS", "8")))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+LOG = logging.getLogger("sbox-outbound-health")
+WRITE_LOCK = threading.Lock()
+
+
+def read_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return default
+
+
+def write_runtime_state(state):
+    directory = os.path.dirname(RUNTIME_STATE_FILE)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    tmp = RUNTIME_STATE_FILE + ".tmp"
+    with WRITE_LOCK:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False, separators=(",", ":"))
+            fh.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, RUNTIME_STATE_FILE)
+
+
+def api_request(method, path, payload=None):
+    secret = ""
+    try:
+        with open(SECRET_FILE, "r", encoding="utf-8") as fh:
+            secret = fh.read().strip()
+    except OSError:
+        pass
+    url = API_BASE.rstrip("/") + path
+    body = None
+    headers = {"Accept": "application/json"}
+    if secret:
+        headers["Authorization"] = "Bearer " + secret
+    if payload is not None:
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+        raw = response.read()
+        if not raw:
+            return response.status, {}
+        return response.status, json.loads(raw.decode("utf-8"))
+
+
+def probe(tag):
+    query = urllib.parse.urlencode({"url": TEST_URL, "timeout": str(TIMEOUT_MS)})
+    path = "/proxies/" + urllib.parse.quote(tag, safe="") + "/delay?" + query
+    try:
+        status, payload = api_request("GET", path)
+        delay = payload.get("delay") if isinstance(payload, dict) else None
+        if status == 200 and isinstance(delay, (int, float)) and delay >= 0:
+            return True, delay, "ok"
+        # Clash API 本身异常时不要把监控故障误判成出口故障。
+        if status in (408, 504):
+            return False, None, "outbound timeout"
+        return None, None, "health API returned HTTP " + str(status)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (408, 504):
+            return False, None, "outbound timeout"
+        return None, None, "health API HTTP " + str(exc.code)
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        return None, None, str(exc)
+
+
+def switch(selector, target):
+    path = "/proxies/" + urllib.parse.quote(selector, safe="")
+    try:
+        status, _ = api_request("PUT", path, {"name": target})
+        return status in (200, 204)
+    except (OSError, ValueError, urllib.error.URLError, urllib.error.HTTPError) as exc:
+        LOG.warning("切换 %s -> %s 失败：%s", selector, target, exc)
+        return False
+
+
+def configured_nodes():
+    data = read_json(STATE_FILE, {})
+    nodes = data.get("nodes", []) if isinstance(data, dict) else []
+    result = []
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            continue
+        outbound = node.get("outbound") or {}
+        if outbound.get("type", "direct") == "direct":
+            continue
+        result.append({
+            "key": str(node.get("port", index + 1)),
+            "name": str(node.get("name", "节点" + str(index + 1))),
+            "outbound": "out-" + str(index + 1),
+            "selector": "health-" + str(index + 1),
+        })
+    return result
+
+
+def run_cycle(runtime):
+    nodes = configured_nodes()
+    valid_keys = {item["key"] for item in nodes}
+    runtime = {key: value for key, value in runtime.items() if key in valid_keys}
+    if not nodes:
+        return runtime
+
+    results = {}
+    workers = min(MAX_WORKERS, len(nodes))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = {pool.submit(probe, item["outbound"]): item for item in nodes}
+        for future in as_completed(pending):
+            item = pending[future]
+            try:
+                results[item["key"]] = future.result()
+            except Exception as exc:
+                results[item["key"]] = (False, None, str(exc))
+
+    for item in nodes:
+        key = item["key"]
+        ok, delay, detail = results.get(key, (False, None, "missing result"))
+        entry = runtime.setdefault(key, {"current": "proxy", "failures": 0, "successes": 0})
+        if ok is None:
+            entry["last_ok"] = None
+            entry["last_detail"] = detail
+            entry["updated_at"] = int(time.time())
+            continue
+        current = entry.get("current", "proxy")
+        if current not in ("proxy", "direct"):
+            current = "proxy"
+        if current == "proxy":
+            entry["successes"] = 0
+            if ok:
+                entry["failures"] = 0
+                if delay is not None:
+                    entry["last_delay_ms"] = delay
+            else:
+                entry["failures"] = int(entry.get("failures", 0)) + 1
+                if entry["failures"] >= 2:
+                    if switch(item["selector"], "direct"):
+                        entry["current"] = "direct"
+                        entry["failures"] = 0
+                        LOG.warning("节点 %s：出口连续失败 2 次，已切换到 Direct", item["name"])
+        else:
+            entry["failures"] = 0
+            if ok:
+                entry["successes"] = int(entry.get("successes", 0)) + 1
+                if delay is not None:
+                    entry["last_delay_ms"] = delay
+                if entry["successes"] >= 2:
+                    if switch(item["selector"], item["outbound"]):
+                        entry["current"] = "proxy"
+                        entry["successes"] = 0
+                        LOG.info("节点 %s：出口连续成功 2 次，已恢复原出口", item["name"])
+            else:
+                entry["successes"] = 0
+        entry["last_ok"] = bool(ok)
+        entry["last_detail"] = detail
+        entry["updated_at"] = int(time.time())
+    write_runtime_state(runtime)
+    return runtime
+
+
+def main():
+    runtime = read_json(RUNTIME_STATE_FILE, {})
+    if not isinstance(runtime, dict):
+        runtime = {}
+    LOG.info("出口健康监控已启动：检测间隔 %ss，超时 %sms，目标 %s", int(INTERVAL), TIMEOUT_MS, TEST_URL)
+    while True:
+        try:
+            runtime = run_cycle(runtime)
+        except Exception:
+            LOG.exception("出口健康检测周期异常，保持当前路由")
+        # 按需求在本轮检测全部完成后再等待 INTERVAL 秒。
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
+PY_OUTBOUND_HEALTH_EOF
+  chmod 0700 "$OUTBOUND_HEALTH_SCRIPT"
+}
+
+ensure_outbound_health_service_file() {
+  local py_bin
+  py_bin=$(command -v python3 || echo "/usr/bin/python3")
+  install_outbound_health_monitor_script
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    cat >"/etc/systemd/system/${OUTBOUND_HEALTH_SERVICE}" <<EOF
+[Unit]
+Description=sbox outbound health monitor
+After=network-online.target sing-box.service
+Wants=network-online.target
+Requires=sing-box.service
+
+[Service]
+Type=simple
+User=root
+Environment=SBOX_STATE_FILE=${STATE_FILE}
+Environment=SBOX_HEALTH_STATE_FILE=${OUTBOUND_HEALTH_STATE_FILE}
+Environment=SBOX_HEALTH_SECRET_FILE=${OUTBOUND_HEALTH_SECRET_FILE}
+Environment=SBOX_HEALTH_API=${OUTBOUND_HEALTH_API_ADDR}
+Environment=SBOX_HEALTH_URL=${OUTBOUND_HEALTH_URL}
+Environment=SBOX_HEALTH_INTERVAL=${OUTBOUND_HEALTH_INTERVAL}
+Environment=SBOX_HEALTH_TIMEOUT_MS=${OUTBOUND_HEALTH_TIMEOUT_MS}
+ExecStart=${py_bin} ${OUTBOUND_HEALTH_SCRIPT}
+Restart=always
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  else
+    local rc_file="/etc/init.d/${OUTBOUND_HEALTH_SERVICE%.service}"
+    cat >"$rc_file" <<EOF
+#!/sbin/openrc-run
+description="sbox outbound health monitor"
+command="${py_bin}"
+command_args="${OUTBOUND_HEALTH_SCRIPT}"
+command_background="yes"
+pidfile="/run/sbox-outbound-monitor.pid"
+output_log="/var/log/sbox-outbound-monitor.log"
+error_log="/var/log/sbox-outbound-monitor.log"
+export SBOX_STATE_FILE="${STATE_FILE}"
+export SBOX_HEALTH_STATE_FILE="${OUTBOUND_HEALTH_STATE_FILE}"
+export SBOX_HEALTH_SECRET_FILE="${OUTBOUND_HEALTH_SECRET_FILE}"
+export SBOX_HEALTH_API="${OUTBOUND_HEALTH_API_ADDR}"
+export SBOX_HEALTH_URL="${OUTBOUND_HEALTH_URL}"
+export SBOX_HEALTH_INTERVAL="${OUTBOUND_HEALTH_INTERVAL}"
+export SBOX_HEALTH_TIMEOUT_MS="${OUTBOUND_HEALTH_TIMEOUT_MS}"
+
+depend() {
+  need net
+  after sing-box
+}
+EOF
+    chmod 0755 "$rc_file"
+  fi
+  service_daemon_reload
+}
+
+sync_outbound_health_service() {
+  local count
+  count=$(outbound_health_node_count)
+  if (( count > 0 )); then
+    [[ -s "$CONFIG_FILE" ]] || return 0
+    if ! outbound_health_config_ready; then
+      return 0
+    fi
+    ensure_outbound_health_secret >/dev/null
+    ensure_outbound_health_service_file
+    service_enable "$OUTBOUND_HEALTH_SERVICE"
+    service_start "$OUTBOUND_HEALTH_SERVICE" >/dev/null 2>&1 || true
+  else
+    service_disable "$OUTBOUND_HEALTH_SERVICE"
+    rm -f "$OUTBOUND_HEALTH_STATE_FILE"
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+      rm -f "/etc/systemd/system/${OUTBOUND_HEALTH_SERVICE}"
+    else
+      rm -f "/etc/init.d/${OUTBOUND_HEALTH_SERVICE%.service}"
+    fi
+    service_daemon_reload
+  fi
+}
+
+outbound_health_config_ready() {
+  local count
+  count=$(outbound_health_node_count)
+  (( count == 0 )) && return 0
+  [[ -s "$CONFIG_FILE" ]] || return 1
+  jq -e --arg addr "$OUTBOUND_HEALTH_API_ADDR" '
+    (.experimental.clash_api.external_controller == $addr)
+    and (([.outbounds[]?.tag | select(startswith("health-"))] | length) > 0)
+    and (([.route.rules[]?.outbound | select(startswith("health-"))] | length) > 0)
+  ' "$CONFIG_FILE" >/dev/null 2>&1
+}
+
+migrate_outbound_health_config() {
+  outbound_health_config_ready && return 0
+  local candidate
+  candidate=$(mktemp)
+  if ! generate_config_from_state "$candidate" "$STATE_FILE"; then
+    rm -f "$candidate"
+    return 1
+  fi
+  if command -v sing-box >/dev/null 2>&1 && sing-box check -c "$candidate" >/dev/null 2>&1; then
+    info "检测到旧版出口配置，正在启用自动健康检测并平滑重载……"
+    apply_config "$candidate"
+  fi
+  rm -f "$candidate"
 }
 
 migrate_legacy_state() {
@@ -302,11 +664,15 @@ is_ntp_service_active() {
 
 auto_heal_service() {
   migrate_legacy_state
+  ensure_state_schema
   sync_anytls_default_padding
   if ! is_ntp_service_active; then
     ensure_time_sync_service 2>/dev/null || true
   fi
   if [[ -s "$CONFIG_FILE" ]] && command -v sing-box >/dev/null 2>&1; then
+    if state_has_nodes && ! outbound_health_config_ready; then
+      migrate_outbound_health_config 2>/dev/null || true
+    fi
     ensure_service_file
     if ! service_is_running; then
       if sing-box check -c "$CONFIG_FILE" >/dev/null 2>&1; then
@@ -314,6 +680,7 @@ auto_heal_service() {
       fi
     fi
   fi
+  sync_outbound_health_service 2>/dev/null || true
 }
 
 ensure_sbox_cli() {
@@ -2174,8 +2541,11 @@ upgrade_sing_box() {
   install_singbox_binary "FORCE"
   if [[ -s "$CONFIG_FILE" ]]; then
     sing-box check -c "$CONFIG_FILE" || die "新版本下配置校验失败，请检查 ${CONFIG_FILE}。"
+    service_stop "$OUTBOUND_HEALTH_SERVICE"
     service_restart "$SYSTEMD_SERVICE"
   fi
+  migrate_outbound_health_config 2>/dev/null || true
+  sync_outbound_health_service 2>/dev/null || true
   update_self_script "silent" 2>/dev/null || true
   local new_ver
   new_ver=$(sing-box version 2>/dev/null | head -n 1 || echo "未知")
@@ -3069,9 +3439,15 @@ get_default_padding_scheme_json() {
 generate_config_from_state() {
   local output=$1 state_file=${2:-$STATE_FILE}
   validate_nodes_state "$state_file"
-  local default_pad
+  local default_pad health_api_secret=""
   default_pad=$(get_default_padding_scheme_json)
-  jq --arg cert_dir "$CERT_DIR" --argjson default_pad "$default_pad" '
+  if jq -e 'any(.nodes[]?; (.outbound.type // "direct") != "direct")' "$state_file" >/dev/null 2>&1; then
+    health_api_secret=$(ensure_outbound_health_secret)
+  fi
+  jq --arg cert_dir "$CERT_DIR" \
+    --arg health_api_addr "$OUTBOUND_HEALTH_API_ADDR" \
+    --arg health_api_secret "$health_api_secret" \
+    --argjson default_pad "$default_pad" '
     def cert_tls($n): {
       enabled: true,
       server_name: $n.domain,
@@ -3236,15 +3612,35 @@ generate_config_from_state() {
     .nodes as $nodes | {
       log: {level: (.log_level // "warn"), timestamp: true},
       inbounds: ([$nodes | to_entries[] | inbound(.value; .key)]),
-      outbounds: ([$nodes | to_entries[] | outbound(.value.outbound; .key)] + [{type: "direct", tag: "direct"}, {type: "block", tag: "block"}]),
+      outbounds: (
+        ([$nodes | to_entries[] | outbound(.value.outbound; .key)])
+        + ([$nodes | to_entries[] | select((.value.outbound.type // "direct") != "direct") | {
+            type: "selector",
+            tag: ("health-" + ((.key + 1)|tostring)),
+            outbounds: [("out-" + ((.key + 1)|tostring)), "direct"],
+            default: ("out-" + ((.key + 1)|tostring)),
+            interrupt_exist_connections: true
+          }])
+        + [{type: "direct", tag: "direct"}, {type: "block", tag: "block"}]
+      ),
       route: {
         rules: ([$nodes | to_entries[] | {
           inbound: [("in-" + ((.key + 1)|tostring))],
           action: "route",
-          outbound: ("out-" + ((.key + 1)|tostring))
+          outbound: (if ((.value.outbound.type // "direct") == "direct") then
+            ("out-" + ((.key + 1)|tostring))
+          else
+            ("health-" + ((.key + 1)|tostring))
+          end)
         }]),
         final: "direct"
-      }
+      },
+      experimental: (if any($nodes[]?; (.outbound.type // "direct") != "direct") then {
+        clash_api: {
+          external_controller: $health_api_addr,
+          secret: $health_api_secret
+        }
+      } else {} end)
     }' "$state_file" >"$output"
 }
 
@@ -3276,6 +3672,7 @@ apply_config() {
   ensure_service_file
   service_daemon_reload
   service_enable "$SYSTEMD_SERVICE"
+  service_stop "$OUTBOUND_HEALTH_SERVICE"
   if ! service_restart "$SYSTEMD_SERVICE"; then
     warn "sing-box 重启命令执行失败，正在查看日志……"
     if [[ "$INIT_SYSTEM" == "systemd" ]] && command -v journalctl >/dev/null 2>&1; then
@@ -3286,6 +3683,7 @@ apply_config() {
     if [[ -n "$backup" ]]; then
       cp -a "$backup" "$CONFIG_FILE"
       service_restart "$SYSTEMD_SERVICE" || true
+      sync_outbound_health_service || true
       die "新配置无法启动服务，已自动回滚备份。"
     fi
     die "sing-box 启动失败。"
@@ -3301,10 +3699,12 @@ apply_config() {
     if [[ -n "$backup" ]]; then
       cp -a "$backup" "$CONFIG_FILE"
       service_restart "$SYSTEMD_SERVICE" || true
+      sync_outbound_health_service || true
       die "新配置启动后异常退出，已自动回滚备份。请检查上方日志。"
     fi
     die "sing-box 服务启动后异常退出，请检查上方日志排查原因。"
   fi
+  sync_outbound_health_service
   ok "sing-box 配置文件已生效并成功加载，服务正常运行中。"
 }
 
@@ -3328,6 +3728,7 @@ save_nodes_json() {
   install -d -m 0700 "$STATE_DIR" "$BACKUP_DIR"
   install -m 0600 "$state_tmp" "$STATE_FILE"
   rm -f "$candidate" "$state_tmp"
+  sync_outbound_health_service
   install_deploy_hook
   sync_traffic_rules "$nodes"
   sync_traffic_cron
@@ -3682,6 +4083,7 @@ install_flow() {
   install -d -m 0700 "$STATE_DIR" "$BACKUP_DIR"
   install -m 0600 "$state_tmp" "$STATE_FILE"
   rm -f "$candidate" "$state_tmp"
+  sync_outbound_health_service
   install_deploy_hook
   sync_traffic_rules "$nodes"
   sync_traffic_cron
@@ -5595,7 +5997,11 @@ cert_flow() {
     certbot renew
     sync_certificate
     if [[ -s "$CONFIG_FILE" ]] && command -v sing-box >/dev/null 2>&1; then
-      sing-box check -c "$CONFIG_FILE" && service_reload_or_restart "$SYSTEMD_SERVICE" || true
+      sing-box check -c "$CONFIG_FILE" && {
+        service_stop "$OUTBOUND_HEALTH_SERVICE"
+        service_reload_or_restart "$SYSTEMD_SERVICE"
+        sync_outbound_health_service
+      } || true
     fi
     ok "证书续签及同步完成。"
   fi
@@ -5611,6 +6017,9 @@ require_managed_install() {
 }
 
 start_service() {
+  if (( EUID == 0 )); then
+    migrate_outbound_health_config 2>/dev/null || true
+  fi
   if ! service_is_installed; then
     warn "sing-box 服务尚未安装，请先选择 [1. 安装服务]。"
     return 0
@@ -5624,6 +6033,7 @@ start_service() {
   service_start "$SYSTEMD_SERVICE"
   sleep 1
   if service_is_running; then
+    sync_outbound_health_service
     ok "sing-box 服务已成功启动并正在运行。"
   else
     warn "sing-box 服务启动后未能保持运行，日志摘要："
@@ -5638,11 +6048,15 @@ start_service() {
 
 stop_service() {
   info "停止 ${SYSTEMD_SERVICE}……"
+  service_stop "$OUTBOUND_HEALTH_SERVICE"
   service_stop "$SYSTEMD_SERVICE"
   ok "sing-box 服务已停止。"
 }
 
 restart_service() {
+  if (( EUID == 0 )); then
+    migrate_outbound_health_config 2>/dev/null || true
+  fi
   if ! service_is_installed; then
     warn "sing-box 服务尚未安装，请先选择 [1. 安装服务]。"
     return 0
@@ -5655,10 +6069,12 @@ restart_service() {
   if [[ -s "$CONFIG_FILE" ]] && command -v sing-box >/dev/null 2>&1; then
     sing-box check -c "$CONFIG_FILE" || { warn "配置校验失败，已放弃重启。"; return 0; }
   fi
+  service_stop "$OUTBOUND_HEALTH_SERVICE"
   info "重启 ${SYSTEMD_SERVICE}……"
   service_restart "$SYSTEMD_SERVICE"
   sleep 1
   if service_is_running; then
+    sync_outbound_health_service
     ok "sing-box 服务已成功重启并正在运行。"
   else
     warn "sing-box 服务重启后未能保持运行，日志摘要："
@@ -5685,7 +6101,42 @@ disable_service() {
 
 
 
+print_outbound_health_status() {
+  local count runtime node port entry current label failures successes delay last_ok
+  count=$(outbound_health_node_count)
+  (( count > 0 )) || return 0
+  if service_is_running "$OUTBOUND_HEALTH_SERVICE"; then
+    printf "出口健康监控:      %s运行中%s\n" "$C_GREEN" "$C_RESET"
+  else
+    printf "出口健康监控:      %s未运行%s\n" "$C_YELLOW" "$C_RESET"
+  fi
+  runtime='{}'
+  [[ -r "$OUTBOUND_HEALTH_STATE_FILE" ]] && runtime=$(cat "$OUTBOUND_HEALTH_STATE_FILE" 2>/dev/null || echo '{}')
+  printf "出口检测状态:\n"
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    port=$(jq -r '.port' <<<"$node")
+    entry=$(jq -c --arg key "$port" '.[$key] // {}' <<<"$runtime" 2>/dev/null || echo '{}')
+    current=$(jq -r '.current // "proxy"' <<<"$entry")
+    failures=$(jq -r '.failures // 0' <<<"$entry")
+    successes=$(jq -r '.successes // 0' <<<"$entry")
+    delay=$(jq -r 'if .last_delay_ms == null then "-" else ((.last_delay_ms|tostring) + " ms") end' <<<"$entry")
+    last_ok=$(jq -r 'if .last_ok == true then "成功" elif .last_ok == false then "失败" else "未检测" end' <<<"$entry")
+    if [[ "$current" == "direct" ]]; then
+      label="Direct（故障回退）"
+    else
+      label="$(protocol_label "$(jq -r '.outbound.type // "direct"' <<<"$node")")"
+    fi
+    printf "  %-16s 当前: %-18s 最近: %-4s 延迟: %-10s 失败/成功计数: %s/%s\n" \
+      "$(jq -r '.name // "未命名"' <<<"$node")" "$label" "$last_ok" "$delay" "$failures" "$successes"
+  done < <(jq -c '.nodes[]? | select((.outbound.type // "direct") != "direct")' "$STATE_FILE" 2>/dev/null)
+}
+
 status_flow() {
+  if (( EUID == 0 )); then
+    migrate_outbound_health_config 2>/dev/null || true
+    sync_outbound_health_service 2>/dev/null || true
+  fi
   echo
   printf "%s=========================== 系统与服务状态 ===========================%s\n" "$C_CYAN" "$C_RESET"
   local core_ver
@@ -5746,6 +6197,7 @@ status_flow() {
     api_active_str="已停止"
   fi
   printf "流量 API 服务:     %s\n" "$api_active_str"
+  print_outbound_health_status
   local nodes
   nodes=$(current_nodes_json)
   print_node_list "$nodes"
@@ -5947,8 +6399,10 @@ uninstall_flow() {
   confirm_uninstall
   info "正在卸载 sing-box 服务……"
   service_disable "$SYSTEMD_SERVICE"
+  service_disable "$OUTBOUND_HEALTH_SERVICE"
   service_disable "$API_SYSTEMD_SERVICE"
   rm -f "/etc/systemd/system/${SYSTEMD_SERVICE}" "/etc/init.d/sing-box" >/dev/null 2>&1 || true
+  rm -f "/etc/systemd/system/${OUTBOUND_HEALTH_SERVICE}" "/etc/init.d/${OUTBOUND_HEALTH_SERVICE%.service}" >/dev/null 2>&1 || true
   rm -f "/etc/systemd/system/${API_SYSTEMD_SERVICE}" "/etc/init.d/sbox-api" >/dev/null 2>&1 || true
   if command -v dpkg-query >/dev/null 2>&1 && dpkg-query -W sing-box >/dev/null 2>&1; then
     apt-get purge -y sing-box 2>/dev/null || true
@@ -5966,7 +6420,7 @@ uninstall_flow() {
   (crontab -l 2>/dev/null || true) | awk -v tag="${CRON_TAG}" 'index($0, tag) == 0' >"$traffic_cron_tmp" || true
   crontab "$traffic_cron_tmp" >/dev/null 2>&1 || true
   rm -f "$traffic_cron_tmp"
-  rm -rf "$CONFIG_DIR" "$STATE_DIR" /var/lib/sing-box /run/sing-box
+  rm -rf "$CONFIG_DIR" "$STATE_DIR" /var/lib/sing-box /run/sing-box "$OUTBOUND_HEALTH_RUNTIME_DIR"
   rm -f "$SCRIPT_INSTALL_PATH" "$SCRIPT_SYMLINK_PATH" >/dev/null 2>&1 || true
   disable_certbot_timer_if_unused
   service_daemon_reload
@@ -6087,7 +6541,14 @@ update_self_script() {
     sync_traffic_cron 2>/dev/null || true
     sync_traffic_rules 2>/dev/null || true
     sync_anytls_default_padding 2>/dev/null || true
+    migrate_outbound_health_config 2>/dev/null || true
+    sync_outbound_health_service 2>/dev/null || true
     info "后台定时重置任务、时间同步与证书续签钩子已同步刷新。"
+  fi
+
+  # 使用新脚本自身执行一次迁移，确保旧版本升级后立即接入出口健康监控。
+  if [[ -x "$SCRIPT_INSTALL_PATH" ]]; then
+    "$SCRIPT_INSTALL_PATH" --migrate-outbound-health >/dev/null 2>&1 || true
   fi
 
   if [[ "$mode" == "silent" || "$mode" == "quiet" ]]; then
@@ -6330,6 +6791,15 @@ main() {
     --sync-traffic)
       require_root
       sync_traffic_rules
+      exit 0
+      ;;
+    --migrate-outbound-health)
+      require_root
+      detect_os
+      migrate_legacy_state
+      ensure_state_schema
+      migrate_outbound_health_config 2>/dev/null || true
+      sync_outbound_health_service 2>/dev/null || true
       exit 0
       ;;
     --check-traffic-reset)
