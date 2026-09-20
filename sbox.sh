@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.19"
+readonly SCRIPT_VERSION="0.0.20"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -280,7 +280,7 @@ install_outbound_health_monitor_script() {
   cat >"$OUTBOUND_HEALTH_SCRIPT" <<'PY_OUTBOUND_HEALTH_EOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""sbox 主备出口健康监控：按优先级切换备用出口，全部不可用时回退 Direct。"""
+"""sbox 主备出口健康监控：按优先级切换，仅在显式配置时回退 Direct。"""
 import json
 import logging
 import os
@@ -469,7 +469,9 @@ def run_cycle(runtime):
 
         if target and target != current and switch(item["selector"], target):
             old = current
-            current = target
+            # 运行状态使用 primary 表示主出口，避免把实际 sing-box tag
+            # 当作下一轮状态值，导致状态在恢复后的首轮被重新归一化。
+            current = "primary" if target == item["outbound"] else target
             if target == item["outbound"]:
                 LOG.info("节点 %s：主出口连续成功 2 次，已恢复主出口", item["name"])
             elif target == "direct":
@@ -592,14 +594,17 @@ sync_outbound_health_service() {
 }
 
 outbound_health_config_ready() {
-  local count
-  count=$(outbound_health_node_count)
-  (( count == 0 )) && return 0
-  [[ -s "$CONFIG_FILE" ]] || return 1
-  jq -e --arg addr "$OUTBOUND_HEALTH_API_ADDR" '
-    (.experimental.clash_api.external_controller == $addr)
-    and (([.outbounds[]?.tag | select(startswith("health-"))] | length) > 0)
-    and (([.route.rules[]?.outbound | select(startswith("health-"))] | length) > 0)
+  [[ -s "$CONFIG_FILE" && -r "$STATE_FILE" ]] || return 1
+  local expected
+  expected=$(jq -c '[.nodes | to_entries[] | select((.value.outbound.type // "direct") != "direct" and ((.value.backup_outbounds // []) | length > 0)) | ("health-" + ((.key + 1) | tostring))] | sort' "$STATE_FILE" 2>/dev/null) || return 1
+  jq -e --arg addr "$OUTBOUND_HEALTH_API_ADDR" --argjson expected "$expected" '
+    ([.outbounds[]?.tag | select(startswith("health-"))] | sort) == $expected
+    and ([.route.rules[]?.outbound | select(startswith("health-"))] | sort) == $expected
+    and (if ($expected | length) == 0 then
+      (.experimental.clash_api? == null)
+    else
+      (.experimental.clash_api.external_controller == $addr)
+    end)
   ' "$CONFIG_FILE" >/dev/null 2>&1
 }
 
@@ -612,7 +617,7 @@ migrate_outbound_health_config() {
     return 1
   fi
   if command -v sing-box >/dev/null 2>&1 && sing-box check -c "$candidate" >/dev/null 2>&1; then
-    info "检测到旧版出口配置，正在启用自动健康检测并平滑重载……"
+    info "检测到出口健康路由需要同步，正在更新配置并平滑重载……"
     apply_config "$candidate"
   fi
   rm -f "$candidate"
@@ -3145,9 +3150,18 @@ collect_outbound_settings() {
   fi
 }
 
+normalize_backup_outbounds() {
+  local backups=${1:-'[]'}
+  jq -c '
+    [.[] | select((.type // "direct") != "direct")]
+    + (if any(.[]; (.type // "direct") == "direct") then [{type:"direct"}] else [] end)
+  ' <<<"$backups"
+}
+
 collect_backup_outbounds() {
   local old=${1:-} target=${2:-} backups backup_json more
   backups=$(jq -c '.backup_outbounds // []' <<<"${old:-"{}"}")
+  backups=$(normalize_backup_outbounds "$backups")
   if (( NON_INTERACTIVE )); then
     printf -v "$target" '%s' "$backups"
     return 0
@@ -3164,6 +3178,7 @@ collect_backup_outbounds() {
     backups=$(jq -c --argjson item "$backup_json" '. + [$item]' <<<"$backups")
     ok "备用出口已添加（当前共 $(jq 'length' <<<"$backups") 个）。"
   done
+  backups=$(normalize_backup_outbounds "$backups")
   printf -v "$target" '%s' "$backups"
 }
 
@@ -3734,6 +3749,8 @@ apply_config() {
   service_daemon_reload
   service_enable "$SYSTEMD_SERVICE"
   service_stop "$OUTBOUND_HEALTH_SERVICE"
+  # 配置内容或出口顺序变化后，不复用旧出口对应的连续成功/失败计数。
+  rm -f "$OUTBOUND_HEALTH_STATE_FILE"
   if ! service_restart "$SYSTEMD_SERVICE"; then
     warn "sing-box 重启命令执行失败，正在查看日志……"
     if [[ "$INIT_SYSTEM" == "systemd" ]] && command -v journalctl >/dev/null 2>&1; then
@@ -4244,7 +4261,7 @@ format_node_outbound_summary() {
 }
 
 format_node_outbound_route() {
-  local node=$1 outbound route backup_index=1 outbound_type
+  local node=$1 outbound backups route backup_index=1 outbound_type
   format_route_item() {
     local item=$1 item_type item_server item_port
     item_type=$(jq -r '.type // "direct"' <<<"$item")
@@ -4264,6 +4281,7 @@ format_node_outbound_route() {
   else
     route="主 $(format_route_item "$outbound")"
   fi
+  backups=$(normalize_backup_outbounds "$(jq -c '.backup_outbounds // []' <<<"$node")")
   while IFS= read -r outbound; do
     [[ -n "$outbound" ]] || continue
     outbound_type=$(jq -r '.type // "direct"' <<<"$outbound")
@@ -4273,7 +4291,7 @@ format_node_outbound_route() {
       route+=" → 备${backup_index} $(format_route_item "$outbound")"
     fi
     backup_index=$((backup_index + 1))
-  done < <(jq -c '.backup_outbounds[]?' <<<"$node")
+  done < <(jq -c '.[]?' <<<"$backups")
   printf "%s" "$route"
 }
 
@@ -5244,6 +5262,7 @@ backup_outbound_flow() {
   fi
   backup_outbounds=$(jq -c '.backup_outbounds // []' <<<"$old")
   backup_outbounds=$(jq -c --argjson item "$backup_json" '. + [$item]' <<<"$backup_outbounds")
+  backup_outbounds=$(normalize_backup_outbounds "$backup_outbounds")
   save_nodes_json "$(jq -c --argjson index "$index" --argjson backups "$backup_outbounds" '.[ $index ].backup_outbounds = $backups' <<<"$nodes")"
   ok "节点 [${name}] 已添加第 $(jq 'length' <<<"$backup_outbounds") 个备用出口。"
   show_client
