@@ -4072,6 +4072,25 @@ print(c_cyan + bot_bar + c_reset)
   else
     render_node_table_fallback "$table_data"
   fi
+
+  echo
+  printf "出口路线:\n"
+  index=1
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    local route main_outbound backup_index backup_node backup_outbound
+    main_outbound=$(jq -c '.outbound // {type:"direct"}' <<<"$node")
+    route=$(format_node_outbound_summary "$(jq -c --argjson outbound "$main_outbound" '.outbound=$outbound | .backup_outbounds=[]' <<<"$node")")
+    printf "  %d) 主出口: %s\n" "$index" "$route"
+    backup_index=1
+    while IFS= read -r backup_outbound; do
+      [[ -n "$backup_outbound" ]] || continue
+      backup_node=$(jq -c --argjson outbound "$backup_outbound" '.outbound=$outbound | .backup_outbounds=[]' <<<"$node")
+      printf "     备用%d: %s\n" "$backup_index" "$(format_node_outbound_summary "$backup_node")"
+      backup_index=$((backup_index + 1))
+    done < <(jq -c '.backup_outbounds[]?' <<<"$node")
+    index=$((index + 1))
+  done < <(jq -c '.[]?' <<<"$nodes")
 }
 
 select_node_index() {
@@ -5178,6 +5197,35 @@ outbound_flow() {
   pause_prompt
 }
 
+backup_outbound_flow() {
+  local nodes index old name backup_json backup_outbounds
+  nodes=$(current_nodes_json)
+  if (( $(node_count "$nodes") == 0 )); then
+    warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
+    return 0
+  fi
+  print_node_list "$nodes"
+  index=$(select_node_index "$nodes" "请选择要添加备用出口的节点") || return 0
+  old=$(jq -c ".[$index]" <<<"$nodes")
+  name=$(jq -r '.name' <<<"$old")
+  if [[ "$(jq -r '.outbound.type // "direct"' <<<"$old")" == "direct" ]]; then
+    warn "节点 [${name}] 的主出口是 Direct，添加备用出口后不会启用主备健康切换。"
+  fi
+  echo
+  info "为节点 [${name}] 添加备用出口……"
+  OUTBOUND=""
+  if ! collect_outbound_settings "$old" backup_json backup; then
+    warn "已取消添加备用出口。"
+    return 0
+  fi
+  backup_outbounds=$(jq -c '.backup_outbounds // []' <<<"$old")
+  backup_outbounds=$(jq -c --argjson item "$backup_json" '. + [$item]' <<<"$backup_outbounds")
+  save_nodes_json "$(jq -c --argjson index "$index" --argjson backups "$backup_outbounds" '.[ $index ].backup_outbounds = $backups' <<<"$nodes")"
+  ok "节点 [${name}] 已添加第 $(jq 'length' <<<"$backup_outbounds") 个备用出口。"
+  show_client
+  pause_prompt
+}
+
 generate_client_outbound_json() {
   local node=$1
   local proto name domain port
@@ -5399,11 +5447,12 @@ nodes_menu() {
     printf "  1) 新增节点\n"
     printf "  2) 修改配置\n"
     printf "  3) 调整出口\n"
-    printf "  4) 调整流量\n"
-    printf "  5) 删除节点\n"
-    printf "  6) 分享链接\n"
+    printf "  4) 备用出口\n"
+    printf "  5) 调整流量\n"
+    printf "  6) 删除节点\n"
+    printf "  7) 分享链接\n"
     printf "  0) 返回主菜单\n"
-    read -r -p "请输入选择 [0-6，默认: 0]: " choice
+    read -r -p "请输入选择 [0-7，默认: 0]: " choice
     choice=${choice:-0}
     case "$choice" in
       1) add_node_flow ;;
@@ -5428,7 +5477,7 @@ nodes_menu() {
           warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
           pause_prompt
         else
-          configure_traffic_flow "$nodes"
+          backup_outbound_flow
         fi
         ;;
       5)
@@ -5436,10 +5485,18 @@ nodes_menu() {
           warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
           pause_prompt
         else
-          delete_node_flow
+          configure_traffic_flow "$nodes"
         fi
         ;;
       6)
+        if (( $(node_count "$nodes") == 0 )); then
+          warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
+          pause_prompt
+        else
+          delete_node_flow
+        fi
+        ;;
+      7)
         if (( $(node_count "$nodes") == 0 )); then
           warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
           pause_prompt
