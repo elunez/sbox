@@ -4078,17 +4078,7 @@ print(c_cyan + bot_bar + c_reset)
   index=1
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
-    local route main_outbound backup_index backup_node backup_outbound
-    main_outbound=$(jq -c '.outbound // {type:"direct"}' <<<"$node")
-    route=$(format_node_outbound_summary "$(jq -c --argjson outbound "$main_outbound" '.outbound=$outbound | .backup_outbounds=[]' <<<"$node")")
-    printf "  %d) 主出口: %s\n" "$index" "$route"
-    backup_index=1
-    while IFS= read -r backup_outbound; do
-      [[ -n "$backup_outbound" ]] || continue
-      backup_node=$(jq -c --argjson outbound "$backup_outbound" '.outbound=$outbound | .backup_outbounds=[]' <<<"$node")
-      printf "     备用%d: %s\n" "$backup_index" "$(format_node_outbound_summary "$backup_node")"
-      backup_index=$((backup_index + 1))
-    done < <(jq -c '.backup_outbounds[]?' <<<"$node")
+    printf "  %d) %s\n" "$index" "$(format_node_outbound_route "$node")"
     index=$((index + 1))
   done < <(jq -c '.[]?' <<<"$nodes")
 }
@@ -4251,6 +4241,40 @@ format_node_outbound_summary() {
     *) summary="${o_type}" ;;
   esac
   echo "${summary}${backup_desc}"
+}
+
+format_node_outbound_route() {
+  local node=$1 outbound route backup_index=1 outbound_type
+  format_route_item() {
+    local item=$1 item_type item_server item_port
+    item_type=$(jq -r '.type // "direct"' <<<"$item")
+    [[ "$item_type" == "direct" ]] && { printf "Direct"; return; }
+    item_server=$(jq -r '.server // empty' <<<"$item")
+    item_port=$(jq -r '.port // empty' <<<"$item")
+    if [[ -n "$item_server" && -n "$item_port" ]]; then
+      printf "%s (%s:%s)" "$(protocol_label "$item_type")" "$item_server" "$item_port"
+    else
+      protocol_label "$item_type"
+    fi
+  }
+  outbound=$(jq -c '.outbound // {type:"direct"}' <<<"$node")
+  outbound_type=$(jq -r '.type // "direct"' <<<"$outbound")
+  if [[ "$outbound_type" == "direct" ]]; then
+    route="Direct"
+  else
+    route="主 $(format_route_item "$outbound")"
+  fi
+  while IFS= read -r outbound; do
+    [[ -n "$outbound" ]] || continue
+    outbound_type=$(jq -r '.type // "direct"' <<<"$outbound")
+    if [[ "$outbound_type" == "direct" ]]; then
+      route+=" → Direct"
+    else
+      route+=" → 备${backup_index} $(format_route_item "$outbound")"
+    fi
+    backup_index=$((backup_index + 1))
+  done < <(jq -c '.backup_outbounds[]?' <<<"$node")
+  printf "%s" "$route"
 }
 
 format_node_credential_summary() {
