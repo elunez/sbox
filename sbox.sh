@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.20"
+readonly SCRIPT_VERSION="0.0.21"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -595,15 +595,44 @@ sync_outbound_health_service() {
 
 outbound_health_config_ready() {
   [[ -s "$CONFIG_FILE" && -r "$STATE_FILE" ]] || return 1
-  local expected
-  expected=$(jq -c '[.nodes | to_entries[] | select((.value.outbound.type // "direct") != "direct" and ((.value.backup_outbounds // []) | length > 0)) | ("health-" + ((.key + 1) | tostring))] | sort' "$STATE_FILE" 2>/dev/null) || return 1
-  jq -e --arg addr "$OUTBOUND_HEALTH_API_ADDR" --argjson expected "$expected" '
-    ([.outbounds[]?.tag | select(startswith("health-"))] | sort) == $expected
-    and ([.route.rules[]?.outbound | select(startswith("health-"))] | sort) == $expected
-    and (if ($expected | length) == 0 then
+  local expected health_secret=""
+  expected=$(jq -c '.nodes | to_entries | map(
+    .key as $node_index | .value as $node |
+    select(($node.outbound.type // "direct") != "direct" and (($node.backup_outbounds // []) | length > 0)) |
+    {
+      selector: {
+        type: "selector",
+        tag: ("health-" + (($node_index + 1) | tostring)),
+        outbounds: (["out-" + (($node_index + 1) | tostring)] + [
+          ($node.backup_outbounds // []) | to_entries[] |
+          select((.value.type // "direct") != "direct") |
+          "backup-" + (($node_index + 1) | tostring) + "-" + ((.key + 1) | tostring)
+        ] + (if any(($node.backup_outbounds // [])[]?; (.type // "direct") == "direct") then ["direct"] else [] end)),
+        default: ("out-" + (($node_index + 1) | tostring)),
+        interrupt_exist_connections: true
+      },
+      route: {
+        inbound: ["in-" + (($node_index + 1) | tostring)],
+        action: "route",
+        outbound: ("health-" + (($node_index + 1) | tostring))
+      }
+    }
+  ) | {selectors: ([.[].selector] | sort_by(.tag)), routes: ([.[].route] | sort_by(.outbound))}' "$STATE_FILE" 2>/dev/null) || return 1
+  [[ -r "$OUTBOUND_HEALTH_SECRET_FILE" ]] && health_secret=$(tr -d '\r\n' <"$OUTBOUND_HEALTH_SECRET_FILE")
+  jq -e --arg addr "$OUTBOUND_HEALTH_API_ADDR" --arg secret "$health_secret" --argjson expected "$expected" '
+    ([.outbounds[]? | select((.tag // "") | startswith("health-")) | {
+      type, tag, outbounds: (.outbounds // []), default: (.default // ""),
+      interrupt_exist_connections: (.interrupt_exist_connections // false)
+    }] | sort_by(.tag)) == $expected.selectors
+    and ([.route.rules[]? | select((.outbound // "") | startswith("health-")) | {
+      inbound: (.inbound // []), action: (.action // ""), outbound
+    }] | sort_by(.outbound)) == $expected.routes
+    and (if ($expected.selectors | length) == 0 then
       (.experimental.clash_api? == null)
     else
-      (.experimental.clash_api.external_controller == $addr)
+      ($secret != "")
+      and (.experimental.clash_api.external_controller == $addr)
+      and (.experimental.clash_api.secret == $secret)
     end)
   ' "$CONFIG_FILE" >/dev/null 2>&1
 }
@@ -3319,19 +3348,30 @@ state_has_nodes() {
 
 ensure_state_schema() {
   [[ -r "$STATE_FILE" ]] || return 0
-  local version
-  version=$(jq -r '.version // 0' "$STATE_FILE" 2>/dev/null || printf '0')
-  if [[ "$version" -ge 3 ]]; then return 0; fi
-
-  if jq -e '.nodes | type == "array" and length > 0' "$STATE_FILE" >/dev/null 2>&1; then
-    local tmp top_domain
-    tmp=$(mktemp)
-    top_domain=$(json_get "$STATE_FILE" '.domain')
-    jq --arg top_domain "$top_domain" '.version = 3 | .nodes = (.nodes | map(. + {protocol:(.protocol // "anytls"),domain:(if (.domain // "") == "" then $top_domain else .domain end),traffic:(.traffic // {enabled:true,billing_mode:"single",monthly_limit:"unlimited",reset_day:null}),outbound:(if (.outbound.type // "direct") == "ss" then (.outbound + {type:"shadowsocks"}) else (.outbound // {type:"direct"}) end),backup_outbounds:(.backup_outbounds // [])}))' "$STATE_FILE" >"$tmp"
-    install -m 0600 "$tmp" "$STATE_FILE"
-    rm -f "$tmp"
-    return 0
+  jq -e '.nodes | type == "array"' "$STATE_FILE" >/dev/null 2>&1 || return 0
+  local tmp top_domain
+  tmp=$(mktemp)
+  top_domain=$(json_get "$STATE_FILE" '.domain')
+  if jq --arg top_domain "$top_domain" '
+    .version = 3 |
+    .nodes = (.nodes | map(
+      . + {
+        protocol: (.protocol // "anytls"),
+        domain: (if (.domain // "") == "" then $top_domain else .domain end),
+        traffic: (.traffic // {enabled:true,billing_mode:"single",monthly_limit:"unlimited",reset_day:null}),
+        outbound: (if (.outbound.type // "direct") == "ss" then (.outbound + {type:"shadowsocks"}) else (.outbound // {type:"direct"}) end)
+      } |
+      .backup_outbounds = (
+        [.backup_outbounds[]? | select(type == "object" and (.type // "direct") != "direct")]
+        + (if any(.backup_outbounds[]?; type == "object" and (.type // "direct") == "direct") then [{type:"direct"}] else [] end)
+      )
+    ))
+  ' "$STATE_FILE" >"$tmp"; then
+    if ! cmp -s "$tmp" "$STATE_FILE"; then
+      install -m 0600 "$tmp" "$STATE_FILE"
+    fi
   fi
+  rm -f "$tmp"
 }
 
 current_nodes_json() {
@@ -4230,13 +4270,20 @@ add_node_flow() {
 
 format_node_outbound_summary() {
   local node=$1
-  local o_type o_server o_port backup_count backup_desc summary
+  local o_type o_server o_port summary
+  local backup_proxy_count has_direct backup_desc=""
   o_type=$(jq -r '.outbound.type // "direct"' <<<"$node")
   o_server=$(jq -r '.outbound.server // empty' <<<"$node")
   o_port=$(jq -r '.outbound.port // empty' <<<"$node")
-  backup_count=$(jq '[.backup_outbounds[]?] | length' <<<"$node")
-  backup_desc=""
-  (( backup_count > 0 )) && backup_desc="，备用出口 ${backup_count} 个"
+  backup_proxy_count=$(jq '[.backup_outbounds[]? | select((.type // "direct") != "direct")] | length' <<<"$node")
+  has_direct=$(jq 'any(.backup_outbounds[]?; (.type // "direct") == "direct")' <<<"$node")
+  if (( backup_proxy_count > 0 )) && [[ "$has_direct" == "true" ]]; then
+    backup_desc="，备用 ${backup_proxy_count} 个 (回退 Direct)"
+  elif (( backup_proxy_count > 0 )); then
+    backup_desc="，备用出口 ${backup_proxy_count} 个"
+  elif [[ "$has_direct" == "true" ]]; then
+    backup_desc="，故障回退 Direct"
+  fi
   case "$o_type" in
     direct) summary="直连 (Direct)" ;;
     warp) summary="本地 WARP 出口" ;;
@@ -5240,33 +5287,119 @@ outbound_flow() {
 }
 
 backup_outbound_flow() {
-  local nodes index old name backup_json backup_outbounds
+  local nodes index old name backups backup_count choice
   nodes=$(current_nodes_json)
   if (( $(node_count "$nodes") == 0 )); then
     warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
     return 0
   fi
   print_node_list "$nodes"
-  index=$(select_node_index "$nodes" "请选择要添加备用出口的节点") || return 0
+  index=$(select_node_index "$nodes" "请选择要管理备用出口的节点") || return 0
   old=$(jq -c ".[$index]" <<<"$nodes")
   name=$(jq -r '.name' <<<"$old")
   if [[ "$(jq -r '.outbound.type // "direct"' <<<"$old")" == "direct" ]]; then
-    warn "节点 [${name}] 的主出口是 Direct，添加备用出口后不会启用主备健康切换。"
+    warn "节点 [${name}] 的主出口是 Direct，配置备用出口后不会启用主备健康切换。"
   fi
+
+  backups=$(normalize_backup_outbounds "$(jq -c '.backup_outbounds // []' <<<"$old")")
+  backup_count=$(jq 'length' <<<"$backups")
+
   echo
-  info "为节点 [${name}] 添加备用出口……"
-  OUTBOUND=""
-  if ! collect_outbound_settings "$old" backup_json backup; then
-    warn "已取消添加备用出口。"
-    return 0
+  printf "%s=== 节点 [%s] 备用出口管理 ===%s\n" "$C_CYAN" "$name" "$C_RESET"
+  printf "当前出口路线: %s\n" "$(format_node_outbound_route "$old")"
+
+  if (( backup_count == 0 )); then
+    local add_confirm=""
+    read -r -p "该节点暂未配置备用出口，是否立即添加？[Y/n，默认: Y]: " add_confirm
+    add_confirm=${add_confirm:-Y}
+    if [[ ! "$add_confirm" =~ ^[Yy]$ ]]; then
+      warn "已取消添加备用出口。"
+      return 0
+    fi
+    choice=1
+  else
+    printf "  1) 添加备用出口\n"
+    printf "  2) 删除指定备用出口\n"
+    printf "  3) 清空全部备用出口\n"
+    printf "  0) 返回上级菜单\n"
+    read -r -p "请输入选择 [0-3，默认: 0]: " choice
+    choice=${choice:-0}
   fi
-  backup_outbounds=$(jq -c '.backup_outbounds // []' <<<"$old")
-  backup_outbounds=$(jq -c --argjson item "$backup_json" '. + [$item]' <<<"$backup_outbounds")
-  backup_outbounds=$(normalize_backup_outbounds "$backup_outbounds")
-  save_nodes_json "$(jq -c --argjson index "$index" --argjson backups "$backup_outbounds" '.[ $index ].backup_outbounds = $backups' <<<"$nodes")"
-  ok "节点 [${name}] 已添加第 $(jq 'length' <<<"$backup_outbounds") 个备用出口。"
-  show_client
-  pause_prompt
+
+  case "$choice" in
+    1)
+      local backup_json
+      echo
+      info "为节点 [${name}] 添加备用出口……"
+      OUTBOUND=""
+      if ! collect_outbound_settings "$old" backup_json backup; then
+        warn "已取消添加备用出口。"
+        return 0
+      fi
+      local new_type
+      new_type=$(jq -r '.type // "direct"' <<<"$backup_json")
+      if [[ "$new_type" == "direct" ]] && jq -e 'any(.[]; (.type // "direct") == "direct")' <<<"$backups" >/dev/null 2>&1; then
+        warn "节点 [${name}] 已配置 Direct 回退，无需重复添加。"
+        return 0
+      fi
+      backups=$(jq -c --argjson item "$backup_json" '. + [$item]' <<<"$backups")
+      backups=$(normalize_backup_outbounds "$backups")
+      nodes=$(current_nodes_json)
+      save_nodes_json "$(jq -c --argjson index "$index" --argjson backups "$backups" '.[ $index ].backup_outbounds = $backups' <<<"$nodes")"
+      ok "节点 [${name}] 备用出口已更新（当前共 $(jq 'length' <<<"$backups") 项）。"
+      show_client
+      pause_prompt
+      ;;
+    2)
+      echo
+      printf "当前备用出口列表:\n"
+      local b_idx=1 b_item b_type b_server b_port
+      while IFS= read -r b_item; do
+        [[ -n "$b_item" ]] || continue
+        b_type=$(jq -r '.type // "direct"' <<<"$b_item")
+        if [[ "$b_type" == "direct" ]]; then
+          printf "  %d) 故障回退 Direct\n" "$b_idx"
+        else
+          b_server=$(jq -r '.server // empty' <<<"$b_item")
+          b_port=$(jq -r '.port // empty' <<<"$b_item")
+          printf "  %d) %s (%s:%s)\n" "$b_idx" "$(protocol_label "$b_type")" "$b_server" "$b_port"
+        fi
+        b_idx=$((b_idx + 1))
+      done < <(jq -c '.[]?' <<<"$backups")
+      local del_sel
+      read -r -p "请输入要删除的备用出口序号 [1-${backup_count}，0 取消]: " del_sel
+      [[ -n "$del_sel" && "$del_sel" =~ ^[0-9]+$ ]] || { warn "已取消删除。"; return 0; }
+      local del_num=$((10#$del_sel))
+      if (( del_num < 1 || del_num > backup_count )); then
+        warn "已取消删除。"
+        return 0
+      fi
+      backups=$(jq -c --argjson del_idx "$((del_num - 1))" 'del(.[$del_idx])' <<<"$backups")
+      backups=$(normalize_backup_outbounds "$backups")
+      nodes=$(current_nodes_json)
+      save_nodes_json "$(jq -c --argjson index "$index" --argjson backups "$backups" '.[ $index ].backup_outbounds = $backups' <<<"$nodes")"
+      ok "节点 [${name}] 指定备用出口已删除。"
+      show_client
+      pause_prompt
+      ;;
+    3)
+      local clear_confirm=""
+      read -r -p "确认清空节点 [${name}] 的全部备用出口？[y/N]: " clear_confirm
+      if [[ "$clear_confirm" =~ ^[yY]$ ]]; then
+        nodes=$(current_nodes_json)
+        save_nodes_json "$(jq -c --argjson index "$index" '.[ $index ].backup_outbounds = []' <<<"$nodes")"
+        ok "节点 [${name}] 的全部备用出口已清空，健康检测与自动回退已关闭。"
+        show_client
+        pause_prompt
+      else
+        warn "已取消清空。"
+      fi
+      ;;
+    0|"") return 0 ;;
+    *)
+      warn "无效选择。"
+      ;;
+  esac
 }
 
 generate_client_outbound_json() {
@@ -6302,8 +6435,11 @@ print_outbound_health_status() {
       label="Direct（故障回退）"
     elif [[ "$current" == backup-* ]]; then
       local backup_index backup_type
-      backup_index=${current##*-}
-      backup_type=$(jq -r --argjson index "$((backup_index - 1))" '.backup_outbounds[$index].type // "unknown"' <<<"$node")
+      local backup_raw_index
+      backup_raw_index=${current##*-}
+      backup_raw_index=$((backup_raw_index - 1))
+      backup_type=$(jq -r --argjson index "$backup_raw_index" '.backup_outbounds[$index].type // "unknown"' <<<"$node")
+      backup_index=$(jq -r --argjson index "$backup_raw_index" '[.backup_outbounds[0:$index][] | select((.type // "direct") != "direct")] | length + 1' <<<"$node")
       label="备用${backup_index} $(protocol_label "$backup_type")"
     else
       label="$(protocol_label "$(jq -r '.outbound.type // "direct"' <<<"$node")")"
