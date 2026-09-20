@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.18"
+readonly SCRIPT_VERSION="0.0.19"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -254,7 +254,7 @@ service_daemon_reload() {
 
 outbound_health_node_count() {
   [[ -r "$STATE_FILE" ]] || { echo 0; return 0; }
-  jq '[.nodes[]? | select((.outbound.type // "direct") != "direct")] | length' "$STATE_FILE" 2>/dev/null || echo 0
+  jq '[.nodes[]? | select((.outbound.type // "direct") != "direct" and ((.backup_outbounds // []) | length > 0))] | length' "$STATE_FILE" 2>/dev/null || echo 0
 }
 
 ensure_outbound_health_secret() {
@@ -280,7 +280,7 @@ install_outbound_health_monitor_script() {
   cat >"$OUTBOUND_HEALTH_SCRIPT" <<'PY_OUTBOUND_HEALTH_EOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""sbox 出口健康监控：连续两次失败回退 Direct，连续两次成功恢复出口。"""
+"""sbox 主备出口健康监控：按优先级切换备用出口，全部不可用时回退 Direct。"""
 import json
 import logging
 import os
@@ -394,12 +394,15 @@ def configured_nodes():
         if not isinstance(node, dict):
             continue
         outbound = node.get("outbound") or {}
-        if outbound.get("type", "direct") == "direct":
+        configured_backups = [item for item in (node.get("backup_outbounds") or []) if isinstance(item, dict)]
+        if outbound.get("type", "direct") == "direct" or not configured_backups:
             continue
         result.append({
             "key": str(node.get("port", index + 1)),
             "name": str(node.get("name", "节点" + str(index + 1))),
             "outbound": "out-" + str(index + 1),
+            "backups": ["backup-" + str(index + 1) + "-" + str(pos + 1) for pos, backup in enumerate(configured_backups) if backup.get("type", "direct") != "direct"],
+            "direct_fallback": any(item.get("type", "direct") == "direct" for item in configured_backups),
             "selector": "health-" + str(index + 1),
         })
     return result
@@ -414,55 +417,68 @@ def run_cycle(runtime):
 
     results = {}
     workers = min(MAX_WORKERS, len(nodes))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        pending = {pool.submit(probe, item["outbound"]): item for item in nodes}
+    probe_items = [(item, item["outbound"]) for item in nodes]
+    probe_items += [(item, tag) for item in nodes for tag in item["backups"]]
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(probe_items))) as pool:
+        pending = {pool.submit(probe, tag): (item, tag) for item, tag in probe_items}
         for future in as_completed(pending):
-            item = pending[future]
+            item, tag = pending[future]
             try:
-                results[item["key"]] = future.result()
+                results[(item["key"], tag)] = future.result()
             except Exception as exc:
-                results[item["key"]] = (False, None, str(exc))
+                results[(item["key"], tag)] = (None, None, str(exc))
 
     for item in nodes:
         key = item["key"]
-        ok, delay, detail = results.get(key, (False, None, "missing result"))
-        entry = runtime.setdefault(key, {"current": "proxy", "failures": 0, "successes": 0})
-        if ok is None:
-            entry["last_ok"] = None
-            entry["last_detail"] = detail
-            entry["updated_at"] = int(time.time())
-            continue
-        current = entry.get("current", "proxy")
-        if current not in ("proxy", "direct"):
-            current = "proxy"
-        if current == "proxy":
-            entry["successes"] = 0
-            if ok:
-                entry["failures"] = 0
-                if delay is not None:
-                    entry["last_delay_ms"] = delay
+        entry = runtime.setdefault(key, {"current": "primary", "primary_failures": 0, "primary_successes": 0, "backup_failures": {}, "backup_successes": {}})
+        entry.setdefault("backup_failures", {})
+        entry.setdefault("backup_successes", {})
+        primary_ok, primary_delay, primary_detail = results.get((key, item["outbound"]), (None, None, "missing result"))
+        backup_results = {tag: results.get((key, tag), (None, None, "missing result")) for tag in item["backups"]}
+
+        if primary_ok is not None:
+            entry["primary_failures"] = int(entry.get("primary_failures", 0)) + 1 if not primary_ok else 0
+            entry["primary_successes"] = int(entry.get("primary_successes", 0)) + 1 if primary_ok else 0
+            if primary_delay is not None:
+                entry["last_delay_ms"] = primary_delay
+        for tag, (ok, delay, detail) in backup_results.items():
+            if ok is None:
+                continue
+            entry["backup_failures"][tag] = int(entry["backup_failures"].get(tag, 0)) + 1 if not ok else 0
+            entry["backup_successes"][tag] = int(entry["backup_successes"].get(tag, 0)) + 1 if ok else 0
+
+        current = entry.get("current", "primary")
+        if current not in (["primary"] + item["backups"] + ["direct"]):
+            current = "primary"
+        target = None
+        if current != "primary" and primary_ok is True and entry["primary_successes"] >= 2:
+            target = item["outbound"]
+        elif current == "primary" and entry["primary_failures"] >= 2:
+            target = next((tag for tag in item["backups"] if backup_results[tag][0] is True), None)
+            if target is None and item["direct_fallback"] and all(backup_results[tag][0] is False for tag in item["backups"]):
+                target = "direct"
+        elif current in item["backups"] and backup_results.get(current, (None,))[0] is False and entry["backup_failures"].get(current, 0) >= 2:
+            target = next((tag for tag in item["backups"] if backup_results[tag][0] is True), None)
+            if target is None and item["direct_fallback"] and all(backup_results[tag][0] is False for tag in item["backups"]):
+                target = "direct"
+        elif current == "direct":
+            if primary_ok is True and entry["primary_successes"] >= 2:
+                target = item["outbound"]
             else:
-                entry["failures"] = int(entry.get("failures", 0)) + 1
-                if entry["failures"] >= 2:
-                    if switch(item["selector"], "direct"):
-                        entry["current"] = "direct"
-                        entry["failures"] = 0
-                        LOG.warning("节点 %s：出口连续失败 2 次，已切换到 Direct", item["name"])
-        else:
-            entry["failures"] = 0
-            if ok:
-                entry["successes"] = int(entry.get("successes", 0)) + 1
-                if delay is not None:
-                    entry["last_delay_ms"] = delay
-                if entry["successes"] >= 2:
-                    if switch(item["selector"], item["outbound"]):
-                        entry["current"] = "proxy"
-                        entry["successes"] = 0
-                        LOG.info("节点 %s：出口连续成功 2 次，已恢复原出口", item["name"])
+                target = next((tag for tag in item["backups"] if entry["backup_successes"].get(tag, 0) >= 2), None)
+
+        if target and target != current and switch(item["selector"], target):
+            old = current
+            current = target
+            if target == item["outbound"]:
+                LOG.info("节点 %s：主出口连续成功 2 次，已恢复主出口", item["name"])
+            elif target == "direct":
+                LOG.warning("节点 %s：主出口和备用出口均不可用，已切换到 Direct", item["name"])
             else:
-                entry["successes"] = 0
-        entry["last_ok"] = bool(ok)
-        entry["last_detail"] = detail
+                LOG.warning("节点 %s：%s 不可用，已切换到备用出口 %s", item["name"], old, target)
+        entry["current"] = current
+        entry["last_ok"] = primary_ok
+        entry["last_detail"] = primary_detail
         entry["updated_at"] = int(time.time())
     write_runtime_state(runtime)
     return runtime
@@ -2937,8 +2953,11 @@ collect_inbound_settings() {
 }
 
 collect_outbound_settings() {
-  local old=${1:-} target=${2:-}
+  local old=${1:-} target=${2:-} field=${3:-outbound}
   local mode outbound_json=""
+  if [[ "$field" != "outbound" ]]; then
+    old=$(jq -c --arg field "$field" '.outbound = (.[$field] // {type:"direct"})' <<<"${old:-"{}"}")
+  fi
 
   if [[ "$OUTBOUND" == *"://"* ]]; then
     if parse_proxy_link "$OUTBOUND" outbound_json; then
@@ -2955,7 +2974,11 @@ collect_outbound_settings() {
 
   if (( ! NON_INTERACTIVE )); then
     echo
-    info "配置节点出口分流路由……"
+    if [[ "$field" == "outbound" ]]; then
+      info "配置节点主出口分流路由……"
+    else
+      info "配置备用出口分流路由……"
+    fi
     printf "%s提示：%s可直接粘贴出口节点分享链接 (支持 anytls://, ss://, vless://, trojan://, hy2://, socks5://, http://)\n" "$C_CYAN" "$C_RESET"
     printf "      直接按回车，则进入出口协议菜单进行手动选择配置。\n"
     local outbound_link=""
@@ -3122,9 +3145,31 @@ collect_outbound_settings() {
   fi
 }
 
+collect_backup_outbounds() {
+  local old=${1:-} target=${2:-} backups backup_json more
+  backups=$(jq -c '.backup_outbounds // []' <<<"${old:-"{}"}")
+  if (( NON_INTERACTIVE )); then
+    printf -v "$target" '%s' "$backups"
+    return 0
+  fi
+  while true; do
+    prompt_choice more "是否添加备用出口" "no" \
+      "no|否，暂不添加备用出口" \
+      "yes|是，添加一个备用出口" || break
+    OUTBOUND=""
+    if ! collect_outbound_settings "$old" backup_json backup; then
+      warn "已取消本次备用出口配置。"
+      break
+    fi
+    backups=$(jq -c --argjson item "$backup_json" '. + [$item]' <<<"$backups")
+    ok "备用出口已添加（当前共 $(jq 'length' <<<"$backups") 个）。"
+  done
+  printf -v "$target" '%s' "$backups"
+}
+
 collect_node_json() {
   local old=${1:-} target=${2:-}
-  local default_protocol default_domain traffic outbound default_port node_json
+  local default_protocol default_domain traffic outbound backup_outbounds='[]' default_port node_json
   default_protocol=$(jq -r '.protocol // "anytls"' <<<"${old:-"{}"}")
   default_domain=$(jq -r '.domain // empty' <<<"${old:-"{}"}")
   PROTOCOL="${PROTOCOL:-$default_protocol}"
@@ -3200,45 +3245,50 @@ collect_node_json() {
   info "配置流量管理与配额策略……"
   collect_traffic_settings "$old" traffic || return 1
   echo
-  info "配置节点出口分流路由……"
+  info "配置节点主出口分流路由……"
   collect_outbound_settings "$old" outbound || return 1
+  if [[ "$(jq -r '.type // "direct"' <<<"$outbound")" != "direct" ]]; then
+    collect_backup_outbounds "$old" backup_outbounds
+  else
+    backup_outbounds='[]'
+  fi
   case "$PROTOCOL" in
     vless-reality)
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
         --arg uuid "$NODE_UUID" --arg private_key "$REALITY_PRIVATE_KEY" --arg public_key "$REALITY_PUBLIC_KEY" \
         --arg short_id "$REALITY_SHORT_ID" --arg handshake_server "$REALITY_HANDSHAKE_SERVER" --argjson handshake_port "$REALITY_HANDSHAKE_PORT" \
-        --argjson traffic "$traffic" --argjson outbound "$outbound" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,uuid:$uuid,reality:{private_key:$private_key,public_key:$public_key,short_id:$short_id,handshake_server:$handshake_server,handshake_port:$handshake_port},traffic:$traffic,outbound:$outbound}')
+        --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,uuid:$uuid,reality:{private_key:$private_key,public_key:$public_key,short_id:$short_id,handshake_server:$handshake_server,handshake_port:$handshake_port},traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     shadowsocks)
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
-        --arg method "$SS_METHOD" --arg password "$NODE_PASSWORD" --argjson traffic "$traffic" --argjson outbound "$outbound" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,method:$method,password:$password,traffic:$traffic,outbound:$outbound}')
+        --arg method "$SS_METHOD" --arg password "$NODE_PASSWORD" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,method:$method,password:$password,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     socks5)
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
         --arg username "$NODE_USERNAME" --arg password "$NODE_PASSWORD" \
-        --argjson traffic "$traffic" --argjson outbound "$outbound" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,username:$username,password:$password,traffic:$traffic,outbound:$outbound}')
+        --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,username:$username,password:$password,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     http)
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
         --arg username "$NODE_USERNAME" --arg password "$NODE_PASSWORD" --argjson tls "$HTTP_TLS" \
-        --argjson traffic "$traffic" --argjson outbound "$outbound" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,username:$username,password:$password,tls:$tls,traffic:$traffic,outbound:$outbound}')
+        --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,username:$username,password:$password,tls:$tls,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     anytls)
       local old_pad
       old_pad=$(jq -c '.padding_scheme // empty' <<<"${old:-"{}"}")
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
-        --arg password "$NODE_PASSWORD" --argjson traffic "$traffic" --argjson outbound "$outbound" \
+        --arg password "$NODE_PASSWORD" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
         --argjson pad "${old_pad:-null}" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,password:$password,traffic:$traffic,outbound:$outbound} + (if ($pad | type == "array" and length > 0) then {padding_scheme:$pad} else {} end)')
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,password:$password,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds} + (if ($pad | type == "array" and length > 0) then {padding_scheme:$pad} else {} end)')
       ;;
     *)
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
-        --arg password "$NODE_PASSWORD" --argjson traffic "$traffic" --argjson outbound "$outbound" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,password:$password,traffic:$traffic,outbound:$outbound}')
+        --arg password "$NODE_PASSWORD" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,password:$password,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
   esac
   if [[ -n "$target" ]]; then
@@ -3262,7 +3312,7 @@ ensure_state_schema() {
     local tmp top_domain
     tmp=$(mktemp)
     top_domain=$(json_get "$STATE_FILE" '.domain')
-    jq --arg top_domain "$top_domain" '.version = 3 | .nodes = (.nodes | map(. + {protocol:(.protocol // "anytls"),domain:(if (.domain // "") == "" then $top_domain else .domain end),traffic:(.traffic // {enabled:true,billing_mode:"single",monthly_limit:"unlimited",reset_day:null}),outbound:(if (.outbound.type // "direct") == "ss" then (.outbound + {type:"shadowsocks"}) else (.outbound // {type:"direct"}) end)}))' "$STATE_FILE" >"$tmp"
+    jq --arg top_domain "$top_domain" '.version = 3 | .nodes = (.nodes | map(. + {protocol:(.protocol // "anytls"),domain:(if (.domain // "") == "" then $top_domain else .domain end),traffic:(.traffic // {enabled:true,billing_mode:"single",monthly_limit:"unlimited",reset_day:null}),outbound:(if (.outbound.type // "direct") == "ss" then (.outbound + {type:"shadowsocks"}) else (.outbound // {type:"direct"}) end),backup_outbounds:(.backup_outbounds // [])}))' "$STATE_FILE" >"$tmp"
     install -m 0600 "$tmp" "$STATE_FILE"
     rm -f "$tmp"
     return 0
@@ -3312,9 +3362,33 @@ node_count() {
   jq 'length' <<<"$nodes" 2>/dev/null || echo 0
 }
 
+validate_outbound_config() {
+  local outbound_json=$1 label=${2:-出口} outbound_type
+  outbound_type=$(jq -r '.type // "direct"' <<<"$outbound_json")
+  [[ "$outbound_type" == "direct" || "$outbound_type" == "socks5" || "$outbound_type" == "socks" || "$outbound_type" == "http" || "$outbound_type" == "shadowsocks" || "$outbound_type" == "anytls" || "$outbound_type" == "vless-reality" || "$outbound_type" == "trojan" || "$outbound_type" == "hysteria2" ]] || die "不支持的${label}协议：$outbound_type"
+  if [[ "$outbound_type" != "direct" ]]; then
+    validate_host "$(jq -r '.server // empty' <<<"$outbound_json")" || die "${label}服务器地址无效。"
+    validate_port "$(jq -r '.port // empty' <<<"$outbound_json")" || die "${label}端口无效。"
+  fi
+  case "$outbound_type" in
+    shadowsocks)
+      validate_ss_method "$(jq -r '.method // empty' <<<"$outbound_json")" || die "${label} Shadowsocks 加密方法无效。"
+      validate_ss_password "$(jq -r '.method' <<<"$outbound_json")" "$(jq -r '.password // empty' <<<"$outbound_json")" || die "${label} Shadowsocks 密码格式不匹配。"
+      ;;
+    vless-reality)
+      validate_uuid "$(jq -r '.uuid // empty' <<<"$outbound_json")" || die "${label} VLESS UUID 无效。"
+      [[ -n "$(jq -r '.public_key // empty' <<<"$outbound_json")" ]] || die "${label} REALITY 公钥不能为空。"
+      ;;
+    anytls|trojan|hysteria2)
+      [[ -n "$(jq -r '.password // empty' <<<"$outbound_json")" ]] || die "${label}密码不能为空。"
+      ;;
+  esac
+}
+
 validate_nodes_state() {
-  local state_file=$1 node protocol outbound_type
+  local state_file=$1 node protocol
   jq -e '(.nodes|type=="array") and (if (.nodes|length > 0) then (([.nodes[].port]|length==(unique|length)) and all(.nodes[]; (.name|type=="string" and length>0) and (.port|type=="number" and floor==. and .>=1 and .<=65535) and (.protocol|IN("anytls","shadowsocks","vless-reality","trojan","hysteria2","socks5","http")) and (.traffic.monthly_limit|type=="string") and (.traffic.reset_day==null or (.traffic.reset_day|type=="number" and floor==. and .>=1 and .<=31)))) else true end)' "$state_file" >/dev/null 2>&1 || die "节点状态校验失败：请检查协议类型、名称、端口、流量配置是否存在冲突或非法值。"
+  jq -e 'all(.nodes[]?; ((.backup_outbounds // []) | type == "array") and all((.backup_outbounds // [])[]?; type == "object"))' "$state_file" >/dev/null 2>&1 || die "节点状态校验失败：备用出口列表格式无效。"
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     protocol=$(jq -r '.protocol' <<<"$node")
@@ -3345,25 +3419,11 @@ validate_nodes_state() {
         ;;
       *) [[ -n "$(jq -r '.password // empty' <<<"$node")" ]] || die "$(protocol_label "$protocol") 密码不能为空。" ;;
     esac
-    outbound_type=$(jq -r '.outbound.type // "direct"' <<<"$node")
-    [[ "$outbound_type" == "direct" || "$outbound_type" == "socks5" || "$outbound_type" == "socks" || "$outbound_type" == "http" || "$outbound_type" == "shadowsocks" || "$outbound_type" == "anytls" || "$outbound_type" == "vless-reality" || "$outbound_type" == "trojan" || "$outbound_type" == "hysteria2" ]] || die "不支持的出口协议：$outbound_type"
-    if [[ "$outbound_type" != "direct" ]]; then
-      validate_host "$(jq -r '.outbound.server // empty' <<<"$node")" || die "出口服务器地址无效。"
-      validate_port "$(jq -r '.outbound.port // empty' <<<"$node")" || die "出口端口无效。"
-    fi
-    case "$outbound_type" in
-      shadowsocks)
-        validate_ss_method "$(jq -r '.outbound.method // empty' <<<"$node")" || die "Shadowsocks 出口加密方法无效。"
-        validate_ss_password "$(jq -r '.outbound.method' <<<"$node")" "$(jq -r '.outbound.password // empty' <<<"$node")" || die "Shadowsocks 出口密码格式不匹配。"
-        ;;
-      vless-reality)
-        validate_uuid "$(jq -r '.outbound.uuid // empty' <<<"$node")" || die "VLESS 出口 UUID 无效。"
-        [[ -n "$(jq -r '.outbound.public_key // empty' <<<"$node")" ]] || die "REALITY 出口公钥不能为空。"
-        ;;
-      anytls|trojan|hysteria2)
-        [[ -n "$(jq -r '.outbound.password // empty' <<<"$node")" ]] || die "出口密码不能为空。"
-        ;;
-    esac
+    validate_outbound_config "$(jq -c '.outbound // {type:"direct"}' <<<"$node")" "出口"
+    while IFS= read -r outbound_json; do
+      [[ -n "$outbound_json" ]] || continue
+      validate_outbound_config "$outbound_json" "备用出口"
+    done < <(jq -c '.backup_outbounds[]?' <<<"$node")
   done < <(jq -c '.nodes[]?' "$state_file")
 }
 
@@ -3441,7 +3501,7 @@ generate_config_from_state() {
   validate_nodes_state "$state_file"
   local default_pad health_api_secret=""
   default_pad=$(get_default_padding_scheme_json)
-  if jq -e 'any(.nodes[]?; (.outbound.type // "direct") != "direct")' "$state_file" >/dev/null 2>&1; then
+  if jq -e 'any(.nodes[]?; (.outbound.type // "direct") != "direct" and ((.backup_outbounds // []) | length > 0))' "$state_file" >/dev/null 2>&1; then
     health_api_secret=$(ensure_outbound_health_secret)
   fi
   jq --arg cert_dir "$CERT_DIR" \
@@ -3531,13 +3591,13 @@ generate_config_from_state() {
       else
         empty
       end;
-    def outbound($o; $i):
+    def outbound($o; $i; $prefix):
       if $o.type == "direct" then
-        {type: "direct", tag: ("out-" + (($i + 1)|tostring))}
+        {type: "direct", tag: ($prefix + "-" + (($i + 1)|tostring))}
       elif $o.type == "socks5" or $o.type == "socks" then
         ({
           type: "socks",
-          tag: ("out-" + (($i + 1)|tostring)),
+          tag: ($prefix + "-" + (($i + 1)|tostring)),
           server: $o.server,
           server_port: $o.port,
           version: "5"
@@ -3546,7 +3606,7 @@ generate_config_from_state() {
       elif $o.type == "http" then
         ({
           type: "http",
-          tag: ("out-" + (($i + 1)|tostring)),
+          tag: ($prefix + "-" + (($i + 1)|tostring)),
           server: $o.server,
           server_port: $o.port
         } + (if ($o.username // "") != "" then {username: $o.username} else {} end)
@@ -3555,7 +3615,7 @@ generate_config_from_state() {
       elif $o.type == "shadowsocks" then
         {
           type: "shadowsocks",
-          tag: ("out-" + (($i + 1)|tostring)),
+          tag: ($prefix + "-" + (($i + 1)|tostring)),
           server: $o.server,
           server_port: $o.port,
           method: $o.method,
@@ -3564,7 +3624,7 @@ generate_config_from_state() {
       elif $o.type == "anytls" then
         {
           type: "anytls",
-          tag: ("out-" + (($i + 1)|tostring)),
+          tag: ($prefix + "-" + (($i + 1)|tostring)),
           server: $o.server,
           server_port: $o.port,
           password: $o.password,
@@ -3573,7 +3633,7 @@ generate_config_from_state() {
       elif $o.type == "vless-reality" then
         {
           type: "vless",
-          tag: ("out-" + (($i + 1)|tostring)),
+          tag: ($prefix + "-" + (($i + 1)|tostring)),
           server: $o.server,
           server_port: $o.port,
           uuid: $o.uuid,
@@ -3591,7 +3651,7 @@ generate_config_from_state() {
       elif $o.type == "trojan" then
         {
           type: "trojan",
-          tag: ("out-" + (($i + 1)|tostring)),
+          tag: ($prefix + "-" + (($i + 1)|tostring)),
           server: $o.server,
           server_port: $o.port,
           password: $o.password,
@@ -3600,7 +3660,7 @@ generate_config_from_state() {
       elif $o.type == "hysteria2" then
         {
           type: "hysteria2",
-          tag: ("out-" + (($i + 1)|tostring)),
+          tag: ($prefix + "-" + (($i + 1)|tostring)),
           server: $o.server,
           server_port: $o.port,
           password: $o.password,
@@ -3613,11 +3673,12 @@ generate_config_from_state() {
       log: {level: (.log_level // "warn"), timestamp: true},
       inbounds: ([$nodes | to_entries[] | inbound(.value; .key)]),
       outbounds: (
-        ([$nodes | to_entries[] | outbound(.value.outbound; .key)])
-        + ([$nodes | to_entries[] | select((.value.outbound.type // "direct") != "direct") | {
+        ([$nodes | to_entries[] | outbound(.value.outbound; .key; "out")])
+        + ([$nodes | to_entries[] | .key as $node_index | .value.backup_outbounds // [] | to_entries[] | select((.value.type // "direct") != "direct") | outbound(.value; .key; ("backup-" + (($node_index + 1)|tostring)))])
+        + ([$nodes | to_entries[] | .key as $node_index | select((.value.outbound.type // "direct") != "direct" and ((.value.backup_outbounds // []) | length > 0)) | {
             type: "selector",
             tag: ("health-" + ((.key + 1)|tostring)),
-            outbounds: [("out-" + ((.key + 1)|tostring)), "direct"],
+            outbounds: ([("out-" + (($node_index + 1)|tostring))] + [(.value.backup_outbounds // []) | to_entries[] | select((.value.type // "direct") != "direct") | "backup-" + (($node_index + 1)|tostring) + "-" + ((.key + 1)|tostring)] + (if any((.value.backup_outbounds // [])[]?; (.type // "direct") == "direct") then ["direct"] else [] end)),
             default: ("out-" + ((.key + 1)|tostring)),
             interrupt_exist_connections: true
           }])
@@ -3627,7 +3688,7 @@ generate_config_from_state() {
         rules: ([$nodes | to_entries[] | {
           inbound: [("in-" + ((.key + 1)|tostring))],
           action: "route",
-          outbound: (if ((.value.outbound.type // "direct") == "direct") then
+          outbound: (if ((.value.outbound.type // "direct") == "direct" or ((.value.backup_outbounds // []) | length == 0)) then
             ("out-" + ((.key + 1)|tostring))
           else
             ("health-" + ((.key + 1)|tostring))
@@ -3635,7 +3696,7 @@ generate_config_from_state() {
         }]),
         final: "direct"
       },
-      experimental: (if any($nodes[]?; (.outbound.type // "direct") != "direct") then {
+      experimental: (if any($nodes[]?; (.outbound.type // "direct") != "direct" and ((.backup_outbounds // []) | length > 0)) then {
         clash_api: {
           external_controller: $health_api_addr,
           secret: $health_api_secret
@@ -4143,30 +4204,34 @@ add_node_flow() {
 
 format_node_outbound_summary() {
   local node=$1
-  local o_type o_server o_port
+  local o_type o_server o_port backup_count backup_desc summary
   o_type=$(jq -r '.outbound.type // "direct"' <<<"$node")
   o_server=$(jq -r '.outbound.server // empty' <<<"$node")
   o_port=$(jq -r '.outbound.port // empty' <<<"$node")
+  backup_count=$(jq '[.backup_outbounds[]?] | length' <<<"$node")
+  backup_desc=""
+  (( backup_count > 0 )) && backup_desc="，备用出口 ${backup_count} 个"
   case "$o_type" in
-    direct) echo "直连 (Direct)" ;;
-    warp) echo "本地 WARP 出口" ;;
-    socks5|socks) echo "SOCKS5 代理 (${o_server}:${o_port})" ;;
+    direct) summary="直连 (Direct)" ;;
+    warp) summary="本地 WARP 出口" ;;
+    socks5|socks) summary="SOCKS5 代理 (${o_server}:${o_port})" ;;
     http)
       local is_tls
       is_tls=$(jq -r '.outbound.tls.enabled // false' <<<"$node")
       if [[ "$is_tls" == "true" ]]; then
-        echo "HTTPS 代理 (${o_server}:${o_port})"
+        summary="HTTPS 代理 (${o_server}:${o_port})"
       else
-        echo "HTTP 代理 (${o_server}:${o_port})"
+        summary="HTTP 代理 (${o_server}:${o_port})"
       fi
       ;;
-    shadowsocks) echo "Shadowsocks 代理 (${o_server}:${o_port})" ;;
-    anytls) echo "AnyTLS 代理 (${o_server}:${o_port})" ;;
-    trojan) echo "Trojan 代理 (${o_server}:${o_port})" ;;
-    hysteria2) echo "Hysteria2 代理 (${o_server}:${o_port})" ;;
-    vless-reality) echo "VLESS+REALITY 代理 (${o_server}:${o_port})" ;;
-    *) echo "${o_type}" ;;
+    shadowsocks) summary="Shadowsocks 代理 (${o_server}:${o_port})" ;;
+    anytls) summary="AnyTLS 代理 (${o_server}:${o_port})" ;;
+    trojan) summary="Trojan 代理 (${o_server}:${o_port})" ;;
+    hysteria2) summary="Hysteria2 代理 (${o_server}:${o_port})" ;;
+    vless-reality) summary="VLESS+REALITY 代理 (${o_server}:${o_port})" ;;
+    *) summary="${o_type}" ;;
   esac
+  echo "${summary}${backup_desc}"
 }
 
 format_node_credential_summary() {
@@ -4418,47 +4483,48 @@ edit_node_protocol() {
       ;;
   esac
 
-  local traffic outbound new_node
+  local traffic outbound backup_outbounds new_node
   traffic=$(jq -c '.traffic' <<<"$old")
   outbound=$(jq -c '.outbound' <<<"$old")
+  backup_outbounds=$(jq -c '.backup_outbounds // []' <<<"$old")
 
   case "$new_proto" in
     vless-reality)
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
         --arg uuid "$new_uuid" --arg private_key "$new_priv" --arg public_key "$new_pub" \
         --arg short_id "$new_sid" --arg handshake_server "$new_hs_server" --argjson handshake_port "$new_hs_port" \
-        --argjson traffic "$traffic" --argjson outbound "$outbound" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,uuid:$uuid,reality:{private_key:$private_key,public_key:$public_key,short_id:$short_id,handshake_server:$handshake_server,handshake_port:$handshake_port},traffic:$traffic,outbound:$outbound}')
+        --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,uuid:$uuid,reality:{private_key:$private_key,public_key:$public_key,short_id:$short_id,handshake_server:$handshake_server,handshake_port:$handshake_port},traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     shadowsocks)
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
-        --arg method "$new_ss_method" --arg password "$new_pw" --argjson traffic "$traffic" --argjson outbound "$outbound" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,method:$method,password:$password,traffic:$traffic,outbound:$outbound}')
+        --arg method "$new_ss_method" --arg password "$new_pw" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,method:$method,password:$password,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     socks5)
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
         --arg username "$new_user" --arg password "$new_pw" \
-        --argjson traffic "$traffic" --argjson outbound "$outbound" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,username:$username,password:$password,traffic:$traffic,outbound:$outbound}')
+        --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,username:$username,password:$password,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     http)
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
         --arg username "$new_user" --arg password "$new_pw" --argjson tls "$http_tls" \
-        --argjson traffic "$traffic" --argjson outbound "$outbound" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,username:$username,password:$password,tls:$tls,traffic:$traffic,outbound:$outbound}')
+        --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,username:$username,password:$password,tls:$tls,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     anytls)
       local old_pad
       old_pad=$(jq -c '.padding_scheme // empty' <<<"$old")
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
-        --arg password "$new_pw" --argjson traffic "$traffic" --argjson outbound "$outbound" \
+        --arg password "$new_pw" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
         --argjson pad "${old_pad:-null}" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,password:$password,traffic:$traffic,outbound:$outbound} + (if ($pad | type == "array" and length > 0) then {padding_scheme:$pad} else {} end)')
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,password:$password,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds} + (if ($pad | type == "array" and length > 0) then {padding_scheme:$pad} else {} end)')
       ;;
     *)
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
-        --arg password "$new_pw" --argjson traffic "$traffic" --argjson outbound "$outbound" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,password:$password,traffic:$traffic,outbound:$outbound}')
+        --arg password "$new_pw" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,password:$password,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
   esac
 
@@ -4481,7 +4547,7 @@ edit_node_protocol() {
 
 edit_node_outbound() {
   local index=$1
-  local nodes old name outbound
+  local nodes old name outbound backup_outbounds
   nodes=$(current_nodes_json)
   old=$(jq -c ".[$index]" <<<"$nodes")
   name=$(jq -r '.name' <<<"$old")
@@ -4492,8 +4558,13 @@ edit_node_outbound() {
     warn "已取消修改出口分流。"
     return 0
   fi
+  if [[ "$(jq -r '.type // "direct"' <<<"$outbound")" != "direct" ]]; then
+    collect_backup_outbounds "$old" backup_outbounds
+  else
+    backup_outbounds='[]'
+  fi
   nodes=$(current_nodes_json)
-  save_nodes_json "$(jq -c --argjson index "$index" --argjson outbound "$outbound" '.[$index].outbound = $outbound' <<<"$nodes")"
+  save_nodes_json "$(jq -c --argjson index "$index" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" '.[$index].outbound = $outbound | .[$index].backup_outbounds = $backup_outbounds' <<<"$nodes")"
   ok "节点 [${name}] 出口分流已成功更新！"
 }
 
@@ -5079,7 +5150,7 @@ delete_node_flow() {
 }
 
 outbound_flow() {
-  local nodes index old outbound new_nodes name
+  local nodes index old outbound backup_outbounds new_nodes name
   nodes=$(current_nodes_json)
   if (( $(node_count "$nodes") == 0 )); then
     warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
@@ -5095,7 +5166,12 @@ outbound_flow() {
     warn "已放弃修改出口，返回上级菜单。"
     return 0
   fi
-  new_nodes=$(jq -c --argjson index "$index" --argjson outbound "$outbound" '.[ $index ].outbound = $outbound' <<<"$nodes")
+  if [[ "$(jq -r '.type // "direct"' <<<"$outbound")" != "direct" ]]; then
+    collect_backup_outbounds "$old" backup_outbounds
+  else
+    backup_outbounds='[]'
+  fi
+  new_nodes=$(jq -c --argjson index "$index" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" '.[ $index ].outbound = $outbound | .[ $index ].backup_outbounds = $backup_outbounds' <<<"$nodes")
   save_nodes_json "$new_nodes"
   ok "节点 [${name}] 的出口配置已更新！"
   show_client
@@ -6117,19 +6193,24 @@ print_outbound_health_status() {
     [[ -n "$node" ]] || continue
     port=$(jq -r '.port' <<<"$node")
     entry=$(jq -c --arg key "$port" '.[$key] // {}' <<<"$runtime" 2>/dev/null || echo '{}')
-    current=$(jq -r '.current // "proxy"' <<<"$entry")
-    failures=$(jq -r '.failures // 0' <<<"$entry")
-    successes=$(jq -r '.successes // 0' <<<"$entry")
+    current=$(jq -r '.current // "primary"' <<<"$entry")
+    failures=$(jq -r '.primary_failures // 0' <<<"$entry")
+    successes=$(jq -r '.primary_successes // 0' <<<"$entry")
     delay=$(jq -r 'if .last_delay_ms == null then "-" else ((.last_delay_ms|tostring) + " ms") end' <<<"$entry")
     last_ok=$(jq -r 'if .last_ok == true then "成功" elif .last_ok == false then "失败" else "未检测" end' <<<"$entry")
     if [[ "$current" == "direct" ]]; then
       label="Direct（故障回退）"
+    elif [[ "$current" == backup-* ]]; then
+      local backup_index backup_type
+      backup_index=${current##*-}
+      backup_type=$(jq -r --argjson index "$((backup_index - 1))" '.backup_outbounds[$index].type // "unknown"' <<<"$node")
+      label="备用${backup_index} $(protocol_label "$backup_type")"
     else
       label="$(protocol_label "$(jq -r '.outbound.type // "direct"' <<<"$node")")"
     fi
-    printf "  %-16s 当前: %-18s 最近: %-4s 延迟: %-10s 失败/成功计数: %s/%s\n" \
+    printf "  %-16s 当前: %-18s 最近: %-4s 延迟: %-10s 主出口失败/成功: %s/%s\n" \
       "$(jq -r '.name // "未命名"' <<<"$node")" "$label" "$last_ok" "$delay" "$failures" "$successes"
-  done < <(jq -c '.nodes[]? | select((.outbound.type // "direct") != "direct")' "$STATE_FILE" 2>/dev/null)
+  done < <(jq -c '.nodes[]? | select((.outbound.type // "direct") != "direct" and ((.backup_outbounds // []) | length > 0))' "$STATE_FILE" 2>/dev/null)
 }
 
 status_flow() {
