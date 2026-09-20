@@ -6924,7 +6924,7 @@ print_main_menu() {
   fi
 
   echo
-  printf "%s  Sbox · Sing-box 节点管理面板 v%s%s\n" "$C_GREEN" "$SCRIPT_VERSION" "$C_RESET"
+  printf "%s  Sbox · Sing-box 节点管理 v%s%s\n" "$C_GREEN" "$SCRIPT_VERSION" "$C_RESET"
   printf "%s------------------------------------%s\n" "$C_CYAN" "$C_RESET"
   printf " %2d. 退出脚本\n" 0
   printf "%s------------------------------------%s\n" "$C_CYAN" "$C_RESET"
