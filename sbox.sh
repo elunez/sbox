@@ -1025,14 +1025,14 @@ prompt_choice() {
     printf "  %2d) %s\n" "$index" "$item_desc" >&2
     index=$((index + 1))
   done
-  printf "  %2d) 返回上级\n" "$back_index" >&2
+  printf "   0) 返回上级\n" >&2
   if (( NON_INTERACTIVE )); then
     local selected="${items[$((default_index - 1))]}"
     printf -v "$target" "%s" "${selected%%|*}"
     return 0
   fi
   while true; do
-    read -r -p "请输入选择【${title}】[0-${back_index}，默认: ${default_index}]: " choice
+    read -r -p "请输入选择【${title}】[0-${#items[@]}，默认: ${default_index}]: " choice
     choice=${choice:-$default_index}
     if [[ "$choice" == "0" || "$choice" == "$back_index" ]]; then
       return 1
@@ -1049,7 +1049,7 @@ prompt_choice() {
         return 0
       fi
     fi
-    warn "输入无效，请输入 0 到 ${back_index} 之间的数字。"
+    warn "输入无效，请输入 0 到 ${#items[@]} 之间的数字。"
   done
 }
 
@@ -3188,7 +3188,7 @@ normalize_backup_outbounds() {
 }
 
 collect_backup_outbounds() {
-  local old=${1:-} target=${2:-} backups backup_json more
+  local old=${1:-} target=${2:-} backups backup_json choice
   backups=$(jq -c '.backup_outbounds // []' <<<"${old:-"{}"}")
   backups=$(normalize_backup_outbounds "$backups")
   if (( NON_INTERACTIVE )); then
@@ -3196,13 +3196,26 @@ collect_backup_outbounds() {
     return 0
   fi
   while true; do
-    prompt_choice more "是否添加备用出口" "no" \
-      "no|否，暂不添加备用出口" \
-      "yes|是，添加一个备用出口" || break
+    echo
+    printf "%s=== 是否添加备用出口 ===%s\n" "$C_CYAN" "$C_RESET"
+    printf "   1) 是，添加一个备用出口\n"
+    printf "   2) 否，暂不添加备用出口\n"
+    choice=""
+    read -r -p "请输入选择【是否添加备用出口】[1-2，默认: 2]: " choice
+    choice=${choice:-2}
+    if [[ "$choice" != "1" ]]; then
+      break
+    fi
     OUTBOUND=""
     if ! collect_outbound_settings "$old" backup_json backup; then
       warn "已取消本次备用出口配置。"
       break
+    fi
+    local new_type
+    new_type=$(jq -r '.type // "direct"' <<<"$backup_json")
+    if [[ "$new_type" == "direct" ]] && jq -e 'any(.[]; (.type // "direct") == "direct")' <<<"$backups" >/dev/null 2>&1; then
+      warn "已配置 Direct 回退，无需重复添加。"
+      continue
     fi
     backups=$(jq -c --argjson item "$backup_json" '. + [$item]' <<<"$backups")
     ok "备用出口已添加（当前共 $(jq 'length' <<<"$backups") 个）。"
