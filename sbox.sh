@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.21"
+readonly SCRIPT_VERSION="0.0.22"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -1440,10 +1440,10 @@ readonly PROGRESS_INTERVAL=5
 die() { printf "[DNSPod] %s\n" "$*" >&2; exit 1; }
 
 check_txt_record() {
-  local target=$1 expected=$2
-  local cf_ok=0 google_ok=0 txt_resp
+  local target=$1 expected=$2 zone=${3:-}
+  local cf_ok=0 google_ok=0 tencent_ok=0 txt_resp
 
-  # 1. 检查 Cloudflare 1.1.1.1 (全球最大 Anycast 公共 DNS 之一)
+  # 1. 检查 Cloudflare 1.1.1.1 (全球 Anycast 公共 DNS)
   txt_resp=$(curl -fsS --connect-timeout 4 --max-time 6 "https://1.1.1.1/dns-query?name=${target}&type=TXT" -H "accept: application/dns-json" 2>/dev/null || true)
   if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
     cf_ok=1
@@ -1452,7 +1452,7 @@ check_txt_record() {
     [[ "$txt_resp" == *"$expected"* ]] && cf_ok=1
   fi
 
-  # 2. 检查 Google DNS (8.8.8.8 / dns.google，全球覆盖最广的公共递归解析)
+  # 2. 检查 Google DNS (8.8.8.8 / dns.google)
   txt_resp=$(curl -fsS --connect-timeout 4 --max-time 6 "https://dns.google/resolve?name=${target}&type=TXT" 2>/dev/null || true)
   if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
     google_ok=1
@@ -1466,8 +1466,44 @@ check_txt_record() {
     fi
   fi
 
-  # 必须 Cloudflare 与 Google 两个独立公共 DNS 均确认解析成功（多视角交叉确认）
-  if (( cf_ok && google_ok )); then
+  # 3. 检查 Tencent / DNSPod 官方公共 DNS (doh.pub / 1.12.12.12)
+  txt_resp=$(curl -fsS --connect-timeout 4 --max-time 6 "https://doh.pub/dns-query?name=${target}&type=TXT" -H "accept: application/dns-json" 2>/dev/null || true)
+  if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
+    tencent_ok=1
+  else
+    txt_resp=$(curl -fsS --connect-timeout 4 --max-time 6 "https://1.12.12.12/dns-query?name=${target}&type=TXT" -H "accept: application/dns-json" 2>/dev/null || true)
+    if [[ -n "$txt_resp" && "$txt_resp" == *"$expected"* ]]; then
+      tencent_ok=1
+    elif command -v dig >/dev/null 2>&1; then
+      txt_resp=$(dig +short TXT "$target" @119.29.29.29 2>/dev/null || true)
+      [[ "$txt_resp" == *"$expected"* ]] && tencent_ok=1
+    fi
+  fi
+
+  # 4. 若有 dig 且提供了根域名，尝试直接向权威 Nameservers 逐台核验
+  if command -v dig >/dev/null 2>&1 && [[ -n "$zone" ]]; then
+    local -a ns_list=()
+    while IFS= read -r ns; do
+      [[ -n "$ns" ]] && ns_list+=("${ns%.}")
+    done < <(dig +short NS "$zone" 2>/dev/null | grep -v '^;' || true)
+
+    if ((${#ns_list[@]} > 0)); then
+      local all_ns_ok=1 ns_item ns_ans
+      for ns_item in "${ns_list[@]}"; do
+        ns_ans=$(dig +short TXT "$target" "@${ns_item}" 2>/dev/null || true)
+        if [[ "$ns_ans" != *"$expected"* ]]; then
+          all_ns_ok=0
+          break
+        fi
+      done
+      if (( all_ns_ok )); then
+        return 0
+      fi
+    fi
+  fi
+
+  # 若权威 NS 无法直接连通，至少要求腾讯/Cloudflare/Google 中两家及以上同时确认
+  if (( cf_ok + google_ok + tencent_ok >= 2 )); then
     return 0
   fi
   return 1
@@ -1590,12 +1626,13 @@ main() {
       local check_name="${subdomain}.${zone}"
       notify "TXT 记录 ${check_name} 已创建，等待 DNS 解析生效（最长 ${PROPAGATION_SECONDS} 秒）……"
       for ((remaining=PROPAGATION_SECONDS; remaining>0; remaining-=PROGRESS_INTERVAL)); do
-        notify "DNS 传播等待中，剩余 ${remaining} 秒……"
+        local elapsed=$((PROPAGATION_SECONDS - remaining))
+        notify "DNS 传播等待中，已等待 ${elapsed} 秒，剩余 ${remaining} 秒……"
         sleep "$PROGRESS_INTERVAL"
-        if (( PROPAGATION_SECONDS - remaining >= 40 )); then
-          if check_txt_record "$check_name" "$CERTBOT_VALIDATION"; then
-            notify "检测到主流公共 DNS (Cloudflare & Google) 均已解析生效，安全缓冲 10 秒后提交验证……"
-            sleep 10
+        if (( elapsed >= 45 )); then
+          if check_txt_record "$check_name" "$CERTBOT_VALIDATION" "$zone"; then
+            notify "检测到主流公共 DNS / 权威解析已生效，安全缓冲 25 秒以确保全球多地区节点完全同步……"
+            sleep 25
             break
           fi
         fi
@@ -1659,7 +1696,10 @@ collect_dnspod_settings() {
   echo
   info "配置 DNSPod Token (可在 DNSPod 控制台「我的账号」->「API密钥」->「DNSPod Token」中创建)"
   prompt_value raw_input "DNSPod Token [格式: ID,Token 或直接输入 ID]" "$DNSPOD_TOKEN_ID"
-  [[ -n "$raw_input" ]] || die "DNSPod Token ID 不能为空。"
+  if [[ -z "$raw_input" ]]; then
+    warn "DNSPod Token ID 不能为空。"
+    return 1
+  fi
 
   if [[ "$raw_input" == *,* ]]; then
     DNSPOD_TOKEN_ID="${raw_input%%,*}"
@@ -1675,7 +1715,10 @@ collect_dnspod_settings() {
     fi
   fi
 
-  [[ -n "$DNSPOD_TOKEN_ID" && -n "$DNSPOD_TOKEN_KEY" ]] || die "DNSPod Token ID 与 Token Key 不能为空。"
+  if [[ -z "$DNSPOD_TOKEN_ID" || -z "$DNSPOD_TOKEN_KEY" ]]; then
+    warn "DNSPod Token ID 与 Token Key 不能为空。"
+    return 1
+  fi
   write_dnspod_credentials
   install_dnspod_hooks
 }
@@ -1845,12 +1888,13 @@ main() {
 
       notify "TXT 记录 ${record_name} 已创建，等待 DNS 解析生效（最长 ${PROPAGATION_SECONDS} 秒）……"
       for ((remaining=PROPAGATION_SECONDS; remaining>0; remaining-=PROGRESS_INTERVAL)); do
-        notify "DNS 传播等待中，剩余 ${remaining} 秒……"
+        local elapsed=$((PROPAGATION_SECONDS - remaining))
+        notify "DNS 传播等待中，已等待 ${elapsed} 秒，剩余 ${remaining} 秒……"
         sleep "$PROGRESS_INTERVAL"
-        if (( PROPAGATION_SECONDS - remaining >= 25 )); then
+        if (( elapsed >= 25 )); then
           if check_txt_record "$record_name" "$CERTBOT_VALIDATION"; then
-            notify "检测到主流公共 DNS (Cloudflare & Google) 均已解析生效，安全缓冲 10 秒后提交验证……"
-            sleep 10
+            notify "检测到主流公共 DNS (Cloudflare & Google) 均已解析生效，安全缓冲 15 秒后提交验证……"
+            sleep 15
             break
           fi
         fi
@@ -1928,7 +1972,10 @@ collect_cf_settings() {
     else
       read -r -p "Cloudflare API Token: " CF_API_TOKEN
     fi
-    [[ -n "$CF_API_TOKEN" ]] || die "Cloudflare API Token 不能为空。"
+    if [[ -z "$CF_API_TOKEN" ]]; then
+      warn "Cloudflare API Token 不能为空。"
+      return 1
+    fi
     CF_API_KEY=""
     CF_EMAIL=""
   else
@@ -1939,7 +1986,10 @@ collect_cf_settings() {
     else
       read -r -p "Cloudflare Global API Key: " CF_API_KEY
     fi
-    [[ -n "$CF_EMAIL" && -n "$CF_API_KEY" ]] || die "Cloudflare 邮箱与 Global Key 不能为空。"
+    if [[ -z "$CF_EMAIL" || -z "$CF_API_KEY" ]]; then
+      warn "Cloudflare 邮箱与 Global Key 不能为空。"
+      return 1
+    fi
     CF_API_TOKEN=""
   fi
 
@@ -2002,12 +2052,124 @@ copy_certificate() {
   source_dir="/etc/letsencrypt/live/${domain}"
   target_dir="${CERT_DIR}/${domain}"
   group=$(service_group)
-  [[ -s "${source_dir}/fullchain.pem" && -s "${source_dir}/privkey.pem" ]] || die "找不到 ${domain} 的 Certbot 证书。"
+  if [[ ! -s "${source_dir}/fullchain.pem" || ! -s "${source_dir}/privkey.pem" ]]; then
+    warn "找不到 ${domain} 的 Certbot 证书。"
+    return 1
+  fi
   install -d -m 0750 -o root -g "$group" "$CERT_DIR" "$target_dir"
   install -m 0640 -o root -g "$group" "${source_dir}/fullchain.pem" "${target_dir}/fullchain.pem"
   install -m 0640 -o root -g "$group" "${source_dir}/privkey.pem" "${target_dir}/privkey.pem"
-  openssl x509 -in "${target_dir}/fullchain.pem" -noout -checkend 0 >/dev/null 2>&1 || die "证书无效或已经过期。"
-  openssl pkey -in "${target_dir}/privkey.pem" -noout >/dev/null 2>&1 || die "证书私钥无效。"
+  if ! openssl x509 -in "${target_dir}/fullchain.pem" -noout -checkend 0 >/dev/null 2>&1; then
+    warn "证书无效或已经过期。"
+    return 1
+  fi
+  if ! openssl pkey -in "${target_dir}/privkey.pem" -noout >/dev/null 2>&1; then
+    warn "证书私钥无效。"
+    return 1
+  fi
+  return 0
+}
+
+get_active_cert_domains() {
+  [[ -r "$STATE_FILE" ]] || return 0
+  jq -r '
+    .nodes[]?
+    | select(
+        (.protocol == "anytls" or .protocol == "trojan" or .protocol == "hysteria2" or (.protocol == "http" and .tls == true))
+        and (.domain // "" != "")
+      )
+    | .domain
+  ' "$STATE_FILE" 2>/dev/null | sort -u
+}
+
+disable_certbot_timer_if_unused() {
+  local -a renewal_files=()
+  shopt -s nullglob
+  renewal_files=(/etc/letsencrypt/renewal/*.conf)
+  shopt -u nullglob
+  if ((${#renewal_files[@]} == 0)); then
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+      systemctl disable --now certbot.timer >/dev/null 2>&1 || true
+    else
+      local cert_cron_tmp
+      cert_cron_tmp=$(mktemp)
+      (crontab -l 2>/dev/null || true) | awk '$0 !~ /certbot renew/' > "$cert_cron_tmp" || true
+      crontab "$cert_cron_tmp" >/dev/null 2>&1 || true
+      rm -f "$cert_cron_tmp"
+    fi
+    info "无其他证书依赖，已停用证书自动续签任务。"
+  fi
+}
+
+get_all_installed_certs() {
+  local f name
+  if [[ -d "/etc/letsencrypt/renewal" ]]; then
+    for f in /etc/letsencrypt/renewal/*.conf; do
+      [[ -f "$f" ]] || continue
+      name="${f##*/}"
+      name="${name%.conf}"
+      [[ -n "$name" && "$name" != "*" ]] && printf "%s\n" "$name"
+    done
+  fi
+
+  if [[ -d "/etc/letsencrypt/live" ]]; then
+    for f in /etc/letsencrypt/live/*; do
+      [[ -d "$f" ]] || continue
+      name="${f##*/}"
+      [[ -n "$name" && "$name" != "README" && "$name" != "*" ]] && printf "%s\n" "$name"
+    done
+  fi
+
+  if [[ -d "$CERT_DIR" ]]; then
+    for f in "$CERT_DIR"/*; do
+      [[ -d "$f" ]] || continue
+      name="${f##*/}"
+      [[ -n "$name" && "$name" != "*" ]] && printf "%s\n" "$name"
+    done
+  fi
+}
+
+get_unused_certificates() {
+  local active_domains installed_domains
+  active_domains=$(get_active_cert_domains)
+  installed_domains=$(get_all_installed_certs | sort -u)
+
+  [[ -n "$installed_domains" ]] || return 0
+
+  local cert
+  while IFS= read -r cert; do
+    [[ -n "$cert" ]] || continue
+    if ! grep -qFx "$cert" <<<"$active_domains"; then
+      printf "%s\n" "$cert"
+    fi
+  done <<<"$installed_domains"
+}
+
+delete_single_certificate() {
+  local domain=$1
+  [[ -n "$domain" ]] || return 0
+
+  ensure_certbot_environment
+  # 1. 若 certbot 环境正常，使用 certbot 官方命令删除证书及续签配置
+  if command -v certbot >/dev/null 2>&1; then
+    if [[ -f "/etc/letsencrypt/renewal/${domain}.conf" ]] || \
+       certbot certificates 2>/dev/null | grep -q "Certificate Name: ${domain}"; then
+      certbot delete --cert-name "$domain" --non-interactive >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # 2. 兜底彻底清除可能遗留的文件与续签配置，杜绝 certbot renew 再次扫描
+  rm -rf "/etc/letsencrypt/live/${domain}" \
+         "/etc/letsencrypt/archive/${domain}" \
+         "/etc/letsencrypt/renewal/${domain}.conf" >/dev/null 2>&1 || true
+
+  # 3. 清除 sing-box 本地证书目录
+  if [[ -n "$CERT_DIR" && -d "${CERT_DIR}/${domain}" ]]; then
+    rm -rf "${CERT_DIR:?}/${domain}"
+  fi
+
+  # 4. 检查是否仍有其他证书依赖，若无任何证书则关闭后台续签定时器
+  disable_certbot_timer_if_unused
 }
 
 sync_certificate() {
@@ -2018,7 +2180,7 @@ sync_certificate() {
       if [[ -s "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
         copy_certificate "$domain"
       fi
-    done < <(jq -r '.nodes[]?.domain // empty' "$STATE_FILE" 2>/dev/null | sort -u)
+    done < <(get_active_cert_domains)
   fi
 }
 
@@ -2083,16 +2245,26 @@ issue_certificate() {
 
   case "$mode" in
     standalone)
-      [[ -z "$(port_listener 80)" ]] || die "HTTP-01 standalone 需要 TCP 80，但该端口已被占用；请改用 webroot 模式。"
+      local l80
+      l80=$(port_listener 80)
+      if [[ -n "$l80" ]]; then
+        warn "HTTP-01 standalone 模式需要 TCP 80 端口，但该端口已被占用：${l80}"
+        return 1
+      fi
       args+=(--standalone --preferred-challenges http)
       ;;
     webroot)
-      [[ -n "$webroot" && -d "$webroot" ]] || die "webroot 目录不存在：${webroot:-<空>}"
+      if [[ -z "$webroot" || ! -d "$webroot" ]]; then
+        warn "webroot 目录不存在：${webroot:-<空>}"
+        return 1
+      fi
       args+=(--webroot -w "$webroot" --preferred-challenges http)
       ;;
     dnspod)
-      [[ -x "$DNSPOD_AUTH_HOOK" && -x "$DNSPOD_CLEANUP_HOOK" && -r "$DNSPOD_CREDENTIAL_FILE" ]] || \
-        die "DNSPod 凭据或验证钩子未就绪。"
+      if [[ ! -x "$DNSPOD_AUTH_HOOK" || ! -x "$DNSPOD_CLEANUP_HOOK" || ! -r "$DNSPOD_CREDENTIAL_FILE" ]]; then
+        warn "DNSPod 凭据或验证钩子未就绪。"
+        return 1
+      fi
       args+=(--manual --preferred-challenges dns \
         --manual-auth-hook "$DNSPOD_AUTH_HOOK" \
         --manual-cleanup-hook "$DNSPOD_CLEANUP_HOOK")
@@ -2101,8 +2273,10 @@ issue_certificate() {
       fi
       ;;
     cf)
-      [[ -x "$CF_AUTH_HOOK" && -x "$CF_CLEANUP_HOOK" && -r "$CF_CREDENTIAL_FILE" ]] || \
-        die "Cloudflare 凭据或验证钩子未就绪。"
+      if [[ ! -x "$CF_AUTH_HOOK" || ! -x "$CF_CLEANUP_HOOK" || ! -r "$CF_CREDENTIAL_FILE" ]]; then
+        warn "Cloudflare 凭据或验证钩子未就绪。"
+        return 1
+      fi
       args+=(--manual --preferred-challenges dns \
         --manual-auth-hook "$CF_AUTH_HOOK" \
         --manual-cleanup-hook "$CF_CLEANUP_HOOK")
@@ -2110,14 +2284,27 @@ issue_certificate() {
         args+=(--manual-public-ip-logging-ok)
       fi
       ;;
-    *) die "证书模式仅支持 dnspod、cf、webroot 或 standalone。" ;;
+    *)
+      warn "证书模式仅支持 dnspod、cf、webroot 或 standalone。"
+      return 1
+      ;;
   esac
 
   info "通过 Let's Encrypt 为 ${domain} 申请/同步证书……"
-  certbot "${args[@]}"
-  [[ -s "/etc/letsencrypt/live/${domain}/fullchain.pem" ]] || die "未找到签发后的证书。"
-  copy_certificate "$domain"
+  if ! certbot "${args[@]}"; then
+    warn "Certbot 证书申请未能成功执行完成。"
+    return 1
+  fi
+  if [[ ! -s "/etc/letsencrypt/live/${domain}/fullchain.pem" ]]; then
+    warn "未找到签发后的证书文件 (/etc/letsencrypt/live/${domain}/fullchain.pem)。"
+    return 1
+  fi
+  if ! copy_certificate "$domain"; then
+    warn "同步证书至 sing-box 配置目录失败。"
+    return 1
+  fi
   ok "域名 ${domain} 证书已就绪。"
+  return 0
 }
 
 install_deploy_hook() {
@@ -2155,7 +2342,10 @@ ensure_node_certificate() {
   domain=$(jq -r '.domain // empty' <<<"$node")
   tls=$(jq -r '.tls // false' <<<"$node")
   node_requires_certificate "$protocol" "$tls" || return 0
-  validate_domain "$domain" || die "协议 $(protocol_label "$protocol") 需要有效域名：${domain:-<空>}"
+  if ! validate_domain "$domain"; then
+    warn "协议 $(protocol_label "$protocol") 需要有效域名：${domain:-<空>}"
+    return 1
+  fi
   if [[ -s "$(node_cert_file "$domain")" && -s "$(node_key_file "$domain")" ]]; then
     if openssl x509 -in "$(node_cert_file "$domain")" -noout -checkend 86400 >/dev/null 2>&1; then
       info "域名 ${domain} 已存在本地有效证书，直接使用。"
@@ -2187,78 +2377,119 @@ ensure_node_certificate() {
     mode="dnspod"
   fi
 
-  if [[ "$mode" == "webroot" ]]; then
-    if [[ -z "$webroot" || ! -d "$webroot" ]]; then
-      prompt_value WEBROOT "网站根目录" "${WEBROOT:-/var/www/html}"
-      webroot="$WEBROOT"
-    elif (( ! NON_INTERACTIVE )); then
-      prompt_value WEBROOT "网站根目录" "$webroot"
-      webroot="$WEBROOT"
-    fi
-  fi
-
-  if [[ "$mode" == "dnspod" ]]; then
-    if [[ ! -r "$DNSPOD_CREDENTIAL_FILE" ]] || ! jq -e '(.id // .token_id) and (.token // .token_key)' "$DNSPOD_CREDENTIAL_FILE" >/dev/null 2>&1; then
-      DOMAIN="$domain"
-      EMAIL="$email"
-      CERT_MODE="$mode"
-      collect_dnspod_settings || return 1
-    elif (( ! NON_INTERACTIVE )); then
-      local cur_id reuse_choice="yes"
-      cur_id=$(jq -r '.id // .token_id // empty' "$DNSPOD_CREDENTIAL_FILE" 2>/dev/null || true)
-      info "检测到已保存的 DNSPod Token (ID: ${cur_id})"
-      prompt_choice reuse_choice "DNSPod 凭据确认" "yes" \
-        "yes|直接复用已保存凭据" \
-        "no|重新配置新的凭据" || return 1
-      if [[ "$reuse_choice" == "no" ]]; then
+  prepare_cert_mode_env() {
+    local target_mode=$1
+    if [[ "$target_mode" == "webroot" ]]; then
+      if [[ -z "$webroot" || ! -d "$webroot" ]]; then
+        prompt_value WEBROOT "网站根目录" "${WEBROOT:-/var/www/html}"
+        webroot="$WEBROOT"
+      elif (( ! NON_INTERACTIVE )); then
+        prompt_value WEBROOT "网站根目录" "$webroot"
+        webroot="$WEBROOT"
+      fi
+    elif [[ "$target_mode" == "dnspod" ]]; then
+      if [[ ! -r "$DNSPOD_CREDENTIAL_FILE" ]] || ! jq -e '(.id // .token_id) and (.token // .token_key)' "$DNSPOD_CREDENTIAL_FILE" >/dev/null 2>&1; then
         DOMAIN="$domain"
         EMAIL="$email"
-        CERT_MODE="$mode"
+        CERT_MODE="$target_mode"
         collect_dnspod_settings || return 1
+      elif (( ! NON_INTERACTIVE )); then
+        local cur_id reuse_choice="yes"
+        cur_id=$(jq -r '.id // .token_id // empty' "$DNSPOD_CREDENTIAL_FILE" 2>/dev/null || true)
+        info "检测到已保存的 DNSPod Token (ID: ${cur_id})"
+        prompt_choice reuse_choice "DNSPod 凭据确认" "yes" \
+          "yes|直接复用已保存凭据" \
+          "no|重新配置新的凭据" || return 1
+        if [[ "$reuse_choice" == "no" ]]; then
+          DOMAIN="$domain"
+          EMAIL="$email"
+          CERT_MODE="$target_mode"
+          collect_dnspod_settings || return 1
+        else
+          install_dnspod_hooks
+        fi
       else
         install_dnspod_hooks
       fi
-    else
-      install_dnspod_hooks
-    fi
-  fi
-
-  if [[ "$mode" == "cf" ]]; then
-    if [[ ! -r "$CF_CREDENTIAL_FILE" ]] || ! jq -e '.api_token or (.api_key and .email)' "$CF_CREDENTIAL_FILE" >/dev/null 2>&1; then
-      DOMAIN="$domain"
-      EMAIL="$email"
-      CERT_MODE="$mode"
-      collect_cf_settings || return 1
-    elif (( ! NON_INTERACTIVE )); then
-      local reuse_choice="yes"
-      info "检测到已保存的 Cloudflare 凭据"
-      prompt_choice reuse_choice "Cloudflare 凭据确认" "yes" \
-        "yes|直接复用已保存凭据" \
-        "no|重新配置新的凭据" || return 1
-      if [[ "$reuse_choice" == "no" ]]; then
+    elif [[ "$target_mode" == "cf" ]]; then
+      if [[ ! -r "$CF_CREDENTIAL_FILE" ]] || ! jq -e '.api_token or (.api_key and .email)' "$CF_CREDENTIAL_FILE" >/dev/null 2>&1; then
         DOMAIN="$domain"
         EMAIL="$email"
-        CERT_MODE="$mode"
+        CERT_MODE="$target_mode"
         collect_cf_settings || return 1
+      elif (( ! NON_INTERACTIVE )); then
+        local reuse_choice="yes"
+        info "检测到已保存的 Cloudflare 凭据"
+        prompt_choice reuse_choice "Cloudflare 凭据确认" "yes" \
+          "yes|直接复用已保存凭据" \
+          "no|重新配置新的凭据" || return 1
+        if [[ "$reuse_choice" == "no" ]]; then
+          DOMAIN="$domain"
+          EMAIL="$email"
+          CERT_MODE="$target_mode"
+          collect_cf_settings || return 1
+        else
+          install_cf_hooks
+        fi
       else
         install_cf_hooks
       fi
-    else
-      install_cf_hooks
     fi
-  fi
+  }
 
-  issue_certificate "$domain" "$email" "$mode" "$webroot"
-  CERT_MODE="$mode"
-  WEBROOT="$webroot"
-  if [[ -s "$STATE_FILE" ]]; then
-    local state_tmp
-    state_tmp=$(mktemp)
-    jq --arg email "$email" --arg mode "$mode" --arg webroot "$webroot" \
-      '.email=$email | .cert_mode=$mode | .webroot=$webroot' "$STATE_FILE" >"$state_tmp"
-    install -m 0600 "$state_tmp" "$STATE_FILE"
-    rm -f "$state_tmp"
-  fi
+  prepare_cert_mode_env "$mode" || return 1
+
+  while true; do
+    if issue_certificate "$domain" "$email" "$mode" "$webroot"; then
+      CERT_MODE="$mode"
+      WEBROOT="$webroot"
+      if [[ -s "$STATE_FILE" ]]; then
+        local state_tmp
+        state_tmp=$(mktemp)
+        jq --arg email "$email" --arg mode "$mode" --arg webroot "$webroot" \
+          '.email=$email | .cert_mode=$mode | .webroot=$webroot' "$STATE_FILE" >"$state_tmp"
+        install -m 0600 "$state_tmp" "$STATE_FILE"
+        rm -f "$state_tmp"
+      fi
+      return 0
+    fi
+
+    if (( NON_INTERACTIVE )); then
+      warn "非交互模式下证书申请失败。"
+      return 1
+    fi
+
+    echo
+    warn "域名 [${domain}] 证书申请未能成功。"
+    printf "%s可能原因与排查建议：%s\n" "$C_YELLOW" "$C_RESET"
+    printf "  1. DNS 记录在全球权威 DNS 上尚未完全同步扩散（Let's Encrypt 会从全球多节点交叉验证，稍等重试即可）\n"
+    printf "  2. 域名解析未正确生效，或 API Token 权限有误\n"
+    printf "  3. 服务器 80 端口被外部防火墙阻断或被本地 Web 服务占用（针对 HTTP-01 验证模式）\n"
+    echo
+    printf "%s请选择后续操作：%s\n" "$C_CYAN" "$C_RESET"
+    printf "  1) 立即重试申请证书 (推荐，此时 DNS 记录通常已完成全球同步)\n"
+    printf "  2) 更换证书申请模式 (如 Standalone / Webroot / Cloudflare / DNSPod)\n"
+    printf "  3) 放弃证书申请并安全返回 (保留当前已配置参数，不退出脚本)\n"
+    local fail_choice
+    read -r -p "请输入选择 [1-3，默认: 1]: " fail_choice
+    fail_choice=${fail_choice:-1}
+    case "$fail_choice" in
+      1)
+        echo
+        info "正在重新尝试为域名 [${domain}] 申请证书……"
+        prepare_cert_mode_env "$mode" || return 1
+        ;;
+      2)
+        choose_cert_mode || return 1
+        mode="$CERT_MODE"
+        prepare_cert_mode_env "$mode" || return 1
+        ;;
+      3|*)
+        warn "已取消本次证书申请。"
+        return 1
+        ;;
+    esac
+  done
 }
 
 service_group() {
@@ -3260,21 +3491,39 @@ collect_node_json() {
   NODE_DOMAIN="${NODE_DOMAIN:-$default_domain}"
   NODE_DOMAIN=${NODE_DOMAIN:-${DOMAIN:-$(json_get "$STATE_FILE" '.domain')}}
   if node_requires_certificate "$PROTOCOL" "$HTTP_TLS"; then
-    prompt_value NODE_DOMAIN "节点连接地址 (域名)" "$NODE_DOMAIN"
-    validate_domain "$NODE_DOMAIN" || die "当前协议 [$(protocol_label "$PROTOCOL")] 需要 SSL 证书，请输入已解析到本机公网 IP 的有效域名 (如 example.com)。"
+    while true; do
+      prompt_value NODE_DOMAIN "节点连接地址 (域名)" "$NODE_DOMAIN"
+      if validate_domain "$NODE_DOMAIN"; then
+        break
+      fi
+      warn "当前协议 [$(protocol_label "$PROTOCOL")] 需要 SSL 证书，请输入已解析到本机公网 IP 的有效域名 (如 example.com)。"
+      if (( NON_INTERACTIVE )); then
+        return 1
+      fi
+    done
   else
     local fallback_ip
     fallback_ip="${NODE_DOMAIN:-$(detect_public_ip || true)}"
-    if [[ -n "$fallback_ip" ]]; then
-      prompt_value NODE_DOMAIN "节点连接地址 (域名或公网 IP)" "$fallback_ip"
-    else
-      prompt_value NODE_DOMAIN "节点连接地址 (域名或公网 IP，请勿填写 127.0.0.1)" ""
-    fi
-    [[ -n "$NODE_DOMAIN" ]] || die "节点连接地址不能为空。"
-    if [[ "$NODE_DOMAIN" == "127.0.0.1" || "$NODE_DOMAIN" == "localhost" ]]; then
-      warn "注意：127.0.0.1 是本机回环地址，外部客户端将无法连接！建议输入服务器公网 IP。"
-    fi
-    validate_host "$NODE_DOMAIN" || die "节点连接地址无效。"
+    while true; do
+      if [[ -n "$fallback_ip" ]]; then
+        prompt_value NODE_DOMAIN "节点连接地址 (域名或公网 IP)" "$fallback_ip"
+      else
+        prompt_value NODE_DOMAIN "节点连接地址 (域名或公网 IP，请勿填写 127.0.0.1)" "$NODE_DOMAIN"
+      fi
+      if [[ -z "$NODE_DOMAIN" ]]; then
+        warn "节点连接地址不能为空。"
+        (( NON_INTERACTIVE )) && return 1
+        continue
+      fi
+      if [[ "$NODE_DOMAIN" == "127.0.0.1" || "$NODE_DOMAIN" == "localhost" ]]; then
+        warn "注意：127.0.0.1 是本机回环地址，外部客户端将无法连接！建议输入服务器公网 IP。"
+      fi
+      if validate_host "$NODE_DOMAIN"; then
+        break
+      fi
+      warn "节点连接地址无效，请输入有效域名或 IP。"
+      (( NON_INTERACTIVE )) && return 1
+    done
   fi
   default_port=$(jq -r '.port // empty' <<<"${old:-"{}"}")
   default_port=${default_port:-${PORT:-}}
@@ -5261,12 +5510,32 @@ delete_node_flow() {
     read -r -p "确认删除节点 [${name}] (端口: ${port})？[y/N]: " answer
   fi
   [[ "$answer" =~ ^[yY]$ ]] || { warn "已取消删除。"; return 0; }
-  local del_proto
+  local del_proto del_domain
   del_proto=$(jq -r ".[$index].protocol // empty" <<<"$nodes")
+  del_domain=$(jq -r ".[$index].domain // empty" <<<"$nodes")
   traffic_remove_port "$port"
   firewall_remove_port "$port" "$(case "$del_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
   save_nodes_json "$(jq -c --argjson index "$index" 'del(.[$index])' <<<"$nodes")"
   ok "节点 [${name}] 已成功删除。"
+
+  if [[ -n "$del_domain" ]] && (( ! NON_INTERACTIVE )); then
+    local active_now
+    active_now=$(get_active_cert_domains)
+    if ! grep -qFx "$del_domain" <<<"$active_now"; then
+      if [[ -f "/etc/letsencrypt/renewal/${del_domain}.conf" || -d "/etc/letsencrypt/live/${del_domain}" || -d "${CERT_DIR}/${del_domain}" ]]; then
+        echo
+        local clean_ans
+        read -r -p "检测到节点域名 [${del_domain}] 的证书已无其他节点使用，是否立即清理该证书及自动续签任务？[y/N]: " clean_ans
+        clean_ans=${clean_ans:-N}
+        if [[ "$clean_ans" =~ ^[yY]$ ]]; then
+          delete_single_certificate "$del_domain"
+          ok "已成功清理域名 [${del_domain}] 的证书及自动续签任务。"
+        else
+          info "已保留证书。后续如需清理，可进入主菜单 [11. 证书管理] 选择 [清理无用证书]。"
+        fi
+      fi
+    fi
+  fi
   pause_prompt
 }
 
@@ -6305,6 +6574,188 @@ traffic_menu() {
   done
 }
 
+clean_unused_certs_flow() {
+  require_root
+  echo
+  info "正在扫描系统中未引用的 SSL 证书……"
+  local -a unused=()
+  local cert
+
+  while IFS= read -r cert; do
+    [[ -n "$cert" ]] && unused+=("$cert")
+  done < <(get_unused_certificates)
+
+  if ((${#unused[@]} == 0)); then
+    ok "未发现无用证书，当前所有证书均在正常使用中。"
+    return 0
+  fi
+
+  echo
+  printf "%s发现以下 %d 个未被任何 sing-box 节点引用的 SSL 证书：%s\n" "$C_YELLOW" "${#unused[@]}" "$C_RESET"
+  local i=0 c
+  for c in "${unused[@]}"; do
+    ((i++))
+    local sources=()
+    [[ -f "/etc/letsencrypt/renewal/${c}.conf" ]] && sources+=("Certbot自动续签配置")
+    [[ -d "/etc/letsencrypt/live/${c}" ]] && sources+=("Let's Encrypt证书库")
+    [[ -d "${CERT_DIR}/${c}" ]] && sources+=("sing-box证书目录")
+    local src_desc=""
+    if ((${#sources[@]} > 0)); then
+      local old_ifs=$IFS
+      IFS=", "
+      src_desc="${sources[*]}"
+      IFS=$old_ifs
+    fi
+    printf "  %2d) %s%s%s (%s)\n" "$i" "$C_CYAN" "$c" "$C_RESET" "${src_desc:-本地残留}"
+  done
+  echo
+  warn "清理后将永久删除证书文件并注销 Certbot 自动续签任务，防止无效续期。"
+
+  if (( NON_INTERACTIVE )); then
+    for c in "${unused[@]}"; do
+      info "正在清理域名 [${c}] 的证书及续签任务……"
+      delete_single_certificate "$c"
+      ok "域名 [${c}] 证书已成功清理。"
+    done
+    ok "所有无用证书已清理完毕！"
+    return 0
+  fi
+
+  echo
+  printf "%s请选择清理方式：%s\n" "$C_CYAN" "$C_RESET"
+  printf "  1) 清理全部无用证书 (推荐)\n"
+  printf "  2) 选择指定证书清理\n"
+  printf "  0) 取消并返回\n"
+  local mode_choice
+  read -r -p "请输入选择 [0-2，默认: 1]: " mode_choice
+  mode_choice=${mode_choice:-1}
+
+  case "$mode_choice" in
+    1)
+      local confirm_all
+      read -r -p "确认清理上述全部 ${#unused[@]} 个无用证书？[y/N]: " confirm_all
+      if [[ "$confirm_all" =~ ^[yY]$ ]]; then
+        for c in "${unused[@]}"; do
+          info "正在清理域名 [${c}] 的证书及续签任务……"
+          delete_single_certificate "$c"
+          ok "域名 [${c}] 证书已成功清理。"
+        done
+        echo
+        ok "所有无用证书已清理完毕！"
+      else
+        info "已取消清理操作。"
+      fi
+      ;;
+    2)
+      local target_idx
+      read -r -p "请输入要清理的证书序号 [1-${#unused[@]}]: " target_idx
+      if [[ "$target_idx" =~ ^[0-9]+$ ]] && (( target_idx >= 1 && target_idx <= ${#unused[@]} )); then
+        local target_cert="${unused[$((target_idx - 1))]}"
+        local confirm_single
+        read -r -p "确认清理证书 [${target_cert}] 及其续签配置？[y/N]: " confirm_single
+        if [[ "$confirm_single" =~ ^[yY]$ ]]; then
+          info "正在清理域名 [${target_cert}] 的证书及续签任务……"
+          delete_single_certificate "$target_cert"
+          ok "域名 [${target_cert}] 证书已成功清理。"
+        else
+          info "已取消清理操作。"
+        fi
+      else
+        warn "输入无效序号。"
+      fi
+      ;;
+    0|"")
+      info "已取消清理操作。"
+      ;;
+    *)
+      warn "无效选择。"
+      ;;
+  esac
+}
+
+list_certs_flow() {
+  echo
+  printf "%s=== 当前系统 SSL 证书状态 ===%s\n" "$C_CYAN" "$C_RESET"
+  local active_domains all_certs_str
+  active_domains=$(get_active_cert_domains)
+  all_certs_str=$(get_all_installed_certs | sort -u)
+
+  if [[ -z "$all_certs_str" ]]; then
+    info "当前系统未检测到任何 SSL 证书。"
+    return 0
+  fi
+
+  local c cert_file expiry renew_status use_status raw_expiry
+  local i=0
+  while IFS= read -r c; do
+    [[ -n "$c" ]] || continue
+    ((i++))
+    if grep -qFx "$c" <<<"$active_domains"; then
+      use_status="${C_GREEN}在用 (活跃节点引用)${C_RESET}"
+    else
+      use_status="${C_YELLOW}未引用 (无用证书，建议清理)${C_RESET}"
+    fi
+
+    cert_file=""
+    if [[ -s "/etc/letsencrypt/live/${c}/fullchain.pem" ]]; then
+      cert_file="/etc/letsencrypt/live/${c}/fullchain.pem"
+    elif [[ -s "${CERT_DIR}/${c}/fullchain.pem" ]]; then
+      cert_file="${CERT_DIR}/${c}/fullchain.pem"
+    fi
+
+    expiry="未知"
+    if [[ -n "$cert_file" ]] && command -v openssl >/dev/null 2>&1; then
+      raw_expiry=$(openssl x509 -enddate -noout -in "$cert_file" 2>/dev/null | cut -d= -f2 || true)
+      if [[ -n "$raw_expiry" ]] && command -v date >/dev/null 2>&1; then
+        expiry=$(date -d "$raw_expiry" "+%Y-%m-%d %H:%M" 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$raw_expiry" "+%Y-%m-%d %H:%M" 2>/dev/null || echo "$raw_expiry")
+      else
+        expiry="${raw_expiry:-未知}"
+      fi
+    fi
+
+    if [[ -f "/etc/letsencrypt/renewal/${c}.conf" ]]; then
+      renew_status="${C_GREEN}自动续签已启用${C_RESET}"
+    else
+      renew_status="${C_GRAY:-}未启用 Certbot 续签${C_RESET}"
+    fi
+
+    printf " [%d] 证书域名: %s%s%s\n" "$i" "$C_CYAN" "$c" "$C_RESET"
+    printf "     使用状态: %b\n" "$use_status"
+    printf "     到期时间: %s\n" "$expiry"
+    printf "     续签配置: %b\n" "$renew_status"
+    printf "%s--------------------------------------------------------%s\n" "$C_CYAN" "$C_RESET"
+  done <<<"$all_certs_str"
+  echo
+}
+
+cert_menu() {
+  local choice unused_count=0
+  while true; do
+    unused_count=$(get_unused_certificates | grep -c . || true)
+    echo
+    printf "%s=== SSL 证书管理与维护 ===%s\n" "$C_CYAN" "$C_RESET"
+    if (( unused_count > 0 )); then
+      printf "  状态提示: %s检测到 %d 个无用证书未清理！建议选择 [2] 进行清理。%s\n" "$C_YELLOW" "$unused_count" "$C_RESET"
+    else
+      printf "  状态提示: %s所有证书均在正常使用中。%s\n" "$C_GREEN" "$C_RESET"
+    fi
+    printf "%s------------------------------------%s\n" "$C_CYAN" "$C_RESET"
+    printf "  1) 续签现有证书\n"
+    printf "  2) 清理无用证书\n"
+    printf "  3) 查看证书列表与状态\n"
+    printf "  0) 返回主菜单\n"
+    read -r -p "请输入选择 [0-3，默认: 1]: " choice
+    choice=${choice:-1}
+    case "$choice" in
+      1) cert_flow; pause_prompt ;;
+      2) clean_unused_certs_flow; pause_prompt ;;
+      3) list_certs_flow; pause_prompt ;;
+      0|"") return ;;
+      *) warn "无效选择。"; sleep 1 ;;
+    esac
+  done
+}
+
 cert_flow() {
   ensure_certbot_environment
   if ! command -v certbot >/dev/null 2>&1; then
@@ -6701,25 +7152,6 @@ remove_managed_repository() {
   rm -f /etc/apt/keyrings/sing-box.asc
 }
 
-disable_certbot_timer_if_unused() {
-  local -a renewal_files=()
-  shopt -s nullglob
-  renewal_files=(/etc/letsencrypt/renewal/*.conf)
-  shopt -u nullglob
-  if ((${#renewal_files[@]} == 0)); then
-    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-      systemctl disable --now certbot.timer >/dev/null 2>&1 || true
-    else
-      local cert_cron_tmp
-      cert_cron_tmp=$(mktemp)
-      (crontab -l 2>/dev/null || true) | awk '$0 !~ /certbot renew/' > "$cert_cron_tmp" || true
-      crontab "$cert_cron_tmp" >/dev/null 2>&1 || true
-      rm -f "$cert_cron_tmp"
-    fi
-    info "无其他证书依赖，已停用证书自动续签任务。"
-  fi
-}
-
 uninstall_flow() {
   preflight
   local domain="" domains="" traffic_cron_tmp
@@ -6740,10 +7172,8 @@ uninstall_flow() {
   rm -f /usr/local/bin/sing-box /usr/bin/sing-box /var/log/sing-box.log /var/log/sbox-api.log >/dev/null 2>&1 || true
   while IFS= read -r domain; do
     [[ -n "$domain" ]] || continue
-    if certbot certificates 2>/dev/null | grep -q "Certificate Name: ${domain}$"; then
-      info "清理证书 ${domain}……"
-      certbot delete --cert-name "$domain" --non-interactive || true
-    fi
+    info "清理证书 ${domain}……"
+    delete_single_certificate "$domain"
   done <<<"$domains"
   nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
   traffic_cron_tmp=$(mktemp)
@@ -6941,7 +7371,7 @@ print_main_menu() {
   printf "%s------------------------------------%s\n" "$C_CYAN" "$C_RESET"
   printf " %2d. 查看状态\n" 9
   printf " %2d. 日志管理\n" 10
-  printf " %2d. 续签证书\n" 11
+  printf " %2d. 证书管理\n" 11
   printf "%s------------------------------------%s\n" "$C_CYAN" "$C_RESET"
   printf " %2d. 更新脚本\n" 12
   printf " %2d. 完全卸载\n" 13
@@ -6971,7 +7401,7 @@ menu() {
       8) restart_service; pause_prompt ;;
       9) status_flow; pause_prompt ;;
       10) logs_menu ;;
-      11) cert_flow; pause_prompt ;;
+      11) cert_menu ;;
       12) update_self_script "menu"; pause_prompt ;;
       13) uninstall_flow ;;
       *) warn "无效选项，请输入 0 到 13 之间的数字。"; sleep 1 ;;
@@ -6988,7 +7418,8 @@ usage() {
   sudo sbox upgrade                 # 升级 sing-box 核心
   sudo sbox nodes                   # 节点管理子菜单
   sudo sbox traffic                 # 流量管理子菜单
-  sudo sbox cert [--dry-run]        # 续签 SSL 证书
+  sudo sbox cert [clean|renew|list] # SSL 证书管理 (子菜单/清理无用证书/续签/查看状态)
+  sudo sbox clean-certs             # 快速清理未引用的无用证书与续签任务
   sudo sbox status                  # 查看运行状态与流量
   sudo sbox logs                    # 查看运行日志与管理
   sudo sbox start                   # 启动服务
@@ -7081,7 +7512,28 @@ main() {
     nodes) parse_options "$@"; nodes_menu ;;
     list) print_node_list ;;
     traffic) parse_options "$@"; traffic_menu ;;
-    cert) parse_options "$@"; cert_flow ;;
+    cert)
+      local sub_cmd=""
+      if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+        sub_cmd="$1"
+        shift
+      fi
+      case "$sub_cmd" in
+        clean) parse_options "$@"; clean_unused_certs_flow ;;
+        renew) parse_options "$@"; cert_flow ;;
+        list) parse_options "$@"; list_certs_flow ;;
+        "")
+          if (( $# > 0 )); then
+            parse_options "$@"
+            cert_flow
+          else
+            cert_menu
+          fi
+          ;;
+        *) die "未知证书子命令：$sub_cmd (支持 clean / renew / list)" ;;
+      esac
+      ;;
+    clean-certs) parse_options "$@"; clean_unused_certs_flow ;;
     show) parse_options "$@"; show_client ;;
     status) parse_options "$@"; status_flow ;;
     logs) parse_options "$@"; logs_flow ;;

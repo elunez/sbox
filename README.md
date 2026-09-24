@@ -8,7 +8,7 @@
 - **全能出站路由**：每个节点可独立指定出口方式，支持 Direct、AnyTLS、Shadowsocks、Trojan、Hysteria2、VLESS + REALITY、SOCKS5 / SOCKS5H、HTTP / HTTPS。
 - **主备出口健康切换与闭环管理**：支持每个节点独立配置主出口与多级备用出口，提供完整的路线查看、添加、删除指定项与一键清空管理；配置了备用出口的节点每 5 秒检测 `http://www.gstatic.com/generate_204`，当前出口连续两次失败后按优先级切到可用备用出口，恢复后优先切回主出口。只有显式添加 Direct 备用出口时才允许回退 Direct；未添加 Direct 时，代理出口全部不可用也会保持当前出口。清空备用出口后自动撤销选择器并停止监控服务。
 - **旧版配置自动迁移**：升级管理脚本后，首次运行面板、`status`、`start` 或 `restart` 会自动识别并补齐主备出口健康检测路由；没有备用出口的旧配置保持原有单出口行为。
-- **动态域名与证书联动**：新增或修改节点时支持绑定不同域名。对于需要证书的协议（AnyTLS、Trojan、Hy2），系统会自动检测证书，未申请时可一键通过 Let's Encrypt（首选 DNSPod Token DNS-01 API、次选 Cloudflare DNS-01 API、Web 目录 Webroot 或独立 80 端口 Standalone）免开放端口签发证书；Shadowsocks 与 VLESS REALITY 无需证书，开箱即用。
+- **动态域名与证书联动与生命周期管理**：新增或修改节点时支持绑定不同域名。对于需要证书的协议（AnyTLS、Trojan、Hy2），系统会自动检测证书，未申请时可一键通过 Let's Encrypt（首选 DNSPod Token DNS-01 API、次选 Cloudflare DNS-01 API、Web 目录 Webroot 或独立 80 端口 Standalone）免开放端口签发证书；提供独立的证书管理菜单，支持一键扫描并清理废弃节点的无用证书与 Certbot 自动续签任务，避免无效续期与报错；Shadowsocks 与 VLESS REALITY 无需证书，开箱即用。
 - **精准流量监控与配额管理**：
   - 基于内核级 **nftables** 进行端口流量双向/单向高精统计；
   - 支持设置月度流量限额（如 100GB、1TB、unlimited），超额后自动阻断端口；
@@ -24,7 +24,7 @@
 ## 控制面板布局
 
 ```text
-  Sbox · Sing-box 节点管理 v0.0.21
+  Sbox · Sing-box 节点管理 v0.0.22
 ------------------------------------
   0. 退出脚本
 ------------------------------------
@@ -41,7 +41,7 @@
 ------------------------------------
   9. 查看状态
  10. 日志管理
- 11. 续签证书
+ 11. 证书管理
 ------------------------------------
  12. 更新脚本
  13. 完全卸载
@@ -196,14 +196,18 @@ sudo sbox --api-json [PORT]      # 命令行直接输出流量 JSON 数据
 
 ```bash
 # 核心操作
-sudo sbox install          # 首次安装引导
-sudo sbox upgrade          # 更新 sing-box 核心
-sudo sbox update           # 检查并更新 sbox 管理脚本 (支持 --force 强制覆盖)
-sudo sbox status           # 查看服务状态与各节点流量
-sudo sbox logs             # 查看 sing-box 运行日志
-sudo sbox show             # 查看客户端连接信息与分享链接
-sudo sbox cert [--dry-run] # 续签证书或模拟演练
-sudo sbox uninstall        # 完全卸载服务
+sudo sbox install                 # 首次安装引导
+sudo sbox upgrade                 # 更新 sing-box 核心
+sudo sbox update                  # 检查并更新 sbox 管理脚本 (支持 --force 强制覆盖)
+sudo sbox status                  # 查看服务状态与各节点流量
+sudo sbox logs                    # 查看 sing-box 运行日志
+sudo sbox show                    # 查看客户端连接信息与分享链接
+sudo sbox cert                    # 进入证书管理子菜单
+sudo sbox cert clean              # 扫描并清理未引用的无用证书及续签任务
+sudo sbox cert renew [--dry-run]  # 续签现有证书或模拟演练
+sudo sbox cert list               # 查看系统 SSL 证书状态
+sudo sbox clean-certs             # 快速清理无用证书与失效续签任务
+sudo sbox uninstall               # 完全卸载服务
 
 # 服务控制
 sudo sbox start            # 启动服务
