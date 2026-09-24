@@ -3486,7 +3486,7 @@ collect_node_json() {
   if [[ -z "$default_node_name" ]]; then
     default_node_name=$(generate_default_node_name)
   fi
-  NODE_NAME="${NODE_NAME:-$default_node_name}"
+  NODE_NAME="$default_node_name"
   prompt_value NODE_NAME "节点名称" "$NODE_NAME"
   NODE_DOMAIN="${NODE_DOMAIN:-$default_domain}"
   NODE_DOMAIN=${NODE_DOMAIN:-${DOMAIN:-$(json_get "$STATE_FILE" '.domain')}}
@@ -4508,6 +4508,7 @@ add_node_flow() {
   SKIP_PROTOCOL_PROMPT=0
   PORT=""
   OUTBOUND=""
+  NODE_NAME=""
   NODE_DOMAIN=""
   NODE_PORT=""
   NODE_PASSWORD=""
