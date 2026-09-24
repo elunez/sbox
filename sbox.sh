@@ -4391,10 +4391,17 @@ print(c_cyan + bot_bar + c_reset)
   else
     render_node_table_fallback "$table_data"
   fi
+}
+
+print_node_routes() {
+  local nodes=${1:-$(current_nodes_json)}
+  local node_cnt
+  node_cnt=$(node_count "$nodes")
+  (( node_cnt == 0 )) && return 0
 
   echo
   printf "出口路线:\n"
-  index=1
+  local index=1 node
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     printf "  %d) %s\n" "$index" "$(format_node_outbound_route "$node")"
@@ -5900,6 +5907,7 @@ nodes_menu() {
   while true; do
     nodes=$(current_nodes_json)
     print_node_list "$nodes"
+    print_node_routes "$nodes"
     echo
     printf "%s=== 节点管理菜单 ===%s\n" "$C_CYAN" "$C_RESET"
     printf "  1) 新增节点\n"
@@ -6594,17 +6602,20 @@ clean_unused_certs_flow() {
   printf "%s发现以下 %d 个未被任何 sing-box 节点引用的 SSL 证书：%s\n" "$C_YELLOW" "${#unused[@]}" "$C_RESET"
   local i=0 c
   for c in "${unused[@]}"; do
-    ((i++))
+    i=$((i + 1))
     local sources=()
-    [[ -f "/etc/letsencrypt/renewal/${c}.conf" ]] && sources+=("Certbot自动续签配置")
-    [[ -d "/etc/letsencrypt/live/${c}" ]] && sources+=("Let's Encrypt证书库")
-    [[ -d "${CERT_DIR}/${c}" ]] && sources+=("sing-box证书目录")
+    if [[ -f "/etc/letsencrypt/renewal/${c}.conf" ]]; then
+      sources+=("Certbot自动续签配置")
+    fi
+    if [[ -d "/etc/letsencrypt/live/${c}" ]]; then
+      sources+=("Let's Encrypt证书库")
+    fi
+    if [[ -d "${CERT_DIR}/${c}" ]]; then
+      sources+=("sing-box证书目录")
+    fi
     local src_desc=""
     if ((${#sources[@]} > 0)); then
-      local old_ifs=$IFS
-      IFS=", "
-      src_desc="${sources[*]}"
-      IFS=$old_ifs
+      src_desc=$(IFS=", "; echo "${sources[*]}")
     fi
     printf "  %2d) %s%s%s (%s)\n" "$i" "$C_CYAN" "$c" "$C_RESET" "${src_desc:-本地残留}"
   done
@@ -6689,7 +6700,7 @@ list_certs_flow() {
   local i=0
   while IFS= read -r c; do
     [[ -n "$c" ]] || continue
-    ((i++))
+    i=$((i + 1))
     if grep -qFx "$c" <<<"$active_domains"; then
       use_status="${C_GREEN}在用 (活跃节点引用)${C_RESET}"
     else
