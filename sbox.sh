@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.22"
+readonly SCRIPT_VERSION="0.0.23"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -3410,6 +3410,30 @@ collect_outbound_settings() {
   fi
 }
 
+normalize_outbounds_array() {
+  local arr=${1:-'[]'}
+  jq -c '
+    [.[] | select((.type // "direct") != "direct")] as $proxies |
+    if any(.[]; (.type // "direct") == "direct") then
+      if ($proxies | length > 0) then ($proxies + [{type:"direct"}]) else [{type:"direct"}] end
+    else
+      if ($proxies | length > 0) then $proxies else [{type:"direct"}] end
+    end
+  ' <<<"$arr"
+}
+
+save_node_outbounds_array() {
+  local index=$1 arr=$2
+  arr=$(normalize_outbounds_array "$arr")
+  local outbound backup_outbounds nodes
+  outbound=$(jq -c '.[0]' <<<"$arr")
+  backup_outbounds=$(jq -c '.[1:] // []' <<<"$arr")
+  nodes=$(current_nodes_json)
+  nodes=$(jq -c --argjson index "$index" --argjson ob "$outbound" --argjson backups "$backup_outbounds" \
+    '.[$index].outbound = $ob | .[$index].backup_outbounds = $backups' <<<"$nodes")
+  save_nodes_json "$nodes"
+}
+
 normalize_backup_outbounds() {
   local backups=${1:-'[]'}
   jq -c '
@@ -4393,6 +4417,35 @@ print(c_cyan + bot_bar + c_reset)
   fi
 }
 
+format_node_outbound_route() {
+  local node=$1 outbound_list route=""
+  format_route_item() {
+    local item=$1 item_type item_server item_port
+    item_type=$(jq -r '.type // "direct"' <<<"$item")
+    [[ "$item_type" == "direct" ]] && { printf "Direct"; return; }
+    item_server=$(jq -r '.server // empty' <<<"$item")
+    item_port=$(jq -r '.port // empty' <<<"$item")
+    if [[ -n "$item_server" && -n "$item_port" ]]; then
+      printf "%s (%s:%s)" "$(protocol_label "$item_type")" "$item_server" "$item_port"
+    else
+      protocol_label "$item_type"
+    fi
+  }
+
+  outbound_list=$(jq -c '[(.outbound // {type:"direct"})] + (.backup_outbounds // [])' <<<"$node")
+  outbound_list=$(normalize_outbounds_array "$outbound_list")
+  local item
+  while IFS= read -r item; do
+    [[ -n "$item" ]] || continue
+    if [[ -z "$route" ]]; then
+      route="$(format_route_item "$item")"
+    else
+      route+=" → $(format_route_item "$item")"
+    fi
+  done < <(jq -c '.[]?' <<<"$outbound_list")
+  printf "%s" "${route:-Direct}"
+}
+
 print_node_routes() {
   local nodes=${1:-$(current_nodes_json)}
   local node_cnt
@@ -4401,10 +4454,15 @@ print_node_routes() {
 
   echo
   printf "出口路线:\n"
-  local index=1 node
+  local index=1 node name
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
-    printf "  %d) %s\n" "$index" "$(format_node_outbound_route "$node")"
+    name=$(jq -r '.name // empty' <<<"$node")
+    if [[ -n "$name" ]]; then
+      printf "  %d) %s: %s\n" "$index" "$name" "$(format_node_outbound_route "$node")"
+    else
+      printf "  %d) %s\n" "$index" "$(format_node_outbound_route "$node")"
+    fi
     index=$((index + 1))
   done < <(jq -c '.[]?' <<<"$nodes")
 }
@@ -4575,41 +4633,6 @@ format_node_outbound_summary() {
     *) summary="${o_type}" ;;
   esac
   echo "${summary}${backup_desc}"
-}
-
-format_node_outbound_route() {
-  local node=$1 outbound backups route backup_index=1 outbound_type
-  format_route_item() {
-    local item=$1 item_type item_server item_port
-    item_type=$(jq -r '.type // "direct"' <<<"$item")
-    [[ "$item_type" == "direct" ]] && { printf "Direct"; return; }
-    item_server=$(jq -r '.server // empty' <<<"$item")
-    item_port=$(jq -r '.port // empty' <<<"$item")
-    if [[ -n "$item_server" && -n "$item_port" ]]; then
-      printf "%s (%s:%s)" "$(protocol_label "$item_type")" "$item_server" "$item_port"
-    else
-      protocol_label "$item_type"
-    fi
-  }
-  outbound=$(jq -c '.outbound // {type:"direct"}' <<<"$node")
-  outbound_type=$(jq -r '.type // "direct"' <<<"$outbound")
-  if [[ "$outbound_type" == "direct" ]]; then
-    route="Direct"
-  else
-    route="主 $(format_route_item "$outbound")"
-  fi
-  backups=$(normalize_backup_outbounds "$(jq -c '.backup_outbounds // []' <<<"$node")")
-  while IFS= read -r outbound; do
-    [[ -n "$outbound" ]] || continue
-    outbound_type=$(jq -r '.type // "direct"' <<<"$outbound")
-    if [[ "$outbound_type" == "direct" ]]; then
-      route+=" → Direct"
-    else
-      route+=" → 备${backup_index} $(format_route_item "$outbound")"
-    fi
-    backup_index=$((backup_index + 1))
-  done < <(jq -c '.[]?' <<<"$backups")
-  printf "%s" "$route"
 }
 
 format_node_credential_summary() {
@@ -4924,26 +4947,7 @@ edit_node_protocol() {
 }
 
 edit_node_outbound() {
-  local index=$1
-  local nodes old name outbound backup_outbounds
-  nodes=$(current_nodes_json)
-  old=$(jq -c ".[$index]" <<<"$nodes")
-  name=$(jq -r '.name' <<<"$old")
-  echo
-  info "修改节点 [${name}] 的出口分流……"
-  OUTBOUND=""
-  if ! collect_outbound_settings "$old" outbound; then
-    warn "已取消修改出口分流。"
-    return 0
-  fi
-  if [[ "$(jq -r '.type // "direct"' <<<"$outbound")" != "direct" ]]; then
-    collect_backup_outbounds "$old" backup_outbounds
-  else
-    backup_outbounds='[]'
-  fi
-  nodes=$(current_nodes_json)
-  save_nodes_json "$(jq -c --argjson index "$index" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" '.[$index].outbound = $outbound | .[$index].backup_outbounds = $backup_outbounds' <<<"$nodes")"
-  ok "节点 [${name}] 出口分流已成功更新！"
+  manage_single_node_outbounds "$1"
 }
 
 edit_node_port() {
@@ -5547,150 +5551,255 @@ delete_node_flow() {
   pause_prompt
 }
 
-outbound_flow() {
-  local nodes index old outbound backup_outbounds new_nodes name
-  nodes=$(current_nodes_json)
-  if (( $(node_count "$nodes") == 0 )); then
-    warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
-    return 0
-  fi
-  print_node_list "$nodes"
-  index=$(select_node_index "$nodes" "请选择要单独修改出口的节点") || return 0
-  old=$(jq -c ".[$index]" <<<"$nodes")
-  name=$(jq -r '.name' <<<"$old")
-  echo
-  info "修改节点 [${name}] 的出口分流路由……"
-  if ! collect_outbound_settings "$old" outbound; then
-    warn "已放弃修改出口，返回上级菜单。"
-    return 0
-  fi
-  if [[ "$(jq -r '.type // "direct"' <<<"$outbound")" != "direct" ]]; then
-    collect_backup_outbounds "$old" backup_outbounds
-  else
-    backup_outbounds='[]'
-  fi
-  new_nodes=$(jq -c --argjson index "$index" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" '.[ $index ].outbound = $outbound | .[ $index ].backup_outbounds = $backup_outbounds' <<<"$nodes")
-  save_nodes_json "$new_nodes"
-  ok "节点 [${name}] 的出口配置已更新！"
-  show_client
-  pause_prompt
+manage_single_node_outbounds() {
+  local index=$1
+  local choice nodes old name all_outbounds count
+  while true; do
+    nodes=$(current_nodes_json)
+    old=$(jq -c ".[$index]" <<<"$nodes")
+    [[ -n "$old" && "$old" != "null" ]] || { warn "目标节点不存在。"; return 0; }
+    name=$(jq -r '.name' <<<"$old")
+
+    all_outbounds=$(jq -c '[(.outbound // {type:"direct"})] + (.backup_outbounds // [])' <<<"$old")
+    all_outbounds=$(normalize_outbounds_array "$all_outbounds")
+    count=$(jq 'length' <<<"$all_outbounds")
+
+    echo
+    printf "%s=== 节点 [%s] 网络出口管理 ===%s\n" "$C_CYAN" "$name" "$C_RESET"
+    printf "出口路线: %s\n" "$(format_node_outbound_route "$old")"
+    echo
+    printf "出口优先级列表:\n"
+    local o_idx=1 o_item o_desc o_type
+    while IFS= read -r o_item; do
+      [[ -n "$o_item" ]] || continue
+      o_type=$(jq -r '.type // "direct"' <<<"$o_item")
+      if [[ "$o_type" == "direct" ]]; then
+        if (( o_idx == 1 && count == 1 )); then
+          printf "  %d) Direct (直连出站)  %s[首选]%s\n" "$o_idx" "$C_GREEN" "$C_RESET"
+        else
+          printf "  %d) Direct (直连出站)  %s[保底·固定末尾]%s\n" "$o_idx" "$C_YELLOW" "$C_RESET"
+        fi
+      else
+        local o_srv o_port
+        o_srv=$(jq -r '.server // empty' <<<"$o_item")
+        o_port=$(jq -r '.port // empty' <<<"$o_item")
+        o_desc="$(protocol_label "$o_type")"
+        [[ -n "$o_srv" && -n "$o_port" ]] && o_desc+=" (${o_srv}:${o_port})"
+        if (( o_idx == 1 )); then
+          printf "  %d) %s  %s[首选]%s\n" "$o_idx" "$o_desc" "$C_GREEN" "$C_RESET"
+        else
+          printf "  %d) %s\n" "$o_idx" "$o_desc"
+        fi
+      fi
+      o_idx=$((o_idx + 1))
+    done < <(jq -c '.[]?' <<<"$all_outbounds")
+
+    echo
+    printf "%s------------------------------------------------%s\n" "$C_CYAN" "$C_RESET"
+    printf "  1) 添加出口\n"
+    printf "  2) 修改指定出口\n"
+    printf "  3) 删除指定出口\n"
+    printf "  4) 调整出口顺序\n"
+    printf "  5) 清空后置出口 (仅保留第 1 出口)\n"
+    printf "  0) 返回上级菜单\n"
+    printf "%s------------------------------------------------%s\n" "$C_CYAN" "$C_RESET"
+    read -r -p "请输入选择 [0-5，默认: 0]: " choice
+    choice=${choice:-0}
+    case "$choice" in
+      1)
+        local new_outbound
+        echo
+        info "为节点 [${name}] 添加网络出口……"
+        OUTBOUND=""
+        if ! collect_outbound_settings "$old" new_outbound backup; then
+          warn "已取消添加出口。"
+          continue
+        fi
+        local new_type
+        new_type=$(jq -r '.type // "direct"' <<<"$new_outbound")
+        if [[ "$new_type" == "direct" ]]; then
+          if jq -e 'any(.[]; (.type // "direct") == "direct")' <<<"$all_outbounds" >/dev/null 2>&1; then
+            warn "当前已存在 Direct 出口，无需重复添加。"
+            continue
+          fi
+          all_outbounds=$(jq -c --argjson item "$new_outbound" '. + [$item]' <<<"$all_outbounds")
+        else
+          all_outbounds=$(jq -c --argjson item "$new_outbound" '. + [$item]' <<<"$all_outbounds")
+        fi
+        all_outbounds=$(normalize_outbounds_array "$all_outbounds")
+        save_node_outbounds_array "$index" "$all_outbounds"
+        ok "节点 [${name}] 网络出口已成功添加！"
+        ;;
+      2)
+        local edit_sel
+        read -r -p "请输入要修改的出口序号 [1-${count}，0 取消]: " edit_sel
+        [[ -n "$edit_sel" && "$edit_sel" =~ ^[0-9]+$ ]] || { warn "已取消修改。"; continue; }
+        local edit_idx=$((10#$edit_sel))
+        if (( edit_idx < 1 || edit_idx > count )); then
+          warn "输入序号无效。"
+          continue
+        fi
+        local curr_target_idx=$((edit_idx - 1))
+        local curr_item
+        curr_item=$(jq -c ".[$curr_target_idx]" <<<"$all_outbounds")
+
+        local modified_outbound
+        echo
+        info "正在重新配置出口 ${edit_idx}……"
+        OUTBOUND=""
+        local mock_old
+        mock_old=$(jq -c --argjson ob "$curr_item" '{outbound: $ob}' <<<"{}")
+        if ! collect_outbound_settings "$mock_old" modified_outbound backup; then
+          warn "已取消修改出口。"
+          continue
+        fi
+
+        local mod_type
+        mod_type=$(jq -r '.type // "direct"' <<<"$modified_outbound")
+        if [[ "$mod_type" == "direct" ]]; then
+          local has_other_direct
+          has_other_direct=$(jq -c --argjson idx "$curr_target_idx" '
+            to_entries | any(.key != $idx and (.value.type // "direct") == "direct")
+          ' <<<"$all_outbounds")
+          if [[ "$has_other_direct" == "true" ]]; then
+            warn "出口列表中已存在 Direct 出口，已自动合并去重。"
+            all_outbounds=$(jq -c --argjson idx "$curr_target_idx" 'del(.[$idx])' <<<"$all_outbounds")
+          else
+            all_outbounds=$(jq -c --argjson idx "$curr_target_idx" --argjson item "$modified_outbound" '.[$idx] = $item' <<<"$all_outbounds")
+          fi
+        else
+          all_outbounds=$(jq -c --argjson idx "$curr_target_idx" --argjson item "$modified_outbound" '.[$idx] = $item' <<<"$all_outbounds")
+        fi
+        all_outbounds=$(normalize_outbounds_array "$all_outbounds")
+        save_node_outbounds_array "$index" "$all_outbounds"
+        ok "节点 [${name}] 出口 ${edit_idx} 已成功修改！"
+        ;;
+      3)
+        if (( count <= 1 )); then
+          warn "节点必须至少保留一个出口，无法删除。如需更换请选择 [2) 修改指定出口]。"
+          continue
+        fi
+        local del_sel
+        read -r -p "请输入要删除的出口序号 [1-${count}，0 取消]: " del_sel
+        [[ -n "$del_sel" && "$del_sel" =~ ^[0-9]+$ ]] || { warn "已取消删除。"; continue; }
+        local del_idx=$((10#$del_sel))
+        if (( del_idx < 1 || del_idx > count )); then
+          warn "输入序号无效。"
+          continue
+        fi
+
+        local confirm_del=""
+        if (( del_idx == 1 )); then
+          read -r -p "删除第 1 项后，后续出口将自动提升为首选出口。确认删除？[y/N]: " confirm_del
+        else
+          read -r -p "确认删除出口 ${del_idx}？[y/N]: " confirm_del
+        fi
+        [[ "$confirm_del" =~ ^[Yy]$ ]] || { warn "已取消删除。"; continue; }
+
+        all_outbounds=$(jq -c --argjson d "$((del_idx - 1))" 'del(.[$d])' <<<"$all_outbounds")
+        all_outbounds=$(normalize_outbounds_array "$all_outbounds")
+        save_node_outbounds_array "$index" "$all_outbounds"
+        ok "节点 [${name}] 出口 ${del_idx} 已成功删除！"
+        ;;
+      4)
+        local proxy_count has_direct
+        proxy_count=$(jq '[.[] | select((.type // "direct") != "direct")] | length' <<<"$all_outbounds")
+        has_direct=$(jq 'any(.[]; (.type // "direct") == "direct")' <<<"$all_outbounds")
+
+        if (( proxy_count <= 1 )); then
+          if [[ "$has_direct" == "true" ]]; then
+            warn "当前仅有 1 项代理出口，且 Direct 固定在末尾，无需调整顺序。"
+          else
+            warn "当前仅有 1 个出口，无需调整顺序。"
+          fi
+          continue
+        fi
+
+        echo
+        printf "当前可调整顺序的代理出口范围为 [1-%d]（Direct 始终固定在末尾）：\n" "$proxy_count"
+        local from_sel to_sel
+        read -r -p "请输入要移动的出口序号 [1-${proxy_count}，0 取消]: " from_sel
+        [[ -n "$from_sel" && "$from_sel" =~ ^[0-9]+$ ]] || { warn "已取消调整。"; continue; }
+        local from_idx=$((10#$from_sel))
+        if (( from_idx == 0 )); then
+          continue
+        elif (( from_idx > proxy_count )); then
+          warn "Direct 出口固定在最后，不支持调整顺序。"
+          continue
+        elif (( from_idx < 1 )); then
+          warn "输入序号无效。"
+          continue
+        fi
+
+        read -r -p "请输入要移动到的目标位置 [1-${proxy_count}]: " to_sel
+        [[ -n "$to_sel" && "$to_sel" =~ ^[0-9]+$ ]] || { warn "已取消调整。"; continue; }
+        local to_idx=$((10#$to_sel))
+        if (( to_idx < 1 || to_idx > proxy_count )); then
+          warn "目标位置无效，只能在 1 到 ${proxy_count} 之间。"
+          continue
+        fi
+
+        if (( from_idx == to_idx )); then
+          info "移动位置未发生改变。"
+          continue
+        fi
+
+        local f_idx=$((from_idx - 1)) t_idx=$((to_idx - 1))
+        all_outbounds=$(jq -c --argjson f "$f_idx" --argjson t "$t_idx" '
+          .[$f] as $item |
+          del(.[$f]) |
+          if $t == 0 then ([$item] + .)
+          elif $t >= length then (. + [$item])
+          else (.[0:$t] + [$item] + .[$t:]) end
+        ' <<<"$all_outbounds")
+        all_outbounds=$(normalize_outbounds_array "$all_outbounds")
+        save_node_outbounds_array "$index" "$all_outbounds"
+        ok "节点 [${name}] 出口已成功调整至第 ${to_idx} 位！"
+        ;;
+      5)
+        if (( count <= 1 )); then
+          warn "当前仅有 1 个出口，无需清空后置出口。"
+          continue
+        fi
+        local confirm_clear=""
+        read -r -p "确认清空第 1 出口之后的所有后置备选出口（仅保留首选出口）？[y/N]: " confirm_clear
+        [[ "$confirm_clear" =~ ^[Yy]$ ]] || { warn "已取消操作。"; continue; }
+        all_outbounds=$(jq -c '.[0:1]' <<<"$all_outbounds")
+        save_node_outbounds_array "$index" "$all_outbounds"
+        ok "节点 [${name}] 后置出口已全部清空，当前仅保留首选出口。"
+        ;;
+      0|"") return 0 ;;
+      *)
+        warn "无效选择。"
+        sleep 1
+        ;;
+    esac
+  done
 }
 
-backup_outbound_flow() {
-  local nodes index old name backups backup_count choice
-  nodes=$(current_nodes_json)
-  if (( $(node_count "$nodes") == 0 )); then
-    warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
-    return 0
-  fi
-  print_node_list "$nodes"
-  index=$(select_node_index "$nodes" "请选择要管理备用出口的节点") || return 0
-  old=$(jq -c ".[$index]" <<<"$nodes")
-  name=$(jq -r '.name' <<<"$old")
-  if [[ "$(jq -r '.outbound.type // "direct"' <<<"$old")" == "direct" ]]; then
-    warn "节点 [${name}] 的主出口是 Direct，配置备用出口后不会启用主备健康切换。"
-  fi
-
-  backups=$(normalize_backup_outbounds "$(jq -c '.backup_outbounds // []' <<<"$old")")
-  backup_count=$(jq 'length' <<<"$backups")
-
-  echo
-  printf "%s=== 节点 [%s] 备用出口管理 ===%s\n" "$C_CYAN" "$name" "$C_RESET"
-  printf "当前出口路线: %s\n" "$(format_node_outbound_route "$old")"
-
-  if (( backup_count == 0 )); then
-    local add_confirm=""
-    read -r -p "该节点暂未配置备用出口，是否立即添加？[Y/n，默认: Y]: " add_confirm
-    add_confirm=${add_confirm:-Y}
-    if [[ ! "$add_confirm" =~ ^[Yy]$ ]]; then
-      warn "已取消添加备用出口。"
+manage_outbound_menu() {
+  local nodes count index
+  while true; do
+    nodes=$(current_nodes_json)
+    count=$(node_count "$nodes")
+    if (( count == 0 )); then
+      warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
+      pause_prompt
       return 0
     fi
-    choice=1
-  else
-    printf "  1) 添加备用出口\n"
-    printf "  2) 删除指定备用出口\n"
-    printf "  3) 清空全部备用出口\n"
-    printf "  0) 返回上级菜单\n"
-    read -r -p "请输入选择 [0-3，默认: 0]: " choice
-    choice=${choice:-0}
-  fi
 
-  case "$choice" in
-    1)
-      local backup_json
-      echo
-      info "为节点 [${name}] 添加备用出口……"
-      OUTBOUND=""
-      if ! collect_outbound_settings "$old" backup_json backup; then
-        warn "已取消添加备用出口。"
-        return 0
-      fi
-      local new_type
-      new_type=$(jq -r '.type // "direct"' <<<"$backup_json")
-      if [[ "$new_type" == "direct" ]] && jq -e 'any(.[]; (.type // "direct") == "direct")' <<<"$backups" >/dev/null 2>&1; then
-        warn "节点 [${name}] 已配置 Direct 回退，无需重复添加。"
-        return 0
-      fi
-      backups=$(jq -c --argjson item "$backup_json" '. + [$item]' <<<"$backups")
-      backups=$(normalize_backup_outbounds "$backups")
-      nodes=$(current_nodes_json)
-      save_nodes_json "$(jq -c --argjson index "$index" --argjson backups "$backups" '.[ $index ].backup_outbounds = $backups' <<<"$nodes")"
-      ok "节点 [${name}] 备用出口已更新（当前共 $(jq 'length' <<<"$backups") 项）。"
-      show_client
-      pause_prompt
-      ;;
-    2)
-      echo
-      printf "当前备用出口列表:\n"
-      local b_idx=1 b_item b_type b_server b_port
-      while IFS= read -r b_item; do
-        [[ -n "$b_item" ]] || continue
-        b_type=$(jq -r '.type // "direct"' <<<"$b_item")
-        if [[ "$b_type" == "direct" ]]; then
-          printf "  %d) 故障回退 Direct\n" "$b_idx"
-        else
-          b_server=$(jq -r '.server // empty' <<<"$b_item")
-          b_port=$(jq -r '.port // empty' <<<"$b_item")
-          printf "  %d) %s (%s:%s)\n" "$b_idx" "$(protocol_label "$b_type")" "$b_server" "$b_port"
-        fi
-        b_idx=$((b_idx + 1))
-      done < <(jq -c '.[]?' <<<"$backups")
-      local del_sel
-      read -r -p "请输入要删除的备用出口序号 [1-${backup_count}，0 取消]: " del_sel
-      [[ -n "$del_sel" && "$del_sel" =~ ^[0-9]+$ ]] || { warn "已取消删除。"; return 0; }
-      local del_num=$((10#$del_sel))
-      if (( del_num < 1 || del_num > backup_count )); then
-        warn "已取消删除。"
-        return 0
-      fi
-      backups=$(jq -c --argjson del_idx "$((del_num - 1))" 'del(.[$del_idx])' <<<"$backups")
-      backups=$(normalize_backup_outbounds "$backups")
-      nodes=$(current_nodes_json)
-      save_nodes_json "$(jq -c --argjson index "$index" --argjson backups "$backups" '.[ $index ].backup_outbounds = $backups' <<<"$nodes")"
-      ok "节点 [${name}] 指定备用出口已删除。"
-      show_client
-      pause_prompt
-      ;;
-    3)
-      local clear_confirm=""
-      read -r -p "确认清空节点 [${name}] 的全部备用出口？[y/N]: " clear_confirm
-      if [[ "$clear_confirm" =~ ^[yY]$ ]]; then
-        nodes=$(current_nodes_json)
-        save_nodes_json "$(jq -c --argjson index "$index" '.[ $index ].backup_outbounds = []' <<<"$nodes")"
-        ok "节点 [${name}] 的全部备用出口已清空，健康检测与自动回退已关闭。"
-        show_client
-        pause_prompt
-      else
-        warn "已取消清空。"
-      fi
-      ;;
-    0|"") return 0 ;;
-    *)
-      warn "无效选择。"
-      ;;
-  esac
+    echo
+    printf "%s======================================= 节点网络出口总览 =======================================%s\n" "$C_CYAN" "$C_RESET"
+    print_node_routes "$nodes"
+    printf "%s================================================================================================%s\n" "$C_CYAN" "$C_RESET"
+
+    index=$(select_node_index "$nodes" "请选择要管理出口的节点") || return 0
+    manage_single_node_outbounds "$index"
+  done
 }
+
+outbound_flow() { manage_outbound_menu; }
+backup_outbound_flow() { manage_outbound_menu; }
 
 generate_client_outbound_json() {
   local node=$1
@@ -5908,18 +6017,16 @@ nodes_menu() {
   while true; do
     nodes=$(current_nodes_json)
     print_node_list "$nodes"
-    print_node_routes "$nodes"
     echo
     printf "%s=== 节点管理菜单 ===%s\n" "$C_CYAN" "$C_RESET"
     printf "  1) 新增节点\n"
     printf "  2) 修改配置\n"
-    printf "  3) 调整出口\n"
-    printf "  4) 备用出口\n"
-    printf "  5) 调整流量\n"
-    printf "  6) 删除节点\n"
-    printf "  7) 分享链接\n"
+    printf "  3) 网络出口\n"
+    printf "  4) 调整流量\n"
+    printf "  5) 删除节点\n"
+    printf "  6) 分享链接\n"
     printf "  0) 返回主菜单\n"
-    read -r -p "请输入选择 [0-7，默认: 0]: " choice
+    read -r -p "请输入选择 [0-6，默认: 0]: " choice
     choice=${choice:-0}
     case "$choice" in
       1) add_node_flow ;;
@@ -5936,7 +6043,7 @@ nodes_menu() {
           warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
           pause_prompt
         else
-          outbound_flow
+          manage_outbound_menu
         fi
         ;;
       4)
@@ -5944,7 +6051,7 @@ nodes_menu() {
           warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
           pause_prompt
         else
-          backup_outbound_flow
+          configure_traffic_flow "$nodes"
         fi
         ;;
       5)
@@ -5952,18 +6059,10 @@ nodes_menu() {
           warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
           pause_prompt
         else
-          configure_traffic_flow "$nodes"
-        fi
-        ;;
-      6)
-        if (( $(node_count "$nodes") == 0 )); then
-          warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
-          pause_prompt
-        else
           delete_node_flow
         fi
         ;;
-      7)
+      6)
         if (( $(node_count "$nodes") == 0 )); then
           warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
           pause_prompt
@@ -7429,6 +7528,7 @@ usage() {
   sudo sbox update [--force]        # 检查并更新 sbox 管理脚本 (别名: update-script)
   sudo sbox upgrade                 # 升级 sing-box 核心
   sudo sbox nodes                   # 节点管理子菜单
+  sudo sbox outbound                # 节点网络出口管理 (调整出口及优先级顺序)
   sudo sbox traffic                 # 流量管理子菜单
   sudo sbox cert [clean|renew|list] # SSL 证书管理 (子菜单/清理无用证书/续签/查看状态)
   sudo sbox clean-certs             # 快速清理未引用的无用证书与续签任务
@@ -7522,6 +7622,7 @@ main() {
     install) parse_options "$@"; install_flow ;;
     upgrade) parse_options "$@"; upgrade_sing_box ;;
     nodes) parse_options "$@"; nodes_menu ;;
+    outbound|outbounds) parse_options "$@"; manage_outbound_menu ;;
     list) print_node_list ;;
     traffic) parse_options "$@"; traffic_menu ;;
     cert)
