@@ -6755,8 +6755,8 @@ cert_menu() {
     printf "  2) 清理无用证书\n"
     printf "  3) 查看证书列表与状态\n"
     printf "  0) 返回主菜单\n"
-    read -r -p "请输入选择 [0-3，默认: 1]: " choice
-    choice=${choice:-1}
+    read -r -p "请输入选择 [0-3，默认: 0]: " choice
+    choice=${choice:-0}
     case "$choice" in
       1) cert_flow; pause_prompt ;;
       2) clean_unused_certs_flow; pause_prompt ;;
