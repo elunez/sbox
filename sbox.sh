@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.23"
+readonly SCRIPT_VERSION="0.0.24"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -44,6 +44,8 @@ readonly OUTBOUND_HEALTH_INTERVAL="${OUTBOUND_HEALTH_INTERVAL:-5}"
 readonly OUTBOUND_HEALTH_TIMEOUT_MS="${OUTBOUND_HEALTH_TIMEOUT_MS:-5000}"
 readonly NFT_TABLE="sing_box_traffic"
 readonly CRON_TAG="sing-box-traffic"
+readonly RATE_LIMIT_PREF_BASE=20000
+readonly RATE_LIMIT_ACTION_BASE=300000
 
 readonly API_DIR="${STATE_DIR}/api"
 readonly API_CONFIG_FILE="${STATE_DIR}/api.json"
@@ -849,6 +851,47 @@ normalize_quota() {
 validate_quota() {
   local val=$1
   [[ "$val" == "unlimited" || "$val" == "0" || "$val" =~ ^[0-9]+(\.[0-9]+)?([kKmMgGtT][bB]?|[bB])?$ ]]
+}
+
+normalize_rate_limit() {
+  local val=${1:-}
+  val=$(printf "%s" "$val" | tr -d '[:space:]')
+  [[ -z "$val" || "$val" == "0" ]] && { printf ""; return 0; }
+  if [[ "$val" =~ ^([0-9]+(\.[0-9]+)?)([kKmMgGtT]?)(bps|bit)?$ ]]; then
+    local number="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
+    unit=$(printf "%s" "$unit" | tr '[:upper:]' '[:lower:]')
+    case "$unit" in
+      "" ) printf "%sMbps" "$number" ;;
+      kbps|kbit) printf "%skbps" "$number" ;;
+      mbps|mbit) printf "%sMbps" "$number" ;;
+      gbps|gbit) printf "%sGbps" "$number" ;;
+      tbps|tbit) printf "%sTbps" "$number" ;;
+      bps|bit) printf "%sbps" "$number" ;;
+      *) return 1 ;;
+    esac
+    return 0
+  fi
+  return 1
+}
+
+validate_rate_limit() {
+  local val=${1:-}
+  [[ -z "$val" || "$val" == "0" ]] && return 0
+  normalize_rate_limit "$val" >/dev/null 2>&1
+}
+
+rate_limit_to_tc() {
+  local val=${1:-}
+  val=$(normalize_rate_limit "$val") || return 1
+  [[ -z "$val" ]] && return 1
+  case "$val" in
+    *Tbps) printf "%sgbit" "$(sed 's/Tbps$//' <<<"$val" | awk '{print $1 * 1000}')" ;;
+    *Gbps) printf "%sgbit" "${val%Gbps}" ;;
+    *Mbps) printf "%smbit" "${val%Mbps}" ;;
+    *kbps) printf "%skbit" "${val%kbps}" ;;
+    *bps) printf "%sbit" "${val%bps}" ;;
+    *) return 1 ;;
+  esac
 }
 
 validate_reset_day() {
@@ -2866,6 +2909,111 @@ bytes_to_human() {
   }'
 }
 
+rate_limit_interface() {
+  local iface
+  iface=$(ip -4 route show default 2>/dev/null | awk 'NR == 1 {print $5; exit}')
+  if [[ -z "$iface" ]]; then
+    iface=$(ip -6 route show default 2>/dev/null | awk 'NR == 1 {print $5; exit}')
+  fi
+  printf "%s" "$iface"
+}
+
+rate_limit_pref() {
+  local port=$1 offset=$2
+  echo $((RATE_LIMIT_PREF_BASE + port * 10 + offset))
+}
+
+rate_limit_action_index() {
+  local port=$1 direction=$2
+  if [[ "$direction" == "upload" ]]; then
+    echo $((RATE_LIMIT_ACTION_BASE + port * 2 + 1))
+  else
+    echo $((RATE_LIMIT_ACTION_BASE + port * 2 + 2))
+  fi
+}
+
+rate_limit_delete_port_rules() {
+  local port=$1 iface=${2:-$(rate_limit_interface)} pref offset action
+  [[ -n "$iface" ]] && command -v tc >/dev/null 2>&1 || return 0
+  for direction in ingress egress; do
+    for offset in 0 1 2 3 4 5 6 7; do
+      pref=$(rate_limit_pref "$port" "$offset")
+      tc filter del dev "$iface" "$direction" pref "$pref" >/dev/null 2>&1 || true
+    done
+  done
+  for direction in upload download; do
+    action=$(rate_limit_action_index "$port" "$direction")
+    tc actions del action police index "$action" >/dev/null 2>&1 || true
+  done
+}
+
+rate_limit_install_filter() {
+  local iface=$1 direction=$2 port=$3 rate=$4 action=$5 pref=$6 ip_version=$7 protocol=$8 port_field=$9
+  tc filter replace dev "$iface" "$direction" protocol "$ip_version" pref "$pref" \
+    flower ip_proto "$protocol" "$port_field" "$port" action police index "$action" >/dev/null 2>&1
+}
+
+rate_limit_install_port() {
+  local node=$1 port upload download iface upload_tc download_tc action pref
+  port=$(jq -r '.port' <<<"$node")
+  upload=$(jq -r '.traffic.rate_limit.upload // empty' <<<"$node")
+  download=$(jq -r '.traffic.rate_limit.download // empty' <<<"$node")
+  iface=$(rate_limit_interface)
+
+  if [[ -z "$upload" && -z "$download" ]]; then
+    rate_limit_delete_port_rules "$port" "$iface"
+    return 0
+  fi
+
+  if [[ -z "$iface" ]]; then
+    warn "未检测到默认网络出口，端口 ${port} 限速规则暂未应用。"
+    return 0
+  fi
+  if ! command -v tc >/dev/null 2>&1; then
+    warn "系统未安装 tc，无法应用端口 ${port} 限速规则。"
+    return 0
+  fi
+
+  tc qdisc add dev "$iface" clsact >/dev/null 2>&1 || true
+  rate_limit_delete_port_rules "$port" "$iface"
+
+  if [[ -n "$upload" ]]; then
+    upload_tc=$(rate_limit_to_tc "$upload") || { warn "端口 ${port} 上传限速格式无效：${upload}"; return 0; }
+    action=$(rate_limit_action_index "$port" upload)
+    tc actions replace action police rate "$upload_tc" burst 64k conform-exceed drop index "$action" >/dev/null 2>&1 || {
+      warn "端口 ${port} 上传限速规则创建失败。"
+      return 0
+    }
+    pref=$(rate_limit_pref "$port" 0)
+    rate_limit_install_filter "$iface" ingress "$port" "$upload_tc" "$action" "$pref" ip tcp dst_port || true
+    rate_limit_install_filter "$iface" ingress "$port" "$upload_tc" "$action" "$((pref + 1))" ip udp dst_port || true
+    rate_limit_install_filter "$iface" ingress "$port" "$upload_tc" "$action" "$((pref + 2))" ipv6 tcp dst_port || true
+    rate_limit_install_filter "$iface" ingress "$port" "$upload_tc" "$action" "$((pref + 3))" ipv6 udp dst_port || true
+  fi
+
+  if [[ -n "$download" ]]; then
+    download_tc=$(rate_limit_to_tc "$download") || { warn "端口 ${port} 下载限速格式无效：${download}"; return 0; }
+    action=$(rate_limit_action_index "$port" download)
+    tc actions replace action police rate "$download_tc" burst 64k conform-exceed drop index "$action" >/dev/null 2>&1 || {
+      warn "端口 ${port} 下载限速规则创建失败。"
+      return 0
+    }
+    pref=$(rate_limit_pref "$port" 4)
+    rate_limit_install_filter "$iface" egress "$port" "$download_tc" "$action" "$pref" ip tcp src_port || true
+    rate_limit_install_filter "$iface" egress "$port" "$download_tc" "$action" "$((pref + 1))" ip udp src_port || true
+    rate_limit_install_filter "$iface" egress "$port" "$download_tc" "$action" "$((pref + 2))" ipv6 tcp src_port || true
+    rate_limit_install_filter "$iface" egress "$port" "$download_tc" "$action" "$((pref + 3))" ipv6 udp src_port || true
+  fi
+}
+
+sync_rate_limit_rules() {
+  local nodes=${1:-$(current_nodes_json)} node
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    rate_limit_install_port "$node"
+  done < <(jq -c '.[]?' <<<"$nodes")
+}
+
 traffic_init_table() {
   nft add table inet "$NFT_TABLE" >/dev/null 2>&1 || true
   nft add chain inet "$NFT_TABLE" input '{ type filter hook input priority 0; policy accept; }' >/dev/null 2>&1 || true
@@ -2897,6 +3045,7 @@ traffic_remove_rule_matches() {
 
 traffic_remove_port() {
   local port=$1
+  rate_limit_delete_port_rules "$port"
   traffic_remove_rule_matches "node_${port}_quota"
   traffic_remove_rule_matches "node_${port}_in"
   traffic_remove_rule_matches "node_${port}_out"
@@ -3031,6 +3180,7 @@ sync_traffic_rules() {
   while IFS= read -r node; do
     [[ -n "$node" ]] && traffic_install_port "$node"
   done < <(jq -c '.[]?' <<<"$nodes")
+  sync_rate_limit_rules "$nodes"
 }
 
 reset_traffic_port() {
@@ -3082,12 +3232,12 @@ traffic_defaults_json() {
     --arg billing "${1:-single}" \
     --arg limit "${2:-unlimited}" \
     --arg day "${3:-}" \
-    '{enabled:true,billing_mode:$billing,monthly_limit:$limit,reset_day:(if $day == "" then null else ($day|tonumber) end)}'
+    '{enabled:true,billing_mode:$billing,monthly_limit:$limit,reset_day:(if $day == "" then null else ($day|tonumber) end),rate_limit:{enabled:false,upload:null,download:null}}'
 }
 
 collect_traffic_settings() {
   local old=${1:-} target=${2:-}
-  local old_billing old_limit old_day traffic_json
+  local old_billing old_limit old_day old_rate_limit traffic_json
   old_billing=$(jq -r '.traffic.billing_mode // "single"' <<<"${old:-"{}"}")
   old_limit=$(jq -r '.traffic.monthly_limit // "unlimited"' <<<"${old:-"{}"}")
   old_day=$(jq -r '.traffic.reset_day // empty' <<<"${old:-"{}"}")
@@ -3108,6 +3258,8 @@ collect_traffic_settings() {
     TRAFFIC_RESET_DAY=""
   fi
   traffic_json=$(traffic_defaults_json "$TRAFFIC_BILLING" "$TRAFFIC_LIMIT" "$TRAFFIC_RESET_DAY")
+  old_rate_limit=$(jq -c '.traffic.rate_limit // {enabled:false,upload:null,download:null}' <<<"${old:-"{}"}")
+  traffic_json=$(jq -c --argjson rate_limit "$old_rate_limit" '.rate_limit = $rate_limit' <<<"$traffic_json")
   if [[ -n "$target" ]]; then
     printf -v "$target" "%s" "$traffic_json"
   else
@@ -3644,7 +3796,17 @@ ensure_state_schema() {
       . + {
         protocol: (.protocol // "anytls"),
         domain: (if (.domain // "") == "" then $top_domain else .domain end),
-        traffic: (.traffic // {enabled:true,billing_mode:"single",monthly_limit:"unlimited",reset_day:null}),
+        traffic: ((.traffic // {enabled:true,billing_mode:"single",monthly_limit:"unlimited",reset_day:null}) + {
+          enabled: ((.traffic.enabled // true)),
+          billing_mode: (.traffic.billing_mode // "single"),
+          monthly_limit: (.traffic.monthly_limit // "unlimited"),
+          reset_day: (.traffic.reset_day // null),
+          rate_limit: ((.traffic.rate_limit // {}) + {
+            enabled: (.traffic.rate_limit.enabled // false),
+            upload: (.traffic.rate_limit.upload // null),
+            download: (.traffic.rate_limit.download // null)
+          })
+        }),
         outbound: (if (.outbound.type // "direct") == "ss" then (.outbound + {type:"shadowsocks"}) else (.outbound // {type:"direct"}) end)
       } |
       .backup_outbounds = (
@@ -3733,6 +3895,10 @@ validate_nodes_state() {
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     protocol=$(jq -r '.protocol' <<<"$node")
+    local rate_limit_value
+    for rate_limit_value in "$(jq -r '.traffic.rate_limit.upload // empty' <<<"$node")" "$(jq -r '.traffic.rate_limit.download // empty' <<<"$node")"; do
+      [[ -z "$rate_limit_value" ]] || validate_rate_limit "$rate_limit_value" || die "节点 [$(jq -r '.name' <<<"$node")] 端口限速格式无效：${rate_limit_value}。"
+    done
     case "$protocol" in
       anytls)
         [[ -n "$(jq -r '.password // empty' <<<"$node")" ]] || die "AnyTLS 密码不能为空。"
@@ -6109,6 +6275,85 @@ immediate_traffic_reset_flow() {
   ok "节点 [${name}] 流量统计与配额已重置。"
 }
 
+print_rate_limit_status() {
+  local nodes=${1:-$(current_nodes_json)} node name port upload download enabled count=0
+  echo
+  printf "%s================ 当前端口限速 ================%s\n" "$C_CYAN" "$C_RESET"
+  while IFS= read -r node; do
+    [[ -n "$node" ]] || continue
+    count=$((count + 1))
+    name=$(jq -r '.name // "未命名节点"' <<<"$node")
+    port=$(jq -r '.port' <<<"$node")
+    enabled=$(jq -r '.traffic.rate_limit.enabled // false' <<<"$node")
+    upload=$(jq -r '.traffic.rate_limit.upload // empty' <<<"$node")
+    download=$(jq -r '.traffic.rate_limit.download // empty' <<<"$node")
+    if [[ "$enabled" == "true" || -n "$upload" || -n "$download" ]]; then
+      printf "  %s (%s)\n" "$name" "$port"
+      printf "    客户端上传（入站）：%s\n" "${upload:-不限速}"
+      printf "    客户端下载（出站）：%s\n" "${download:-不限速}"
+      if [[ -n "$(rate_limit_interface)" ]] && command -v tc >/dev/null 2>&1 && tc qdisc show dev "$(rate_limit_interface)" 2>/dev/null | grep -q 'clsact'; then
+        printf "    状态：已配置（tc）\n"
+      else
+        printf "    状态：已保存，待系统具备 tc 后应用\n"
+      fi
+    else
+      printf "  %s (%s)：未配置限速\n" "$name" "$port"
+    fi
+  done < <(jq -c '.[]?' <<<"$nodes")
+  (( count > 0 )) || printf "  暂无节点。\n"
+  printf "%s===============================================%s\n" "$C_CYAN" "$C_RESET"
+}
+
+configure_port_rate_limit_flow() {
+  local nodes=${1:-$(current_nodes_json)} index old name port old_upload old_download upload download upload_norm download_norm rate_json new_nodes
+  if (( $(node_count "$nodes") == 0 )); then
+    warn "当前暂无任何节点配置，请先在节点管理中添加节点。"
+    return 0
+  fi
+  print_node_list "$nodes"
+  index=$(select_node_index "$nodes" "请选择要配置端口限速的节点") || return 0
+  old=$(jq -c ".[$index]" <<<"$nodes")
+  name=$(jq -r '.name' <<<"$old")
+  port=$(jq -r '.port' <<<"$old")
+  old_upload=$(jq -r '.traffic.rate_limit.upload // empty' <<<"$old")
+  old_download=$(jq -r '.traffic.rate_limit.download // empty' <<<"$old")
+
+  echo
+  info "配置节点 [${name}]（端口 ${port}）的实时带宽限速。"
+  printf "  纯数字默认按 Mbps 处理，例如 500 = 500Mbps。输入 0 或留空表示不限速。\n"
+  prompt_value upload "客户端上传限速（入站）" "${old_upload:-0}"
+  prompt_value download "客户端下载限速（出站）" "${old_download:-0}"
+  upload_norm=$(normalize_rate_limit "$upload" 2>/dev/null || true)
+  download_norm=$(normalize_rate_limit "$download" 2>/dev/null || true)
+  if [[ -n "$upload" && -z "$upload_norm" && "$upload" != "0" ]] || [[ -n "$download" && -z "$download_norm" && "$download" != "0" ]]; then
+    warn "限速格式无效，请输入例如 20、100Mbps 或 1Gbps。"
+    return 0
+  fi
+
+  if [[ -z "$upload_norm" && -z "$download_norm" ]]; then
+    rate_json='{"enabled":false,"upload":null,"download":null}'
+  else
+    rate_json=$(jq -cn --arg upload "$upload_norm" --arg download "$download_norm" \
+      '{enabled:true,upload:(if $upload == "" then null else $upload end),download:(if $download == "" then null else $download end)}')
+  fi
+
+  echo
+  printf "即将应用端口限速：\n"
+  printf "  节点：%s\n  端口：%s\n  客户端上传（入站）：%s\n  客户端下载（出站）：%s\n" \
+    "$name" "$port" "${upload_norm:-不限速}" "${download_norm:-不限速}"
+  local confirm_rate
+  read -r -p "确认保存并应用？[Y/n]: " confirm_rate
+  confirm_rate=${confirm_rate:-Y}
+  [[ "$confirm_rate" =~ ^[Yy]$ ]] || { warn "已取消端口限速配置。"; return 0; }
+
+  nodes=$(current_nodes_json)
+  new_nodes=$(jq -c --argjson index "$index" --argjson rate_limit "$rate_json" \
+    '.[ $index ].traffic.rate_limit = $rate_limit' <<<"$nodes")
+  save_nodes_json "$new_nodes"
+  ok "节点 [${name}] 的端口限速配置已保存并同步。"
+  pause_prompt
+}
+
 init_api_config() {
   if [[ ! -r "$API_CONFIG_FILE" ]]; then
     install -d -m 0750 "$CONFIG_DIR"
@@ -6644,12 +6889,14 @@ traffic_menu() {
     printf "%s=== 流量管理与监控 ===%s\n" "$C_CYAN" "$C_RESET"
     printf "  1) 刷新流量状态\n"
     printf "  2) 调整配额限制\n"
-    printf "  3) 重置单点流量\n"
-    printf "  4) 重置全部流量\n"
-    printf "  5) 查看重置日志\n"
-    printf "  6) API 接口服务\n"
+    printf "  3) 配置端口限速\n"
+    printf "  4) 查看当前限速\n"
+    printf "  5) 重置单点流量\n"
+    printf "  6) 重置全部流量\n"
+    printf "  7) 查看重置日志\n"
+    printf "  8) API 接口服务\n"
     printf "  0) 返回主菜单\n"
-    read -r -p "请输入选择 [0-6，默认: 0]: " choice
+    read -r -p "请输入选择 [0-8，默认: 0]: " choice
     choice=${choice:-0}
     case "$choice" in
       1) print_node_list "$nodes"; pause_prompt ;;
@@ -6661,21 +6908,28 @@ traffic_menu() {
         fi
         ;;
       3)
+        configure_port_rate_limit_flow "$nodes"
+        ;;
+      4)
+        print_rate_limit_status "$nodes"
+        pause_prompt
+        ;;
+      5)
         if (( $(node_count "$nodes") == 0 )); then
           warn "当前暂无任何节点配置，无法重置。"
         else
           immediate_traffic_reset_flow "$nodes"
         fi
         ;;
-      4)
+      6)
         if (( $(node_count "$nodes") == 0 )); then
           warn "当前暂无任何节点配置，无法重置。"
         else
           reset_traffic_all
         fi
         ;;
-      5) view_traffic_logs ;;
-      6) api_service_menu ;;
+      7) view_traffic_logs ;;
+      8) api_service_menu ;;
       0|"") return ;;
       *) warn "无效选择。" ;;
     esac
@@ -7265,7 +7519,7 @@ remove_managed_repository() {
 
 uninstall_flow() {
   preflight
-  local domain="" domains="" traffic_cron_tmp
+  local domain="" domains="" traffic_cron_tmp port
   if command -v jq >/dev/null 2>&1 && [[ -r "$STATE_FILE" ]]; then
     domains=$(jq -r '.nodes[]?.domain // empty' "$STATE_FILE" 2>/dev/null | sort -u || true)
   fi
@@ -7286,6 +7540,11 @@ uninstall_flow() {
     info "清理证书 ${domain}……"
     delete_single_certificate "$domain"
   done <<<"$domains"
+  if [[ -r "$STATE_FILE" ]]; then
+    while IFS= read -r port; do
+      [[ -n "$port" ]] && rate_limit_delete_port_rules "$port"
+    done < <(jq -r '.nodes[]?.port // empty' "$STATE_FILE" 2>/dev/null || true)
+  fi
   nft delete table inet "$NFT_TABLE" >/dev/null 2>&1 || true
   traffic_cron_tmp=$(mktemp)
   (crontab -l 2>/dev/null || true) | awk -v tag="${CRON_TAG}" 'index($0, tag) == 0' >"$traffic_cron_tmp" || true
