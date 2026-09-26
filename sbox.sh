@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.24"
+readonly SCRIPT_VERSION="0.0.25"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -4405,8 +4405,11 @@ sync_anytls_default_padding() {
 }
 
 render_node_table_fallback() {
-  local raw=$1
+  local raw=$1 mode=${2:-traffic}
   local headers=("序号" "节点名称" "协议类型" "域名/端口" "当前流量" "月配额/比例" "重置日")
+  if [[ "$mode" == "rate_limit" ]]; then
+    headers=("序号" "节点名称" "协议类型" "域名/端口" "上行限速" "下行限速" "重置日")
+  fi
   local min_widths=(6 14 26 24 12 16 8)
 
   _calc_w() {
@@ -4463,6 +4466,7 @@ render_node_table_fallback() {
 
 print_node_list() {
   local nodes=${1:-$(current_nodes_json)}
+  local mode=${2:-traffic}
   local node_cnt
   node_cnt=$(node_count "$nodes")
   if (( node_cnt == 0 )); then
@@ -4472,38 +4476,46 @@ print_node_list() {
   fi
 
   local table_data="" index=1 node port in_b out_b total_b limit day percent limit_b status_tag b_mode
-  local name protocol domain day_str traffic_str limit_str
+  local name protocol domain day_str traffic_str limit_str upload_limit download_limit
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     port=$(jq -r '.port' <<<"$node")
-    in_b=$(traffic_counter_value "$port" in)
-    out_b=$(traffic_counter_value "$port" out)
-    b_mode=$(jq -r '.traffic.billing_mode // "single"' <<<"$node")
-    if [[ "$b_mode" == "double" ]]; then
-      total_b=$((in_b + out_b))
-    else
-      total_b=$out_b
-    fi
-    limit=$(jq -r '.traffic.monthly_limit // "unlimited"' <<<"$node")
     day=$(jq -r '.traffic.reset_day // empty' <<<"$node")
     day_str="无"
     [[ -n "$day" && "$day" != "null" ]] && day_str="${day}日"
-    percent="-"
     status_tag=""
-    if [[ "$limit" != "unlimited" && "$limit" != "0" ]]; then
-      limit_b=$(size_to_bytes "$limit")
-      if [[ "$limit_b" -gt 0 ]]; then
-        percent=$((total_b * 100 / limit_b))
-        if [[ $percent -ge 100 ]]; then
-          status_tag="[已超额阻断]"
-        fi
-      fi
-    fi
     name=$(jq -r '.name' <<<"$node")
     protocol=$(protocol_label "$(jq -r '.protocol' <<<"$node")")
     domain=$(jq -r '.domain // "127.0.0.1"' <<<"$node")
-    traffic_str=$(bytes_to_human "$total_b")
-    limit_str="${limit}(${percent}%)"
+
+    if [[ "$mode" == "rate_limit" ]]; then
+      upload_limit=$(jq -r '.traffic.rate_limit.upload // "不限速"' <<<"$node")
+      download_limit=$(jq -r '.traffic.rate_limit.download // "不限速"' <<<"$node")
+      traffic_str="$upload_limit"
+      limit_str="$download_limit"
+    else
+      in_b=$(traffic_counter_value "$port" in)
+      out_b=$(traffic_counter_value "$port" out)
+      b_mode=$(jq -r '.traffic.billing_mode // "single"' <<<"$node")
+      if [[ "$b_mode" == "double" ]]; then
+        total_b=$((in_b + out_b))
+      else
+        total_b=$out_b
+      fi
+      limit=$(jq -r '.traffic.monthly_limit // "unlimited"' <<<"$node")
+      percent="-"
+      if [[ "$limit" != "unlimited" && "$limit" != "0" ]]; then
+        limit_b=$(size_to_bytes "$limit")
+        if [[ "$limit_b" -gt 0 ]]; then
+          percent=$((total_b * 100 / limit_b))
+          if [[ $percent -ge 100 ]]; then
+            status_tag="[已超额阻断]"
+          fi
+        fi
+      fi
+      traffic_str=$(bytes_to_human "$total_b")
+      limit_str="${limit}(${percent}%)"
+    fi
 
     table_data+="${index}|@@|${name}|@@|${protocol}|@@|${domain}:${port}|@@|${traffic_str}|@@|${limit_str}|@@|${day_str}|@@|${status_tag}"$'\n'
     index=$((index + 1))
@@ -4517,6 +4529,7 @@ import sys, re, unicodedata
 c_cyan = sys.argv[1]
 c_red = sys.argv[2]
 c_reset = sys.argv[3]
+mode = sys.argv[4]
 raw = sys.stdin.read()
 
 def display_width(s):
@@ -4537,6 +4550,8 @@ def pad_str(s, target_w):
     return s + (" " * (target_w - w))
 
 headers = ["序号", "节点名称", "协议类型", "域名/端口", "当前流量", "月配额/比例", "重置日"]
+if mode == "rate_limit":
+    headers = ["序号", "节点名称", "协议类型", "域名/端口", "上行限速", "下行限速", "重置日"]
 min_widths = [6, 14, 16, 24, 12, 16, 8]
 
 rows = []
@@ -4577,9 +4592,9 @@ for r in rows:
     print(out)
 
 print(c_cyan + bot_bar + c_reset)
-' "$C_CYAN" "$C_RED" "$C_RESET" <<<"$table_data"
+' "$C_CYAN" "$C_RED" "$C_RESET" "$mode" <<<"$table_data"
   else
-    render_node_table_fallback "$table_data"
+    render_node_table_fallback "$table_data" "$mode"
   fi
 }
 
@@ -6248,7 +6263,7 @@ nodes_menu() {
 
 configure_traffic_flow() {
   local nodes=${1:-$(current_nodes_json)} index old traffic new_nodes name
-  print_node_list "$nodes"
+  print_node_list "$nodes" rate_limit
   index=$(select_node_index "$nodes" "请选择要设置流量的节点") || return 0
   old=$(jq -c ".[$index]" <<<"$nodes")
   name=$(jq -r '.name' <<<"$old")
@@ -6267,41 +6282,12 @@ configure_traffic_flow() {
 
 immediate_traffic_reset_flow() {
   local nodes=${1:-$(current_nodes_json)} index port name
-  print_node_list "$nodes"
+  print_node_list "$nodes" rate_limit
   index=$(select_node_index "$nodes" "请选择要立即重置流量的节点") || return 0
   port=$(jq -r ".[$index].port" <<<"$nodes")
   name=$(jq -r ".[$index].name" <<<"$nodes")
   reset_traffic_port "$port" "$name" 0
   ok "节点 [${name}] 流量统计与配额已重置。"
-}
-
-print_rate_limit_status() {
-  local nodes=${1:-$(current_nodes_json)} node name port upload download enabled count=0
-  echo
-  printf "%s================ 当前端口限速 ================%s\n" "$C_CYAN" "$C_RESET"
-  while IFS= read -r node; do
-    [[ -n "$node" ]] || continue
-    count=$((count + 1))
-    name=$(jq -r '.name // "未命名节点"' <<<"$node")
-    port=$(jq -r '.port' <<<"$node")
-    enabled=$(jq -r '.traffic.rate_limit.enabled // false' <<<"$node")
-    upload=$(jq -r '.traffic.rate_limit.upload // empty' <<<"$node")
-    download=$(jq -r '.traffic.rate_limit.download // empty' <<<"$node")
-    if [[ "$enabled" == "true" || -n "$upload" || -n "$download" ]]; then
-      printf "  %s (%s)\n" "$name" "$port"
-      printf "    客户端上传（入站）：%s\n" "${upload:-不限速}"
-      printf "    客户端下载（出站）：%s\n" "${download:-不限速}"
-      if [[ -n "$(rate_limit_interface)" ]] && command -v tc >/dev/null 2>&1 && tc qdisc show dev "$(rate_limit_interface)" 2>/dev/null | grep -q 'clsact'; then
-        printf "    状态：已配置（tc）\n"
-      else
-        printf "    状态：已保存，待系统具备 tc 后应用\n"
-      fi
-    else
-      printf "  %s (%s)：未配置限速\n" "$name" "$port"
-    fi
-  done < <(jq -c '.[]?' <<<"$nodes")
-  (( count > 0 )) || printf "  暂无节点。\n"
-  printf "%s===============================================%s\n" "$C_CYAN" "$C_RESET"
 }
 
 configure_port_rate_limit_flow() {
@@ -6310,7 +6296,7 @@ configure_port_rate_limit_flow() {
     warn "当前暂无任何节点配置，请先在节点管理中添加节点。"
     return 0
   fi
-  print_node_list "$nodes"
+  print_node_list "$nodes" rate_limit
   index=$(select_node_index "$nodes" "请选择要配置端口限速的节点") || return 0
   old=$(jq -c ".[$index]" <<<"$nodes")
   name=$(jq -r '.name' <<<"$old")
@@ -6884,22 +6870,21 @@ traffic_menu() {
   local choice nodes
   while true; do
     nodes=$(current_nodes_json)
-    print_node_list "$nodes"
+    print_node_list "$nodes" rate_limit
     echo
     printf "%s=== 流量管理与监控 ===%s\n" "$C_CYAN" "$C_RESET"
     printf "  1) 刷新流量状态\n"
     printf "  2) 调整配额限制\n"
     printf "  3) 配置端口限速\n"
-    printf "  4) 查看当前限速\n"
-    printf "  5) 重置单点流量\n"
-    printf "  6) 重置全部流量\n"
-    printf "  7) 查看重置日志\n"
-    printf "  8) API 接口服务\n"
+    printf "  4) 重置单点流量\n"
+    printf "  5) 重置全部流量\n"
+    printf "  6) 查看重置日志\n"
+    printf "  7) API 接口服务\n"
     printf "  0) 返回主菜单\n"
-    read -r -p "请输入选择 [0-8，默认: 0]: " choice
+    read -r -p "请输入选择 [0-7，默认: 0]: " choice
     choice=${choice:-0}
     case "$choice" in
-      1) print_node_list "$nodes"; pause_prompt ;;
+      1) print_node_list "$nodes" rate_limit; pause_prompt ;;
       2)
         if (( $(node_count "$nodes") == 0 )); then
           warn "当前暂无任何节点配置，请先在节点管理中添加节点。"
@@ -6911,25 +6896,21 @@ traffic_menu() {
         configure_port_rate_limit_flow "$nodes"
         ;;
       4)
-        print_rate_limit_status "$nodes"
-        pause_prompt
-        ;;
-      5)
         if (( $(node_count "$nodes") == 0 )); then
           warn "当前暂无任何节点配置，无法重置。"
         else
           immediate_traffic_reset_flow "$nodes"
         fi
         ;;
-      6)
+      5)
         if (( $(node_count "$nodes") == 0 )); then
           warn "当前暂无任何节点配置，无法重置。"
         else
           reset_traffic_all
         fi
         ;;
-      7) view_traffic_logs ;;
-      8) api_service_menu ;;
+      6) view_traffic_logs ;;
+      7) api_service_menu ;;
       0|"") return ;;
       *) warn "无效选择。" ;;
     esac
