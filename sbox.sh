@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.28"
+readonly SCRIPT_VERSION="0.0.29"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -6184,6 +6184,9 @@ show_client() {
     domain=$(jq -r '.domain' <<<"$node")
     port=$(jq -r '.port' <<<"$node")
     printf "\n%s[%d] 节点名称: %s%s\n" "$C_GREEN" "$index" "$name" "$C_RESET"
+    if [[ "$protocol" == "shadowsocks" ]]; then
+      printf "  TFO状态: %s\n" "$(jq -r 'if .tcp_fast_open == true then "开启" else "关闭" end' <<<"$node")"
+    fi
     printf "  协议类型: %s\n" "$(protocol_label "$protocol")"
     printf "  连接地址: %s:%s\n" "$domain" "$port"
     case "$protocol" in
