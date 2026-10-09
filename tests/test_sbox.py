@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import pty
 from pathlib import Path
 import re
 import shlex
@@ -564,6 +565,60 @@ upgrade_sing_box''', env=env)
         self.assertEqual(result.stderr, "")
         self.assertEqual([line for line in result.stdout.splitlines() if line.startswith("下载核心:")],
                          ["下载核心:FORCE"])
+
+    def same_version_update_in_terminal(self, mode, non_interactive=0):
+        code = f'''source {shlex.quote(str(SCRIPT))}
+[[ -t 0 ]] || exit 99
+require_root() {{ :; }}
+curl() {{
+  [[ "$*" == *purge.jsdelivr.net* ]] && return 0
+  cp {shlex.quote(str(SCRIPT))} "${{@: -1}}"
+}}
+NON_INTERACTIVE={non_interactive}
+update_self_script {shlex.quote(mode)}
+printf '更新检查已返回\\n'
+'''
+        master, slave = pty.openpty()
+        process = subprocess.Popen(["bash", "-c", code], stdin=slave, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True)
+        os.close(slave)
+        self.addCleanup(os.close, master)
+
+        def cleanup():
+            if process.poll() is None:
+                process.kill()
+            process.communicate()
+
+        self.addCleanup(cleanup)
+        return process, master
+
+    def test_silent_same_version_check_returns_without_terminal_input(self):
+        for mode in ("silent", "quiet"):
+            with self.subTest(mode=mode):
+                process, _ = self.same_version_update_in_terminal(mode)
+                stdout, stderr = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertIn("更新检查已返回", stdout)
+                self.assertNotIn("是否重新强制", stderr)
+
+    def test_non_interactive_same_version_check_does_not_prompt_on_terminal(self):
+        process, _ = self.same_version_update_in_terminal("cli", non_interactive=1)
+        stdout, stderr = process.communicate(timeout=3)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn("更新检查已返回", stdout)
+        self.assertNotIn("是否重新强制", stderr)
+
+    def test_manual_same_version_check_keeps_force_reinstall_prompt(self):
+        for mode in ("cli", "menu"):
+            with self.subTest(mode=mode):
+                process, master = self.same_version_update_in_terminal(mode)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    process.communicate(timeout=0.3)
+                os.write(master, b"\n")
+                stdout, stderr = process.communicate(timeout=3)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertIn("更新检查已返回", stdout)
+                self.assertIn("是否重新强制拉取", stderr)
 
     def test_generated_api_script_and_old_service_migration(self):
         state_dir = self.directory / "state"

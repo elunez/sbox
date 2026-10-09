@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.31"
+readonly SCRIPT_VERSION="0.0.32"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -7766,10 +7766,11 @@ update_self_script() {
 
   if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
     ok "当前脚本已是最新版本 (v${SCRIPT_VERSION})。"
+    # 自动检查不询问强制重装，避免提示被隐藏后仍等待终端输入。
     local need_force=0
     if (( FORCE_UPDATE || ASSUME_YES )); then
       need_force=1
-    elif [[ -t 0 ]]; then
+    elif [[ "$mode" != "silent" && "$mode" != "quiet" && "$NON_INTERACTIVE" != "1" && -t 0 ]]; then
       local force_update
       read -r -p "是否重新强制拉取并安装当前版本？[y/N]: " force_update
       [[ "$force_update" =~ ^[yY]$ ]] && need_force=1
