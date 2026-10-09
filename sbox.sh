@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.30"
+readonly SCRIPT_VERSION="0.0.31"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -2841,33 +2841,64 @@ apt_get_minimal() {
     -o APT::Keep-Downloaded-Packages=false "$@"
 }
 
-install_dependencies_and_core() {
+install_dependencies() {
+  local mode=${1:-install} package
+  local -a packages=() missing=() apt_install_flags=(-y --no-install-recommends)
   detect_os
   info "检测操作系统与环境：${OS_ID:-Linux} (${PKG_MGR:-未知}) / ${INIT_SYSTEM}……"
 
   case "$PKG_MGR" in
+    apt) packages=(ca-certificates curl gnupg jq openssl certbot iproute2 nftables cron python3 tar gzip) ;;
+    dnf|yum) packages=(ca-certificates curl gnupg2 jq openssl certbot iproute nftables cronie python3 tar gzip chrony) ;;
+    apk) packages=(bash ca-certificates curl gnupg jq openssl certbot iproute2 nftables tzdata python3 tar gzip coreutils dcron gcompat chrony) ;;
+  esac
+
+  # 更新核心只补缺失依赖；首次安装仍使用原有完整依赖列表。
+  if [[ "$mode" == "update" ]]; then
+    for package in ${packages[@]+"${packages[@]}"}; do
+      case "$PKG_MGR" in
+        apt) [[ "$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)" == "install ok installed" ]] || missing+=("$package") ;;
+        dnf|yum) rpm -q "$package" >/dev/null 2>&1 || missing+=("$package") ;;
+        apk) apk info -e "$package" >/dev/null 2>&1 || missing+=("$package") ;;
+      esac
+    done
+    packages=(${missing[@]+"${missing[@]}"})
+    apt_install_flags+=(--no-upgrade)
+    if (( ${#packages[@]} == 0 )); then
+      info "现有系统依赖齐全，跳过依赖安装。"
+    fi
+  fi
+
+  case "$PKG_MGR" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
-      apt_get_minimal update -y || die "更新依赖索引失败，请检查软件源、网络及 /var 分区空间。"
-      apt_get_minimal install -y --no-install-recommends \
-        ca-certificates curl gnupg jq openssl certbot iproute2 nftables cron python3 tar gzip || die "安装依赖失败，请检查上方错误及 /var 分区空间。"
+      if (( ${#packages[@]} > 0 )); then
+        apt_get_minimal update -y || die "更新依赖索引失败，请检查软件源、网络及 /var 分区空间。"
+        apt_get_minimal install "${apt_install_flags[@]}" "${packages[@]}" || die "安装依赖失败，请检查上方错误及 /var 分区空间。"
+      fi
       # 时间同步依赖由 ensure_time_sync_service 按现有服务情况单独补齐。
       ensure_certbot_environment
       ;;
     dnf)
-      dnf --setopt=keepcache=0 install -y epel-release || true
-      dnf --setopt=keepcache=0 install -y ca-certificates curl gnupg2 jq openssl certbot iproute nftables cronie python3 tar gzip chrony
+      if (( ${#packages[@]} > 0 )); then
+        dnf --setopt=keepcache=0 install -y epel-release || true
+        dnf --setopt=keepcache=0 install -y "${packages[@]}"
+      fi
       systemctl enable --now crond >/dev/null 2>&1 || true
       ensure_certbot_environment
       ;;
     yum)
-      yum --setopt=keepcache=0 install -y epel-release || true
-      yum --setopt=keepcache=0 install -y ca-certificates curl gnupg2 jq openssl certbot iproute nftables cronie python3 tar gzip chrony
+      if (( ${#packages[@]} > 0 )); then
+        yum --setopt=keepcache=0 install -y epel-release || true
+        yum --setopt=keepcache=0 install -y "${packages[@]}"
+      fi
       systemctl enable --now crond >/dev/null 2>&1 || true
       ensure_certbot_environment
       ;;
     apk)
-      apk add --no-cache bash ca-certificates curl gnupg jq openssl certbot iproute2 nftables tzdata python3 tar gzip coreutils dcron gcompat chrony
+      if (( ${#packages[@]} > 0 )); then
+        apk add --no-cache "${packages[@]}"
+      fi
       rc-update add dcron default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || true
       rc-service dcron start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
       ensure_certbot_environment
@@ -2878,12 +2909,16 @@ install_dependencies_and_core() {
   esac
 
   ensure_time_sync_service
+}
+
+install_dependencies_and_core() {
+  install_dependencies
   install_singbox_binary
 }
 
 upgrade_sing_box() {
   preflight
-  install_dependencies_and_core
+  install_dependencies update
   info "正在检查并更新 sing-box 核心……"
   install_singbox_binary "FORCE"
   if [[ -s "$CONFIG_FILE" ]]; then

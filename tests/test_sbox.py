@@ -446,6 +446,125 @@ install_dependencies_and_core''')
         self.assertTrue(all("APT::Keep-Downloaded-Packages=false" in call for call in calls))
         self.assertNotIn("不应安装核心", result.stdout)
 
+    def test_update_skips_package_manager_when_dependencies_are_installed(self):
+        for manager in ("apt", "dnf", "yum", "apk"):
+            with self.subTest(manager=manager):
+                result = bash(f'''detect_os() {{ PKG_MGR={manager}; }}
+dpkg-query() {{ printf 'install ok installed'; }}
+rpm() {{ return 0; }}
+apt-get() {{ echo 不应调用APT >&2; return 99; }}
+dnf() {{ echo 不应调用DNF >&2; return 99; }}
+yum() {{ echo 不应调用YUM >&2; return 99; }}
+apk() {{ [[ "$1" == info ]] || {{ echo 不应安装APK依赖 >&2; return 99; }}; }}
+systemctl() {{ :; }}
+rc-update() {{ :; }}
+rc-service() {{ :; }}
+ensure_certbot_environment() {{ :; }}
+ensure_time_sync_service() {{ :; }}
+install_dependencies update''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertIn("依赖齐全", result.stdout)
+
+    def test_apt_update_installs_only_missing_or_incomplete_dependencies(self):
+        log = self.directory / "apt-missing"
+        result = bash(f'''detect_os() {{ PKG_MGR=apt; }}
+dpkg-query() {{
+  case "$3" in
+    jq) printf 'deinstall ok config-files' ;;
+    python3) return 1 ;;
+    *) printf 'install ok installed' ;;
+  esac
+}}
+apt-get() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; }}
+ensure_certbot_environment() {{ :; }}
+ensure_time_sync_service() {{ :; }}
+install_dependencies update''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = log.read_text().splitlines()
+        self.assertEqual(len(calls), 2)
+        self.assertIn(" update ", calls[0])
+        install_args = shlex.split(calls[1])
+        install_args = install_args[install_args.index("install") + 1:]
+        self.assertEqual(install_args, ["-y", "--no-install-recommends", "--no-upgrade", "jq", "python3"])
+
+    def test_rpm_and_apk_update_install_only_missing_dependencies(self):
+        for manager in ("dnf", "yum", "apk"):
+            with self.subTest(manager=manager):
+                log = self.directory / (manager + "-missing")
+                result = bash(f'''detect_os() {{ PKG_MGR={manager}; }}
+rpm() {{ [[ "$2" != jq ]]; }}
+dnf() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; }}
+yum() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; }}
+apk() {{
+  if [[ "$1" == info ]]; then [[ "$3" != jq ]];
+  else printf '%s\\n' "$*" >> {shlex.quote(str(log))}; fi
+}}
+systemctl() {{ :; }}
+rc-update() {{ :; }}
+rc-service() {{ :; }}
+ensure_certbot_environment() {{ :; }}
+ensure_time_sync_service() {{ :; }}
+install_dependencies update''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = log.read_text().splitlines()
+                if manager == "apk":
+                    self.assertEqual(calls, ["add --no-cache jq"])
+                else:
+                    self.assertEqual(calls, ["--setopt=keepcache=0 install -y epel-release",
+                                             "--setopt=keepcache=0 install -y jq"])
+
+    def test_update_index_failure_stops_before_core_download(self):
+        log = self.directory / "failed-update"
+        result = bash(f'''preflight() {{ :; }}
+detect_os() {{ PKG_MGR=apt; }}
+dpkg-query() {{ [[ "$3" != jq ]] && printf 'install ok installed'; }}
+apt-get() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; return 1; }}
+ensure_certbot_environment() {{ :; }}
+ensure_time_sync_service() {{ :; }}
+install_singbox_binary() {{ echo 不应下载核心; }}
+upgrade_sing_box''')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+        self.assertNotIn("不应下载核心", result.stdout)
+
+    def test_initial_install_keeps_full_dependencies_and_installs_core_once(self):
+        log = self.directory / "initial-install"
+        result = bash(f'''detect_os() {{ PKG_MGR=apt; }}
+dpkg-query() {{ echo 首次安装不应筛选依赖 >&2; return 99; }}
+apt-get() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; }}
+ensure_certbot_environment() {{ :; }}
+ensure_time_sync_service() {{ :; }}
+install_singbox_binary() {{ echo 安装核心; }}
+install_dependencies_and_core''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout.count("安装核心"), 1)
+        calls = log.read_text().splitlines()
+        args = shlex.split(calls[1])
+        self.assertEqual(args[args.index("install") + 1:],
+                         ["-y", "--no-install-recommends", "ca-certificates", "curl", "gnupg", "jq",
+                          "openssl", "certbot", "iproute2", "nftables", "cron", "python3", "tar", "gzip"])
+
+    def test_upgrade_downloads_core_once_without_reinstalling_dependencies(self):
+        env = dict(os.environ, CONFIG_FILE=str(self.directory / "absent-config.json"))
+        result = bash('''preflight() { :; }
+detect_os() { PKG_MGR=apt; }
+dpkg-query() { printf 'install ok installed'; }
+apt-get() { echo 不应安装依赖 >&2; return 99; }
+ensure_certbot_environment() { :; }
+ensure_time_sync_service() { :; }
+install_singbox_binary() { printf '下载核心:%s\\n' "${1:-}"; }
+migrate_outbound_health_config() { :; }
+sync_outbound_health_service() { :; }
+update_self_script() { :; }
+sing-box() { echo 'sing-box version test'; }
+upgrade_sing_box''', env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual([line for line in result.stdout.splitlines() if line.startswith("下载核心:")],
+                         ["下载核心:FORCE"])
+
     def test_generated_api_script_and_old_service_migration(self):
         state_dir = self.directory / "state"
         env = dict(os.environ, STATE_DIR=str(state_dir))
