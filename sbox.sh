@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.26"
+readonly SCRIPT_VERSION="0.0.27"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -2788,15 +2788,27 @@ install_singbox_binary() (
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
-  local -a urls=(
-    "https://github.com/SagerNet/sing-box/releases/download/v${ver}/${pkg_name}.tar.gz"
-    "https://ghproxy.net/https://github.com/SagerNet/sing-box/releases/download/v${ver}/${pkg_name}.tar.gz"
-    "https://mirror.ghproxy.com/https://github.com/SagerNet/sing-box/releases/download/v${ver}/${pkg_name}.tar.gz"
-  )
+  local origin="https://github.com/SagerNet/sing-box/releases/download/v${ver}/${pkg_name}.tar.gz"
+  local mirror="${SBOX_DOWNLOAD_MIRROR:-auto}" download_timeout="${SBOX_DOWNLOAD_TIMEOUT:-600}"
+  [[ "$download_timeout" =~ ^[1-9][0-9]*$ ]] || die "SBOX_DOWNLOAD_TIMEOUT 必须是正整数秒数。"
+  local -a urls=()
+  case "$mirror" in
+    auto) urls=("https://gh.zyun.vip/${origin}" "$origin" "https://ghproxy.net/${origin}") ;;
+    github) urls=("$origin" "https://gh.zyun.vip/${origin}" "https://ghproxy.net/${origin}") ;;
+    https://?*)
+      urls=("${mirror%/}/${origin}" "$origin")
+      if [[ "${mirror%/}" != "https://gh.zyun.vip" ]]; then urls+=("https://gh.zyun.vip/${origin}"); fi
+      if [[ "${mirror%/}" != "https://ghproxy.net" ]]; then urls+=("https://ghproxy.net/${origin}"); fi
+      ;;
+    *) die "SBOX_DOWNLOAD_MIRROR 仅支持 auto、github 或 HTTPS 加速源前缀。" ;;
+  esac
 
-  local dl_ok=0
+  local dl_ok=0 source_index=0
   for u in "${urls[@]}"; do
-    if curl -fsSL --connect-timeout 10 -m 90 "$u" | tar -xzOf - "${pkg_name}/sing-box" >"$bin"; then
+    source_index=$((source_index + 1))
+    info "尝试下载源 ${source_index}/${#urls[@]} (最长 ${download_timeout} 秒，持续低速 30 秒后切换)……"
+    # 不使用 curl --retry：流式解压时直接重试会把多次响应拼接成损坏的压缩流。
+    if curl -fSL --connect-timeout 10 --max-time "$download_timeout" --speed-limit 1024 --speed-time 30 "$u" | tar -xzOf - "${pkg_name}/sing-box" >"$bin"; then
       if [[ -s "$bin" ]]; then
         dl_ok=1
         break

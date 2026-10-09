@@ -375,6 +375,37 @@ install_singbox_binary 1.14.2'''
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("1.14.2", core.read_text())
 
+    def test_download_fallback_uses_fresh_stream_and_longer_timeout(self):
+        log = self.directory / "downloads"
+        archive = shlex.quote(str(self.directory / "core.tar.gz"))
+        extra = f'''curl() {{
+  printf '%s\\n' "$*" >> {shlex.quote(str(log))}
+  if [[ "$*" == *gh.zyun.vip* ]]; then head -c 30 {archive}; return 28; fi
+  cat {archive}
+}}'''
+        result, core = self.installation(b"#!/bin/sh\necho 'sing-box version 1.14.2'\n", extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("1.14.2", core.read_text())
+        calls = log.read_text().splitlines()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("gh.zyun.vip/https://github.com/", calls[0])
+        self.assertTrue(all("--max-time 600 --speed-limit 1024 --speed-time 30" in call for call in calls))
+        self.assertNotIn("gh.zyun.vip", calls[1])
+        self.assertNotIn("mirror.ghproxy.com", "\n".join(calls))
+
+    def test_custom_mirror_and_timeout(self):
+        log = self.directory / "downloads"
+        archive = shlex.quote(str(self.directory / "core.tar.gz"))
+        extra = f'''SBOX_DOWNLOAD_MIRROR=https://mirror.example/
+SBOX_DOWNLOAD_TIMEOUT=1200
+curl() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; cat {archive}; }}'''
+        result, _ = self.installation(b"#!/bin/sh\necho 'sing-box version 1.14.2'\n", extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = log.read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("https://mirror.example/https://github.com/", calls[0])
+        self.assertIn("--max-time 1200", calls[0])
+
     def test_invalid_core_keeps_old_binary(self):
         result, core = self.installation(b"invalid binary")
         self.assertNotEqual(result.returncode, 0)

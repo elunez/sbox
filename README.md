@@ -79,6 +79,14 @@ curl -fsSLO https://raw.githubusercontent.com/elunez/sbox/main/sbox.sh && chmod 
 
 核心采用流式下载，只解压二进制到 `/usr/local/bin` 的临时文件，不落盘压缩包和完整解压目录，避免容量受限的 `/tmp`（tmpfs）导致安装失败。新核心校验可执行后直接替换旧文件；失败或正常退出时清理临时文件。请确保目标分区仍有足够空间存放一个新核心。APT 安装会减少索引和缓存占用，不重复安装整套依赖；DNF/YUM 安装后不保留下载包缓存。
 
+核心默认优先使用 `https://gh.zyun.vip/` 加速源，失败后尝试 GitHub 和 GHProxy；每个来源最长 600 秒，连续 30 秒下载速度低于 1KB/s 则切换。显示下载进度，失败后清空本次临时文件再尝试下一来源。可以通过环境变量调整（加速源是第三方服务，速度取决于机器所在网络）：
+
+```bash
+sudo env SBOX_DOWNLOAD_MIRROR=github sbox upgrade                 # 优先 GitHub 直连
+sudo env SBOX_DOWNLOAD_MIRROR=https://gh.zyun.vip sbox upgrade     # 优先指定 HTTPS 加速源
+sudo env SBOX_DOWNLOAD_TIMEOUT=1200 sbox upgrade                 # 每个来源最多 20 分钟
+```
+
 安装完成后，脚本会自动安装至系统 PATH，后续随时在任意终端输入快捷命令即可唤出管理面板：
 
 ```bash
