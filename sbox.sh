@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.25"
+readonly SCRIPT_VERSION="0.0.26"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -67,6 +67,7 @@ NODE_PORT=""
 NODE_PASSWORD=""
 NODE_USERNAME=""
 HTTP_TLS="false"
+SS_TFO=""
 CERT_MODE=""
 WEBROOT=""
 OUTBOUND=""
@@ -418,7 +419,6 @@ def run_cycle(runtime):
         return runtime
 
     results = {}
-    workers = min(MAX_WORKERS, len(nodes))
     probe_items = [(item, item["outbound"]) for item in nodes]
     probe_items += [(item, tag) for item in nodes for tag in item["backups"]]
     with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(probe_items))) as pool:
@@ -438,16 +438,14 @@ def run_cycle(runtime):
         primary_ok, primary_delay, primary_detail = results.get((key, item["outbound"]), (None, None, "missing result"))
         backup_results = {tag: results.get((key, tag), (None, None, "missing result")) for tag in item["backups"]}
 
-        if primary_ok is not None:
-            entry["primary_failures"] = int(entry.get("primary_failures", 0)) + 1 if not primary_ok else 0
-            entry["primary_successes"] = int(entry.get("primary_successes", 0)) + 1 if primary_ok else 0
-            if primary_delay is not None:
-                entry["last_delay_ms"] = primary_delay
+        # 未知结果打断连续计数，避免使用过期结果触发切换。
+        entry["primary_failures"] = int(entry.get("primary_failures", 0)) + 1 if primary_ok is False else 0
+        entry["primary_successes"] = int(entry.get("primary_successes", 0)) + 1 if primary_ok is True else 0
+        if primary_delay is not None:
+            entry["last_delay_ms"] = primary_delay
         for tag, (ok, delay, detail) in backup_results.items():
-            if ok is None:
-                continue
-            entry["backup_failures"][tag] = int(entry["backup_failures"].get(tag, 0)) + 1 if not ok else 0
-            entry["backup_successes"][tag] = int(entry["backup_successes"].get(tag, 0)) + 1 if ok else 0
+            entry["backup_failures"][tag] = int(entry["backup_failures"].get(tag, 0)) + 1 if ok is False else 0
+            entry["backup_successes"][tag] = int(entry["backup_successes"].get(tag, 0)) + 1 if ok is True else 0
 
         current = entry.get("current", "primary")
         if current not in (["primary"] + item["backups"] + ["direct"]):
@@ -455,19 +453,22 @@ def run_cycle(runtime):
         target = None
         if current != "primary" and primary_ok is True and entry["primary_successes"] >= 2:
             target = item["outbound"]
-        elif current == "primary" and entry["primary_failures"] >= 2:
+        elif current == "primary" and primary_ok is False and entry["primary_failures"] >= 2:
             target = next((tag for tag in item["backups"] if backup_results[tag][0] is True), None)
             if target is None and item["direct_fallback"] and all(backup_results[tag][0] is False for tag in item["backups"]):
                 target = "direct"
-        elif current in item["backups"] and backup_results.get(current, (None,))[0] is False and entry["backup_failures"].get(current, 0) >= 2:
-            target = next((tag for tag in item["backups"] if backup_results[tag][0] is True), None)
-            if target is None and item["direct_fallback"] and all(backup_results[tag][0] is False for tag in item["backups"]):
-                target = "direct"
+        elif current in item["backups"]:
+            higher = item["backups"][:item["backups"].index(current)]
+            target = next((tag for tag in higher if backup_results[tag][0] is True and entry["backup_successes"].get(tag, 0) >= 2), None)
+            if target is None and backup_results[current][0] is False and entry["backup_failures"].get(current, 0) >= 2:
+                target = next((tag for tag in item["backups"] if backup_results[tag][0] is True), None)
+                if target is None and item["direct_fallback"] and all(backup_results[tag][0] is False for tag in item["backups"]):
+                    target = "direct"
         elif current == "direct":
             if primary_ok is True and entry["primary_successes"] >= 2:
                 target = item["outbound"]
             else:
-                target = next((tag for tag in item["backups"] if entry["backup_successes"].get(tag, 0) >= 2), None)
+                target = next((tag for tag in item["backups"] if backup_results[tag][0] is True and entry["backup_successes"].get(tag, 0) >= 2), None)
 
         if target and target != current and switch(item["selector"], target):
             old = current
@@ -479,7 +480,7 @@ def run_cycle(runtime):
             elif target == "direct":
                 LOG.warning("节点 %s：主出口和备用出口均不可用，已切换到 Direct", item["name"])
             else:
-                LOG.warning("节点 %s：%s 不可用，已切换到备用出口 %s", item["name"], old, target)
+                LOG.info("节点 %s：出口 %s -> %s（按优先级切换）", item["name"], old, target)
         entry["current"] = current
         entry["last_ok"] = primary_ok
         entry["last_detail"] = primary_detail
@@ -572,7 +573,7 @@ EOF
 }
 
 sync_outbound_health_service() {
-  local count
+  local count previous_script=""
   count=$(outbound_health_node_count)
   if (( count > 0 )); then
     [[ -s "$CONFIG_FILE" ]] || return 0
@@ -580,9 +581,14 @@ sync_outbound_health_service() {
       return 0
     fi
     ensure_outbound_health_secret >/dev/null
+    [[ ! -f "$OUTBOUND_HEALTH_SCRIPT" ]] || previous_script=$(cat "$OUTBOUND_HEALTH_SCRIPT")
     ensure_outbound_health_service_file
     service_enable "$OUTBOUND_HEALTH_SERVICE"
-    service_start "$OUTBOUND_HEALTH_SERVICE" >/dev/null 2>&1 || true
+    if service_is_running "$OUTBOUND_HEALTH_SERVICE" && [[ "$previous_script" != "$(cat "$OUTBOUND_HEALTH_SCRIPT")" ]]; then
+      service_restart "$OUTBOUND_HEALTH_SERVICE" || return 1
+    else
+      service_start "$OUTBOUND_HEALTH_SERVICE" >/dev/null 2>&1 || true
+    fi
   else
     service_disable "$OUTBOUND_HEALTH_SERVICE"
     rm -f "$OUTBOUND_HEALTH_STATE_FILE"
@@ -2682,9 +2688,9 @@ ensure_time_sync_service() {
       case "$PKG_MGR" in
         apt)
           export DEBIAN_FRONTEND=noninteractive
-          apt-get update -y >/dev/null 2>&1 || true
-          apt-get install -y --no-install-recommends systemd-timesyncd >/dev/null 2>&1 || \
-            apt-get install -y --no-install-recommends chrony >/dev/null 2>&1 || true
+          apt_get_minimal update -y >/dev/null 2>&1 || true
+          apt_get_minimal install -y --no-install-recommends systemd-timesyncd || \
+            apt_get_minimal install -y --no-install-recommends chrony || true
           ;;
         dnf|yum)
           $PKG_MGR install -y chrony >/dev/null 2>&1 || true
@@ -2733,7 +2739,7 @@ ensure_systemd_service() {
   ensure_service_file "$@"
 }
 
-install_singbox_binary() {
+install_singbox_binary() (
   local target_ver=${1:-}
   local current_ver=""
   if command -v sing-box >/dev/null 2>&1; then
@@ -2774,9 +2780,13 @@ install_singbox_binary() {
 
   info "正在下载 sing-box v${ver} (linux-${arch}) 核心……"
   local pkg_name="sing-box-${ver}-linux-${arch}"
-  local tar_file="/tmp/${pkg_name}.tar.gz"
-  local tmp_dir="/tmp/${pkg_name}"
-  rm -rf "$tar_file" "$tmp_dir"
+  local bin="" installed_ver u
+  # 在目标分区暂存，校验后直接重命名；不落盘压缩包，也不复制第二份新核心。
+  install -d -m 0755 /usr/local/bin /usr/bin
+  bin=$(mktemp /usr/local/bin/.sing-box.XXXXXX) || die "无法创建核心临时文件，请检查 /usr/local/bin 所在分区的空间和权限。"
+  trap "rm -f -- $(printf '%q' "$bin")" EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   local -a urls=(
     "https://github.com/SagerNet/sing-box/releases/download/v${ver}/${pkg_name}.tar.gz"
@@ -2786,32 +2796,36 @@ install_singbox_binary() {
 
   local dl_ok=0
   for u in "${urls[@]}"; do
-    if curl -fSL --connect-timeout 10 -m 90 "$u" -o "$tar_file" 2>/dev/null && [[ -s "$tar_file" ]]; then
-      dl_ok=1
-      break
+    if curl -fsSL --connect-timeout 10 -m 90 "$u" | tar -xzOf - "${pkg_name}/sing-box" >"$bin"; then
+      if [[ -s "$bin" ]]; then
+        dl_ok=1
+        break
+      fi
     fi
-    rm -f "$tar_file"
+    warn "当前下载源下载或解压失败，尝试下一来源。"
+    : >"$bin" || die "无法写入核心临时文件，请检查磁盘空间和权限。"
   done
 
-  [[ $dl_ok -eq 1 && -s "$tar_file" ]] || die "下载 sing-box 核心失败，请检查服务器网络连接。"
-
-  mkdir -p "$tmp_dir"
-  tar -xzf "$tar_file" -C "$tmp_dir"
-  local bin
-  bin=$(find "$tmp_dir" -type f -name "sing-box" | head -n 1)
-  [[ -n "$bin" && -f "$bin" ]] || die "解压 sing-box 核心失败，未找到二进制文件。"
-
-  install -d -m 0755 /usr/local/bin /usr/bin
-  install -m 0755 "$bin" /usr/local/bin/sing-box
+  if [[ $dl_ok -ne 1 ]]; then
+    df -h /usr/local/bin >&2 || true
+    die "下载或解压 sing-box 核心失败，请检查网络、压缩包及目标分区空间。"
+  fi
+  chmod 0755 "$bin" || die "无法设置核心执行权限。"
+  installed_ver=$("$bin" version 2>/dev/null) || die "新核心无法执行，旧核心未替换，请检查架构兼容性。"
+  [[ -n "$installed_ver" ]] || die "新核心版本校验失败，旧核心未替换。"
+  installed_ver=${installed_ver%%$'\n'*}
+  mv -f "$bin" /usr/local/bin/sing-box || die "替换核心失败，请检查目标分区空间和权限。"
   ln -sf /usr/local/bin/sing-box /usr/bin/sing-box 2>/dev/null || true
-  rm -rf "$tar_file" "$tmp_dir"
-
-  local installed_ver
-  installed_ver=$(sing-box version 2>/dev/null | head -n 1 || true)
-  [[ -n "$installed_ver" ]] || die "sing-box 核心二进制无法执行，请检查系统架构兼容性。"
 
   ensure_service_file
   ok "sing-box 安装就绪：${installed_ver}"
+)
+
+apt_get_minimal() {
+  # 仅覆盖本次调用，不修改系统 APT 配置或清理其他任务的缓存。
+  apt-get -o Acquire::Languages=none -o Acquire::GzipIndexes=true \
+    -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= \
+    -o APT::Keep-Downloaded-Packages=false "$@"
 }
 
 install_dependencies_and_core() {
@@ -2821,29 +2835,25 @@ install_dependencies_and_core() {
   case "$PKG_MGR" in
     apt)
       export DEBIAN_FRONTEND=noninteractive
-      apt-get update -y
-      apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg jq openssl certbot iproute2 nftables cron python3 tar gzip systemd-timesyncd 2>/dev/null || \
-      apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg jq openssl certbot iproute2 nftables cron python3 tar gzip chrony 2>/dev/null || \
-      apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg jq openssl certbot iproute2 nftables cron python3 tar gzip
+      apt_get_minimal update -y || die "更新依赖索引失败，请检查软件源、网络及 /var 分区空间。"
+      apt_get_minimal install -y --no-install-recommends \
+        ca-certificates curl gnupg jq openssl certbot iproute2 nftables cron python3 tar gzip || die "安装依赖失败，请检查上方错误及 /var 分区空间。"
+      # 时间同步依赖由 ensure_time_sync_service 按现有服务情况单独补齐。
       ensure_certbot_environment
       ;;
     dnf)
-      dnf install -y epel-release 2>/dev/null || true
-      dnf install -y ca-certificates curl gnupg2 jq openssl certbot iproute nftables cronie python3 tar gzip chrony
+      dnf --setopt=keepcache=0 install -y epel-release || true
+      dnf --setopt=keepcache=0 install -y ca-certificates curl gnupg2 jq openssl certbot iproute nftables cronie python3 tar gzip chrony
       systemctl enable --now crond >/dev/null 2>&1 || true
       ensure_certbot_environment
       ;;
     yum)
-      yum install -y epel-release 2>/dev/null || true
-      yum install -y ca-certificates curl gnupg2 jq openssl certbot iproute nftables cronie python3 tar gzip chrony
+      yum --setopt=keepcache=0 install -y epel-release || true
+      yum --setopt=keepcache=0 install -y ca-certificates curl gnupg2 jq openssl certbot iproute nftables cronie python3 tar gzip chrony
       systemctl enable --now crond >/dev/null 2>&1 || true
       ensure_certbot_environment
       ;;
     apk)
-      apk update
       apk add --no-cache bash ca-certificates curl gnupg jq openssl certbot iproute2 nftables tzdata python3 tar gzip coreutils dcron gcompat chrony
       rc-update add dcron default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || true
       rc-service dcron start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
@@ -3314,6 +3324,26 @@ collect_ss_settings() {
     fi
     die "Shadowsocks 密码格式无效。"
   fi
+  collect_ss_tfo_settings "$old" || return 1
+}
+
+collect_ss_tfo_settings() {
+  local old=${1:-'{}'}
+  SS_TFO=${SS_TFO:-$(jq -r '.tcp_fast_open // false' <<<"$old")}
+  [[ "$SS_TFO" == "true" || "$SS_TFO" == "false" ]] || die "SS TFO 必须为 true 或 false。"
+  prompt_choice SS_TFO "Shadowsocks TCP Fast Open (TFO)" "$SS_TFO" \
+    "false|关闭" "true|开启（客户端也需支持 TFO）" || return 1
+  [[ "$SS_TFO" == "true" || "$SS_TFO" == "false" ]] || die "SS TFO 选项无效。"
+}
+
+warn_ss_tfo_support() {
+  local value
+  value=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || true)
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    warn "无法确认内核 TFO 状态，SS TFO 能否生效取决于系统支持。"
+  elif (( (10#$value & 2) == 0 )); then
+    warn "SS 已配置开启 TFO，但内核尚未启用服务端 TFO（net.ipv4.tcp_fastopen=${value}）；需另行启用，脚本不会自动修改系统参数。"
+  fi
 }
 
 collect_inbound_settings() {
@@ -3744,8 +3774,8 @@ collect_node_json() {
       ;;
     shadowsocks)
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
-        --arg method "$SS_METHOD" --arg password "$NODE_PASSWORD" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,method:$method,password:$password,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
+        --arg method "$SS_METHOD" --arg password "$NODE_PASSWORD" --argjson tfo "$SS_TFO" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,method:$method,password:$password,tcp_fast_open:$tfo,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     socks5)
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
@@ -3892,6 +3922,7 @@ validate_nodes_state() {
   local state_file=$1 node protocol
   jq -e '(.nodes|type=="array") and (if (.nodes|length > 0) then (([.nodes[].port]|length==(unique|length)) and all(.nodes[]; (.name|type=="string" and length>0) and (.port|type=="number" and floor==. and .>=1 and .<=65535) and (.protocol|IN("anytls","shadowsocks","vless-reality","trojan","hysteria2","socks5","http")) and (.traffic.monthly_limit|type=="string") and (.traffic.reset_day==null or (.traffic.reset_day|type=="number" and floor==. and .>=1 and .<=31)))) else true end)' "$state_file" >/dev/null 2>&1 || die "节点状态校验失败：请检查协议类型、名称、端口、流量配置是否存在冲突或非法值。"
   jq -e 'all(.nodes[]?; ((.backup_outbounds // []) | type == "array") and all((.backup_outbounds // [])[]?; type == "object"))' "$state_file" >/dev/null 2>&1 || die "节点状态校验失败：备用出口列表格式无效。"
+  jq -e 'all(.nodes[]?; (has("tcp_fast_open") | not) or (.tcp_fast_open | type == "boolean"))' "$state_file" >/dev/null 2>&1 || die "节点状态校验失败：tcp_fast_open 必须为布尔值。"
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     protocol=$(jq -r '.protocol' <<<"$node")
@@ -4039,7 +4070,8 @@ generate_config_from_state() {
           listen: "::",
           listen_port: $n.port,
           method: $n.method,
-          password: $n.password
+          password: $n.password,
+          tcp_fast_open: ($n.tcp_fast_open // false)
         }
       elif $n.protocol == "vless-reality" then
         {
@@ -4225,6 +4257,9 @@ apply_config() {
   local candidate=$1 backup="" group
   group=$(service_group)
   sing-box check -c "$candidate" || die "配置校验未通过，已放弃应用更改。"
+  if jq -e 'any(.inbounds[]?; .type == "shadowsocks" and .tcp_fast_open == true)' "$candidate" >/dev/null 2>&1; then
+    warn_ss_tfo_support
+  fi
   backup=$(backup_config)
   install -d -m 0750 -o root -g "$group" "$CONFIG_DIR"
   install -m 0640 -o root -g "$group" "$candidate" "$CONFIG_FILE"
@@ -4753,6 +4788,7 @@ add_node_flow() {
   NODE_PASSWORD=""
   NODE_USERNAME=""
   HTTP_TLS="false"
+  SS_TFO=""
   echo
   info "添加新节点……"
   if ! collect_node_json '{}' node; then
@@ -4917,6 +4953,9 @@ print_node_summary_card() {
   printf "  监听端口: %s\n" "$port"
   printf "  连接地址: %s\n" "$domain"
   printf "  认证凭据: %s\n" "$cred_str"
+  if [[ "$raw_proto" == "shadowsocks" ]]; then
+    printf "  TCP Fast Open: %s\n" "$(if [[ "$(jq -r '.tcp_fast_open // false' <<<"$node")" == "true" ]]; then echo "开启"; else echo "关闭"; fi)"
+  fi
   if [[ -n "$pad_str" ]]; then
     printf "  混淆策略: %s\n" "$pad_str"
   fi
@@ -5021,6 +5060,8 @@ edit_node_protocol() {
       new_pw=${new_pw:-$(generate_ss_password "$new_ss_method")}
       prompt_secret new_pw "Shadowsocks 密码/密钥" "$new_pw"
       validate_ss_password "$new_ss_method" "$new_pw" || { warn "Shadowsocks 密码格式不匹配。"; return 0; }
+      SS_TFO=""
+      collect_ss_tfo_settings "$old" || return 0
       ;;
     vless-reality)
       NODE_UUID=$(jq -r '.uuid // empty' <<<"$old")
@@ -5080,8 +5121,8 @@ edit_node_protocol() {
       ;;
     shadowsocks)
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
-        --arg method "$new_ss_method" --arg password "$new_pw" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,method:$method,password:$password,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
+        --arg method "$new_ss_method" --arg password "$new_pw" --argjson tfo "$SS_TFO" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,method:$method,password:$password,tcp_fast_open:$tfo,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     socks5)
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
@@ -5570,6 +5611,7 @@ edit_node_wizard() {
   HTTP_TLS=$(jq -r '.tls // false' <<<"$old")
   OUTBOUND=""
   SS_METHOD=""
+  SS_TFO=""
 
   echo
   info "完整重新配置节点：$(jq -r '.name' <<<"$old")……"
@@ -5601,6 +5643,17 @@ edit_node_wizard() {
   ok "节点已成功完整重新配置！"
 }
 
+edit_node_tfo() {
+  local index=$1 nodes old
+  nodes=$(current_nodes_json)
+  old=$(jq -c ".[$index]" <<<"$nodes")
+  [[ "$(jq -r '.protocol' <<<"$old")" == "shadowsocks" ]] || return 0
+  SS_TFO=""
+  collect_ss_tfo_settings "$old" || return 0
+  save_nodes_json "$(jq -c --argjson index "$index" --argjson tfo "$SS_TFO" '.[$index].tcp_fast_open = $tfo' <<<"$nodes")"
+  ok "Shadowsocks TFO 配置已更新。"
+}
+
 edit_single_node_menu() {
   local index=$1
   local choice nodes node proto
@@ -5625,8 +5678,12 @@ edit_single_node_menu() {
     printf "  5) 节点名称\n"
     printf "  6) 连接地址\n"
     printf "  7) 流量策略\n"
-    if [[ "$proto" == "anytls" ]]; then
-      printf "  8) 混淆规则 (AnyTLS)\n"
+    if [[ "$proto" == "anytls" || "$proto" == "shadowsocks" ]]; then
+      if [[ "$proto" == "anytls" ]]; then
+        printf "  8) 混淆规则 (AnyTLS)\n"
+      else
+        printf "  8) TCP Fast Open (TFO)\n"
+      fi
       printf "  9) 完整重配\n"
       printf "  0) 返回上级\n"
       read -r -p "请输入选择 [0-9，默认: 0]: " choice
@@ -5636,7 +5693,7 @@ edit_single_node_menu() {
       read -r -p "请输入选择 [0-8，默认: 0]: " choice
     fi
     choice=${choice:-0}
-    if [[ "$proto" == "anytls" ]]; then
+    if [[ "$proto" == "anytls" || "$proto" == "shadowsocks" ]]; then
       case "$choice" in
         1) edit_node_protocol "$index" ;;
         2) edit_node_outbound "$index" ;;
@@ -5645,7 +5702,7 @@ edit_single_node_menu() {
         5) edit_node_name "$index" ;;
         6) edit_node_domain "$index" ;;
         7) edit_node_traffic "$index" ;;
-        8) edit_node_padding_scheme "$index" ;;
+        8) if [[ "$proto" == "anytls" ]]; then edit_node_padding_scheme "$index"; else edit_node_tfo "$index"; fi ;;
         9) edit_node_wizard "$index" ;;
         0|"") return 0 ;;
         *)
@@ -6363,24 +6420,140 @@ get_api_token() {
   jq -r '.token // empty' "$API_CONFIG_FILE" 2>/dev/null || true
 }
 
-install_api_server_script() {
-  install -d -m 0750 "$API_DIR"
-  cat > "$API_SCRIPT_FILE" << 'PY_SERVER_EOF'
+traffic_collector_source() {
+  cat <<'PY_TRAFFIC_EOF'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import http.server
-import socketserver
-import os
-import subprocess
-import urllib.parse
+"""流量 API 与命令行共用的只读采集逻辑，仅使用 Python 标准库。"""
+import datetime
 import json
-import sys
-import time
+import os
+import re
+import subprocess
+from decimal import Decimal
 
-SCRIPT_INSTALL_PATH = os.environ.get("SBOX_SCRIPT_PATH", "/usr/local/bin/sbox")
+
+def traffic_size_bytes(value):
+    value = str(value or "unlimited")
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([a-zA-Z]*)", value)
+    if not match:
+        return 0
+    multipliers = {"B": 1, "K": 1024, "KB": 1024, "M": 1024**2, "MB": 1024**2,
+                   "": 1024**3, "G": 1024**3, "GB": 1024**3, "T": 1024**4, "TB": 1024**4}
+    return int((Decimal(match[1]) * multipliers.get(match[2].upper(), 1)).to_integral_value())
+
+
+def traffic_human_bytes(value):
+    for unit, factor in (("TB", 1024**4), ("GB", 1024**3), ("MB", 1024**2), ("KB", 1024)):
+        if value >= factor:
+            return f"{value / factor:.2f} {unit}"
+    return f"{value} B"
+
+
+def traffic_instance_id():
+    for path in ("/etc/machine-id", "/proc/sys/kernel/random/uuid"):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            continue
+    return "sbox-instance"
+
+
+def traffic_service_status():
+    init_system = os.environ.get("SBOX_INIT_SYSTEM", "systemd")
+    command = (["rc-service", "sing-box", "status"] if init_system == "openrc"
+               else ["systemctl", "is-active", "sing-box.service"])
+    try:
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+        return "active" if result.returncode == 0 else "stopped"
+    except FileNotFoundError:
+        return "stopped"
+
+
+def collect_traffic_snapshot(port_filter=None):
+    state_file = os.environ.get("SBOX_STATE_FILE", "/etc/sbox/state.json")
+    try:
+        with open(state_file, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except FileNotFoundError:
+        state = {"nodes": []}
+    nodes = state.get("nodes", [])
+    if not isinstance(nodes, list):
+        raise ValueError("节点状态格式无效")
+    if port_filter is not None:
+        nodes = [node for node in nodes if str(node.get("port")) == str(port_filter)]
+    counters = {}
+    if nodes:
+        table = os.environ.get("SBOX_NFT_TABLE", "sing_box_traffic")
+        result = subprocess.run(["nft", "-j", "list", "counters", "inet", table],
+                                capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            raise RuntimeError("读取 nftables 流量计数器失败，请检查表是否存在及读取权限")
+        payload = json.loads(result.stdout)
+        if not isinstance(payload.get("nftables"), list):
+            raise ValueError("nftables 返回格式无效")
+        for item in payload["nftables"]:
+            counter = item.get("counter", {})
+            if counter.get("family") == "inet" and counter.get("table") == table and "name" in counter:
+                counters[counter["name"]] = int(counter.get("bytes", 0))
+
+    output_nodes = []
+    total_input = total_output = total_all = 0
+    for node in nodes:
+        port = node["port"]
+        in_bytes = counters.get(f"node_{port}_in", 0)
+        out_bytes = counters.get(f"node_{port}_out", 0)
+        traffic = node.get("traffic") or {}
+        billing = traffic.get("billing_mode") or "single"
+        total = in_bytes + out_bytes if billing == "double" else out_bytes
+        limit = traffic.get("monthly_limit") or "unlimited"
+        limit_bytes = traffic_size_bytes(limit)
+        enabled = limit not in ("unlimited", "0")
+        percent = total * 100 // limit_bytes if enabled and limit_bytes > 0 else None
+        reset_day = traffic.get("reset_day")
+        reset_day = None if reset_day in (None, "") else int(reset_day)
+        output_nodes.append({
+            "name": node.get("name"), "protocol": node.get("protocol") or "anytls",
+            "domain": node.get("domain") or state.get("domain") or "", "port": port,
+            "input_bytes": in_bytes, "output_bytes": out_bytes, "total_bytes": total,
+            "input_formatted": traffic_human_bytes(in_bytes), "output_formatted": traffic_human_bytes(out_bytes),
+            "total_formatted": traffic_human_bytes(total), "billing_mode": billing,
+            "quota": {"enabled": enabled, "monthly_limit": limit, "monthly_limit_bytes": limit_bytes,
+                      "reset_day": reset_day, "used_percent": percent},
+            "is_blocked": percent is not None and percent >= 100,
+        })
+        total_input += in_bytes
+        total_output += out_bytes
+        total_all += total
+    return {
+        "instance_id": traffic_instance_id(), "timestamp": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "service": "sing-box", "status": traffic_service_status(), "total_nodes": len(output_nodes), "nodes": output_nodes,
+        "total_traffic": {"input_bytes": total_input, "output_bytes": total_output, "total_bytes": total_all,
+                          "input_formatted": traffic_human_bytes(total_input), "output_formatted": traffic_human_bytes(total_output),
+                          "total_formatted": traffic_human_bytes(total_all)},
+    }
+PY_TRAFFIC_EOF
+}
+
+install_api_server_script() {
+  install -d -m 0750 "$API_DIR"
+  traffic_collector_source > "$API_SCRIPT_FILE"
+  cat >> "$API_SCRIPT_FILE" << 'PY_SERVER_EOF'
+import http.server
+import socket
+import socketserver
+import urllib.parse
+import threading
+import time
+import sys
+
 API_CONFIG_FILE = os.environ.get("SBOX_API_CONFIG", "/etc/sbox/api.json")
-_CACHE = {}
+_CACHE = None
+_CACHE_TIME = 0.0
 _CACHE_TTL = 2.0
+_CACHE_LOCK = threading.Lock()
+_LAST_ERROR = None
 
 def load_api_config():
     try:
@@ -6391,26 +6564,22 @@ def load_api_config():
         pass
     return {"port": 6666, "host": "0.0.0.0", "token": ""}
 
-def get_traffic_from_script(port=None):
-    now = time.time()
-    cache_key = port or "all"
-    cached = _CACHE.get(cache_key)
-    if cached and (now - cached["time"] < _CACHE_TTL):
-        return cached["data"]
-
-    script = SCRIPT_INSTALL_PATH if os.path.exists(SCRIPT_INSTALL_PATH) else "./sbox.sh"
-    cmd = ["bash", script, "--api-json"]
-    if port:
-        cmd.append(str(port))
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
-        if res.returncode == 0 and res.stdout.strip():
-            parsed = json.loads(res.stdout.strip())
-            _CACHE[cache_key] = {"time": now, "data": parsed}
-            return parsed
-    except Exception as e:
-        return {"error": "ExecutionError", "message": str(e)}
-    return {"error": "FailedToRetrieveData", "message": "Script returned no data"}
+def get_traffic_snapshot():
+    global _CACHE, _CACHE_TIME, _LAST_ERROR
+    # 所有端口共享快照；锁内再次检查缓存，合并同一时刻的并发刷新。
+    with _CACHE_LOCK:
+        if _CACHE is None or time.monotonic() - _CACHE_TIME >= _CACHE_TTL:
+            try:
+                _CACHE = collect_traffic_snapshot()
+                _LAST_ERROR = None
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                if error != _LAST_ERROR:
+                    print("流量采集失败：" + error, file=sys.stderr)
+                _LAST_ERROR = error
+                _CACHE = {"error": "FailedToRetrieveData", "message": "流量采集失败，请检查节点状态、nftables 和服务权限"}
+            _CACHE_TIME = time.monotonic()
+        return _CACHE
 
 class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
@@ -6475,7 +6644,10 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
                 }
             })
         elif path == "/api/status" or path == "/api/health":
-            data = get_traffic_from_script()
+            data = get_traffic_snapshot()
+            if "error" in data:
+                self.send_json(data, 503)
+                return
             self.send_json({
                 "status": "ok",
                 "service": "sing-box",
@@ -6484,8 +6656,8 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
                 "timestamp": data.get("timestamp", "")
             })
         elif path == "/api/traffic" or path == "/api/traffic/all":
-            data = get_traffic_from_script()
-            self.send_json(data)
+            data = get_traffic_snapshot()
+            self.send_json(data, 503 if "error" in data else 200)
         elif path.startswith("/api/traffic/"):
             parts = path.split("/")
             port_str = parts[-1]
@@ -6493,11 +6665,14 @@ class APIHandler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"error": "InvalidPort", "message": "Port must be an integer"}, 400)
                 return
             port = int(port_str)
-            data = get_traffic_from_script(port)
+            data = get_traffic_snapshot()
+            if "error" in data:
+                self.send_json(data, 503)
+                return
             nodes = data.get("nodes", [])
             matched = [n for n in nodes if n.get("port") == port]
             if matched:
-                node_obj = matched[0]
+                node_obj = dict(matched[0])
                 node_obj["instance_id"] = data.get("instance_id")
                 node_obj["timestamp"] = data.get("timestamp")
                 self.send_json(node_obj)
@@ -6531,8 +6706,8 @@ ensure_python3() {
     case "$PKG_MGR" in
       apt)
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y
-        apt-get install -y --no-install-recommends python3
+        apt_get_minimal update -y
+        apt_get_minimal install -y --no-install-recommends python3
         ;;
       dnf)
         dnf install -y python3
@@ -6566,7 +6741,10 @@ After=network.target sing-box.service
 [Service]
 Type=simple
 User=root
-Environment=SBOX_SCRIPT_PATH=${SCRIPT_INSTALL_PATH}
+Environment=SBOX_STATE_FILE=${STATE_FILE}
+Environment=SBOX_NFT_TABLE=${NFT_TABLE}
+Environment=SBOX_INIT_SYSTEM=${INIT_SYSTEM}
+Environment=SBOX_API_CONFIG=${API_CONFIG_FILE}
 ExecStart=${py_bin} ${API_SCRIPT_FILE}
 Restart=always
 RestartSec=5
@@ -6588,7 +6766,10 @@ command_background="yes"
 pidfile="/run/sbox-api.pid"
 output_log="/var/log/sbox-api.log"
 error_log="/var/log/sbox-api.log"
-export SBOX_SCRIPT_PATH="${SCRIPT_INSTALL_PATH}"
+export SBOX_STATE_FILE="${STATE_FILE}"
+export SBOX_NFT_TABLE="${NFT_TABLE}"
+export SBOX_INIT_SYSTEM="${INIT_SYSTEM}"
+export SBOX_API_CONFIG="${API_CONFIG_FILE}"
 
 depend() {
   need net
@@ -6629,6 +6810,8 @@ start_api_service() {
   fi
   local port
   port=$(get_api_port)
+  install_api_server_script
+  ensure_api_service_file
   service_start "$API_SYSTEMD_SERVICE"
   firewall_allow_port "$port" "tcp"
   ok "API 服务已启动。"
@@ -6642,8 +6825,25 @@ stop_api_service() {
 
 restart_api_service() {
   require_root
+  ensure_python3
+  install_api_server_script
+  ensure_api_service_file
   service_restart "$API_SYSTEMD_SERVICE"
   ok "API 服务已重启。"
+}
+
+refresh_api_service() {
+  [[ -f "$API_SCRIPT_FILE" ]] || return 0
+  # 升级旧 API 脚本时保持启停状态，已迁移的服务不重复重启。
+  if ! grep -q '^def get_traffic_snapshot():' "$API_SCRIPT_FILE"; then
+    local running=0
+    service_is_running "$API_SYSTEMD_SERVICE" && running=1
+    install_api_server_script
+    ensure_api_service_file
+    if (( running )); then
+      service_restart "$API_SYSTEMD_SERVICE"
+    fi
+  fi
 }
 
 uninstall_api_service() {
@@ -6671,125 +6871,23 @@ run_api_foreground() {
   local py_bin
   py_bin=$(command -v python3 || echo "python3")
   info "正在前台启动 API 服务测试 (按 Ctrl+C 停止)..."
-  API_PORT="$port" API_HOST="$host" "$py_bin" "$API_SCRIPT_FILE"
+  SBOX_STATE_FILE="$STATE_FILE" SBOX_NFT_TABLE="$NFT_TABLE" SBOX_INIT_SYSTEM="$INIT_SYSTEM" \
+    SBOX_API_CONFIG="$API_CONFIG_FILE" API_PORT="$port" API_HOST="$host" "$py_bin" "$API_SCRIPT_FILE"
 }
 
 get_traffic_json() {
-  local port_filter="${1:-}"
-  local nodes node port in_b out_b b_mode total_b limit day limit_b percent is_blocked
-  local total_input=0 total_output=0 total_all=0 node_count=0
-  local temp_file
-  temp_file=$(mktemp)
-  echo "[]" > "$temp_file"
-
-  nodes=$(current_nodes_json)
-  while IFS= read -r node; do
-    [[ -n "$node" ]] || continue
-    port=$(jq -r '.port' <<<"$node")
-    if [[ -n "$port_filter" && "$port" != "$port_filter" ]]; then
-      continue
-    fi
-
-    in_b=$(traffic_counter_value "$port" in 2>/dev/null || echo 0)
-    out_b=$(traffic_counter_value "$port" out 2>/dev/null || echo 0)
-    in_b=${in_b:-0}
-    out_b=${out_b:-0}
-    b_mode=$(jq -r '.traffic.billing_mode // "single"' <<<"$node")
-    if [[ "$b_mode" == "double" ]]; then
-      total_b=$((in_b + out_b))
-    else
-      total_b=$out_b
-    fi
-
-    limit=$(jq -r '.traffic.monthly_limit // "unlimited"' <<<"$node")
-    day=$(jq -r '.traffic.reset_day // empty' <<<"$node")
-    limit_b=$(size_to_bytes "$limit")
-    percent="-"
-    is_blocked=false
-    if [[ "$limit" != "unlimited" && "$limit" != "0" && "$limit_b" -gt 0 ]]; then
-      percent=$((total_b * 100 / limit_b))
-      if [[ $percent -ge 100 ]]; then
-        is_blocked=true
-      fi
-    fi
-
-    total_input=$((total_input + in_b))
-    total_output=$((total_output + out_b))
-    total_all=$((total_all + total_b))
-    node_count=$((node_count + 1))
-
-    jq --arg name "$(jq -r '.name' <<<"$node")" \
-       --arg protocol "$(jq -r '.protocol' <<<"$node")" \
-       --arg domain "$(jq -r '.domain' <<<"$node")" \
-       --argjson port "$port" \
-       --argjson input_bytes "$in_b" \
-       --argjson output_bytes "$out_b" \
-       --argjson total_bytes "$total_b" \
-       --arg input_formatted "$(bytes_to_human "$in_b")" \
-       --arg output_formatted "$(bytes_to_human "$out_b")" \
-       --arg total_formatted "$(bytes_to_human "$total_b")" \
-       --arg billing_mode "$b_mode" \
-       --arg monthly_limit "$limit" \
-       --argjson monthly_limit_bytes "$limit_b" \
-       --arg reset_day "${day:-null}" \
-       --arg percent "$percent" \
-       --argjson is_blocked "$is_blocked" \
-       '. += [{
-         name: $name,
-         protocol: $protocol,
-         domain: $domain,
-         port: $port,
-         input_bytes: $input_bytes,
-         output_bytes: $output_bytes,
-         total_bytes: $total_bytes,
-         input_formatted: $input_formatted,
-         output_formatted: $output_formatted,
-         total_formatted: $total_formatted,
-         billing_mode: $billing_mode,
-         quota: {
-           enabled: ($monthly_limit != "unlimited" and $monthly_limit != "0"),
-           monthly_limit: $monthly_limit,
-           monthly_limit_bytes: $monthly_limit_bytes,
-           reset_day: (if $reset_day == "null" or $reset_day == "" then null else ($reset_day|tonumber) end),
-           used_percent: (if $percent == "-" then null else ($percent|tonumber) end)
-         },
-         is_blocked: $is_blocked
-       }]' "$temp_file" > "${temp_file}.tmp" && mv "${temp_file}.tmp" "$temp_file"
-  done < <(jq -c '.[]?' <<<"$nodes")
-
-  local inst_id
-  inst_id=$(cat /etc/machine-id 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "sbox-instance")
-  local now_iso
-  now_iso=$(date -Iseconds 2>/dev/null || date +%Y-%m-%dT%H:%M:%S%z)
-
-  jq --arg instance_id "$inst_id" \
-     --arg timestamp "$now_iso" \
-     --arg service_status "$(if service_is_running; then echo "active"; else echo "stopped"; fi)" \
-     --argjson total_nodes "$node_count" \
-     --argjson total_input "$total_input" \
-     --argjson total_output "$total_output" \
-     --argjson total_all "$total_all" \
-     --arg input_formatted "$(bytes_to_human "$total_input")" \
-     --arg output_formatted "$(bytes_to_human "$total_output")" \
-     --arg total_formatted "$(bytes_to_human "$total_all")" \
-     '{
-       instance_id: $instance_id,
-       timestamp: $timestamp,
-       service: "sing-box",
-       status: $service_status,
-       total_nodes: $total_nodes,
-       nodes: .,
-       total_traffic: {
-         input_bytes: $total_input,
-         output_bytes: $total_output,
-         total_bytes: $total_all,
-         input_formatted: $input_formatted,
-         output_formatted: $output_formatted,
-         total_formatted: $total_formatted
-       }
-     }' "$temp_file"
-
-  rm -f "$temp_file"
+  local port_filter="${1:-}" collector
+  command -v python3 >/dev/null 2>&1 || die "流量查询需要 Python3，请先安装脚本依赖。"
+  detect_init_system
+  collector=$(traffic_collector_source)
+  SBOX_STATE_FILE="$STATE_FILE" SBOX_NFT_TABLE="$NFT_TABLE" SBOX_INIT_SYSTEM="$INIT_SYSTEM" \
+    python3 -c "${collector}"$'\n''import sys
+try:
+    print(json.dumps(collect_traffic_snapshot(sys.argv[1] or None), ensure_ascii=False))
+except Exception as exc:
+    print("流量采集失败：" + str(exc), file=sys.stderr)
+    sys.exit(1)
+' "$port_filter"
 }
 
 api_service_menu() {
@@ -7788,6 +7886,8 @@ usage() {
 
 常用参数：
   --protocol PROTOCOL     协议类型 (anytls / shadowsocks / trojan / hysteria2 / vless-reality / socks5 / http)
+  --ss-tfo                Shadowsocks 入站开启 TCP Fast Open
+  --no-ss-tfo             Shadowsocks 入站关闭 TCP Fast Open (默认)
   --domain DOMAIN         节点域名或 IP
   --port PORT             监听端口
   --password PASS         密码或预共享密钥
@@ -7820,6 +7920,8 @@ parse_options() {
       --username) [[ $# -ge 2 ]] || die "--username 缺少值"; NODE_USERNAME=$2; shift 2;;
       --http-tls) HTTP_TLS="true"; shift;;
       --no-http-tls) HTTP_TLS="false"; shift;;
+      --ss-tfo) SS_TFO="true"; shift;;
+      --no-ss-tfo) SS_TFO="false"; shift;;
       --cert-mode) [[ $# -ge 2 ]] || die "--cert-mode 缺少值"; CERT_MODE=$2; shift 2;;
       --webroot) [[ $# -ge 2 ]] || die "--webroot 缺少值"; WEBROOT=$2; shift 2;;
       --outbound) [[ $# -ge 2 ]] || die "--outbound 缺少值"; OUTBOUND=$2; shift 2;;
@@ -7935,6 +8037,7 @@ main() {
       ensure_state_schema
       migrate_outbound_health_config 2>/dev/null || true
       sync_outbound_health_service 2>/dev/null || true
+      refresh_api_service
       exit 0
       ;;
     --check-traffic-reset)
