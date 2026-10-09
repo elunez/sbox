@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.32"
+readonly SCRIPT_VERSION="0.0.33"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -68,6 +68,8 @@ NODE_PASSWORD=""
 NODE_USERNAME=""
 HTTP_TLS="false"
 SS_TFO=""
+DNS_MODE=""
+DNS_SERVER=""
 SS_OUTBOUND_TFO=""
 CERT_MODE=""
 WEBROOT=""
@@ -407,6 +409,7 @@ def configured_nodes():
             "outbound": "out-" + str(index + 1),
             "backups": ["backup-" + str(index + 1) + "-" + str(pos + 1) for pos, backup in enumerate(configured_backups) if backup.get("type", "direct") != "direct"],
             "direct_fallback": any(item.get("type", "direct") == "direct" for item in configured_backups),
+            "direct_outbound": "direct-" + str(index + 1),
             "selector": "health-" + str(index + 1),
         })
     return result
@@ -471,7 +474,8 @@ def run_cycle(runtime):
             else:
                 target = next((tag for tag in item["backups"] if backup_results[tag][0] is True and entry["backup_successes"].get(tag, 0) >= 2), None)
 
-        if target and target != current and switch(item["selector"], target):
+        switch_target = item.get("direct_outbound", "direct") if target == "direct" else target
+        if target and target != current and switch(item["selector"], switch_target):
             old = current
             # 运行状态使用 primary 表示主出口，避免把实际 sing-box tag
             # 当作下一轮状态值，导致状态在恢复后的首轮被重新归一化。
@@ -616,7 +620,7 @@ outbound_health_config_ready() {
           ($node.backup_outbounds // []) | to_entries[] |
           select((.value.type // "direct") != "direct") |
           "backup-" + (($node_index + 1) | tostring) + "-" + ((.key + 1) | tostring)
-        ] + (if any(($node.backup_outbounds // [])[]?; (.type // "direct") == "direct") then ["direct"] else [] end)),
+        ] + (if any(($node.backup_outbounds // [])[]?; (.type // "direct") == "direct") then ["direct-" + (($node_index + 1) | tostring)] else [] end)),
         default: ("out-" + (($node_index + 1) | tostring)),
         interrupt_exist_connections: true
       },
@@ -628,7 +632,8 @@ outbound_health_config_ready() {
     }
   ) | {selectors: ([.[].selector] | sort_by(.tag)), routes: ([.[].route] | sort_by(.outbound))}' "$STATE_FILE" 2>/dev/null) || return 1
   [[ -r "$OUTBOUND_HEALTH_SECRET_FILE" ]] && health_secret=$(tr -d '\r\n' <"$OUTBOUND_HEALTH_SECRET_FILE")
-  jq -e --arg addr "$OUTBOUND_HEALTH_API_ADDR" --arg secret "$health_secret" --argjson expected "$expected" '
+  jq -e --arg addr "$OUTBOUND_HEALTH_API_ADDR" --arg secret "$health_secret" --argjson expected "$expected" \
+    --argjson dns_level "$(singbox_dns_level)" --slurpfile state "$STATE_FILE" '
     ([.outbounds[]? | select((.tag // "") | startswith("health-")) | {
       type, tag, outbounds: (.outbounds // []), default: (.default // ""),
       interrupt_exist_connections: (.interrupt_exist_connections // false)
@@ -643,6 +648,23 @@ outbound_health_config_ready() {
       and (.experimental.clash_api.external_controller == $addr)
       and (.experimental.clash_api.secret == $secret)
     end)
+    and any(.dns.servers[]?; .tag == "sbox-system" and
+      (if $dns_level >= 1 then .type == "local" and (if $dns_level >= 2 then .prefer_go == true else .prefer_go == null end) else .address == "local" end))
+    and (if $dns_level < 3 then .dns.independent_cache == true else .dns.independent_cache == null end)
+    and (([.dns.servers[]? | select(.tag | startswith("dns-")) | {tag,server:(.server // .address)}] | sort_by(.tag)) ==
+      ([$state[0].nodes | to_entries[] | select((.value.dns.mode // "system") == "custom") |
+        {tag:("dns-" + ((.key + 1)|tostring)),server:(if $dns_level >= 1 then .value.dns.server else
+          (if (.value.dns.server | contains(":")) then "udp://[" + .value.dns.server + "]:53" else "udp://" + .value.dns.server + ":53" end) end)}] | sort_by(.tag)))
+    and (if $dns_level >= 1 then .route.default_domain_resolver == "sbox-system" and
+      (([.outbounds[]? | select(.type != "selector" and .type != "block") | {tag,domain_resolver}] | sort_by(.tag)) ==
+        ([{tag:"direct",domain_resolver:"sbox-system"}] + [$state[0].nodes | to_entries[] | .key as $i | .value as $n |
+          (if ($n.dns.mode // "system") == "custom" then "dns-" + (($i + 1)|tostring) else "sbox-system" end) as $resolver |
+          {tag:("out-" + (($i + 1)|tostring)),domain_resolver:$resolver},
+          (($n.backup_outbounds // []) | to_entries[] | select((.value.type // "direct") != "direct") |
+            {tag:("backup-" + (($i + 1)|tostring) + "-" + ((.key + 1)|tostring)),domain_resolver:$resolver}),
+          (if ($n.outbound.type // "direct") != "direct" and any(($n.backup_outbounds // [])[]?; (.type // "direct") == "direct") then
+            {tag:("direct-" + (($i + 1)|tostring)),domain_resolver:$resolver} else empty end)] | sort_by(.tag)))
+      else all(.outbounds[]?; .domain_resolver == null) end)
   ' "$CONFIG_FILE" >/dev/null 2>&1
 }
 
@@ -655,7 +677,7 @@ migrate_outbound_health_config() {
     return 1
   fi
   if command -v sing-box >/dev/null 2>&1 && sing-box check -c "$candidate" >/dev/null 2>&1; then
-    info "检测到出口健康路由需要同步，正在更新配置并平滑重载……"
+    info "检测到 DNS 或出口健康路由需要同步，正在更新配置并平滑重载……"
     apply_config "$candidate"
   fi
   rm -f "$candidate"
@@ -3733,9 +3755,61 @@ collect_backup_outbounds() {
   printf -v "$target" '%s' "$backups"
 }
 
+validate_dns_settings() {
+  local settings=$1 server
+  jq -e 'type == "object" and (.mode | IN("system", "custom")) and
+    (if .mode == "custom" then (.server | type == "string" and length > 0) else true end)' <<<"$settings" >/dev/null 2>&1 || return 1
+  [[ "$(jq -r '.mode' <<<"$settings")" == "system" ]] && return 0
+  server=$(jq -r '.server' <<<"$settings")
+  # 自定义 DNS 仅接受 IP，避免解析 DNS 服务器域名时形成循环依赖。
+  python3 - "$server" <<'PY_DNS_IP'
+import ipaddress, sys
+try:
+    if '%' in sys.argv[1]:
+        raise ValueError('不支持带接口范围的地址')
+    ipaddress.ip_address(sys.argv[1])
+except ValueError:
+    sys.exit(1)
+PY_DNS_IP
+}
+
+collect_dns_settings() {
+  local old=${1:-'{}'} target=$2 selected_mode selected_server settings
+  selected_mode=${DNS_MODE:-$(jq -r '.dns.mode // "system"' <<<"$old")}
+  selected_server=${DNS_SERVER:-$(jq -r '.dns.server // empty' <<<"$old")}
+  [[ "$selected_mode" == "system" || "$selected_mode" == "custom" ]] || die "DNS 模式仅支持 system 或 custom。"
+  prompt_choice selected_mode "节点 DNS" "$selected_mode" \
+    "system|系统 DNS (默认)" "custom|自定义 DNS" || return 1
+  [[ "$selected_mode" == "system" || "$selected_mode" == "custom" ]] || { warn "DNS 模式无效。"; return 1; }
+  if [[ "$selected_mode" == "custom" ]]; then
+    while true; do
+      prompt_value selected_server "DNS 服务器 IP (IPv4 或 IPv6，UDP 53)" "$selected_server"
+      settings=$(jq -cn --arg server "$selected_server" '{mode:"custom",server:$server}')
+      if validate_dns_settings "$settings"; then break; fi
+      warn "DNS 服务器必须是有效的 IPv4 或 IPv6 地址。"
+      (( NON_INTERACTIVE )) && return 1
+    done
+  else
+    settings='{"mode":"system"}'
+  fi
+  printf -v "$target" '%s' "$settings"
+}
+
+singbox_dns_level() {
+  local version
+  version=$(sing-box version 2>/dev/null || true)
+  # 1.12 引入新 DNS 格式，1.13 支持 prefer_go，1.14 自动隔离 DNS 缓存。
+  if [[ "$version" =~ sing-box\ version\ ([0-9]+)\.([0-9]+)\. ]]; then
+    if (( BASH_REMATCH[1] > 1 || (BASH_REMATCH[1] == 1 && BASH_REMATCH[2] >= 14) )); then printf 3; return; fi
+    if (( BASH_REMATCH[1] > 1 || (BASH_REMATCH[1] == 1 && BASH_REMATCH[2] >= 13) )); then printf 2; return; fi
+    if (( BASH_REMATCH[1] == 1 && BASH_REMATCH[2] >= 12 )); then printf 1; return; fi
+  fi
+  printf 0
+}
+
 collect_node_json() {
   local old=${1:-} target=${2:-}
-  local default_protocol default_domain traffic outbound backup_outbounds='[]' default_port node_json
+  local default_protocol default_domain traffic outbound backup_outbounds='[]' default_port node_json node_dns
   default_protocol=$(jq -r '.protocol // "anytls"' <<<"${old:-"{}"}")
   default_domain=$(jq -r '.domain // empty' <<<"${old:-"{}"}")
   PROTOCOL="${PROTOCOL:-$default_protocol}"
@@ -3825,6 +3899,7 @@ collect_node_json() {
   prompt_value NODE_PORT "监听端口 (Port)" "$NODE_PORT"
   validate_port "$NODE_PORT" || die "监听端口无效。"
   collect_inbound_settings "$old" || return 1
+  collect_dns_settings "${old:-'{}'}" node_dns || return 1
   echo
   info "配置流量管理与配额策略……"
   collect_traffic_settings "$old" traffic || return 1
@@ -3875,6 +3950,7 @@ collect_node_json() {
         '{name:$name,protocol:$protocol,domain:$domain,port:$port,password:$password,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
   esac
+  node_json=$(jq -c --argjson dns "$node_dns" '.dns = $dns' <<<"$node_json")
   if [[ -n "$target" ]]; then
     printf -v "$target" "%s" "$node_json"
   else
@@ -3909,7 +3985,8 @@ ensure_state_schema() {
             download: (.traffic.rate_limit.download // null)
           })
         }),
-        outbound: (if (.outbound.type // "direct") == "ss" then (.outbound + {type:"shadowsocks"}) else (.outbound // {type:"direct"}) end)
+        outbound: (if (.outbound.type // "direct") == "ss" then (.outbound + {type:"shadowsocks"}) else (.outbound // {type:"direct"}) end),
+        dns: (if has("dns") then .dns else {mode:"system"} end)
       } |
       .backup_outbounds = (
         [.backup_outbounds[]? | select(type == "object" and (.type // "direct") != "direct")]
@@ -3999,6 +4076,7 @@ validate_nodes_state() {
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     protocol=$(jq -r '.protocol' <<<"$node")
+    validate_dns_settings "$(jq -c 'if has("dns") then .dns else {mode:"system"} end' <<<"$node")" || die "节点 DNS 配置无效：请选择系统 DNS，或填写自定义 DNS 的 IPv4 / IPv6 地址。"
     local rate_limit_value
     for rate_limit_value in "$(jq -r '.traffic.rate_limit.upload // empty' <<<"$node")" "$(jq -r '.traffic.rate_limit.download // empty' <<<"$node")"; do
       [[ -z "$rate_limit_value" ]] || validate_rate_limit "$rate_limit_value" || die "节点 [$(jq -r '.name' <<<"$node")] 端口限速格式无效：${rate_limit_value}。"
@@ -4110,12 +4188,14 @@ get_default_padding_scheme_json() {
 generate_config_from_state() {
   local output=$1 state_file=${2:-$STATE_FILE}
   validate_nodes_state "$state_file"
-  local default_pad health_api_secret=""
+  local default_pad health_api_secret="" dns_level
+  dns_level=$(singbox_dns_level)
   default_pad=$(get_default_padding_scheme_json)
   if jq -e 'any(.nodes[]?; (.outbound.type // "direct") != "direct" and ((.backup_outbounds // []) | length > 0))' "$state_file" >/dev/null 2>&1; then
     health_api_secret=$(ensure_outbound_health_secret)
   fi
   jq --arg cert_dir "$CERT_DIR" \
+    --argjson dns_level "$dns_level" \
     --arg health_api_addr "$OUTBOUND_HEALTH_API_ADDR" \
     --arg health_api_secret "$health_api_secret" \
     --argjson default_pad "$default_pad" '
@@ -4282,22 +4362,41 @@ generate_config_from_state() {
       else
         {type: "direct", tag: ("out-" + (($i + 1)|tostring))}
       end;
+    def dns_tag($n; $i):
+      if ($n.dns.mode // "system") == "custom" then "dns-" + (($i + 1)|tostring) else "sbox-system" end;
+    def with_dns($n; $i):
+      . + (if $dns_level >= 1 then {domain_resolver: dns_tag($n; $i)} else {domain_strategy:"prefer_ipv4"} end);
     .nodes as $nodes | {
       log: {level: (.log_level // "warn"), timestamp: true},
+      dns: ({
+        servers: (
+          [(if $dns_level >= 1 then
+            {type:"local",tag:"sbox-system"} + (if $dns_level >= 2 then {prefer_go:true} else {} end)
+          else {tag:"sbox-system",address:"local"} end)]
+          + [$nodes | to_entries[] | select((.value.dns.mode // "system") == "custom") |
+            if $dns_level >= 1 then {type:"udp",tag:dns_tag(.value; .key),server:.value.dns.server}
+            else {tag:dns_tag(.value; .key),address:(if (.value.dns.server | contains(":")) then "udp://[" + .value.dns.server + "]:53" else "udp://" + .value.dns.server + ":53" end),detour:"direct"} end]
+        ),
+        rules: (if $dns_level >= 1 then [] else [$nodes | to_entries[] | .key as $i | .value as $n |
+          {inbound:["in-" + (($i + 1)|tostring)],server:dns_tag($n; $i)},
+          {outbound:(["out-" + (($i + 1)|tostring), "direct-" + (($i + 1)|tostring)] + [($n.backup_outbounds // []) | to_entries[] | select((.value.type // "direct") != "direct") | "backup-" + (($i + 1)|tostring) + "-" + ((.key + 1)|tostring)]),server:dns_tag($n; $i)}] end),
+        final:"sbox-system"
+      } + (if $dns_level < 3 then {independent_cache:true} else {} end)),
       inbounds: ([$nodes | to_entries[] | inbound(.value; .key)]),
       outbounds: (
-        ([$nodes | to_entries[] | outbound(.value.outbound; .key; "out")])
-        + ([$nodes | to_entries[] | .key as $node_index | .value.backup_outbounds // [] | to_entries[] | select((.value.type // "direct") != "direct") | outbound(.value; .key; ("backup-" + (($node_index + 1)|tostring)))])
+        ([$nodes | to_entries[] | .value as $n | .key as $i | outbound($n.outbound; $i; "out") | with_dns($n; $i)])
+        + ([$nodes | to_entries[] | .key as $node_index | .value as $n | .value.backup_outbounds // [] | to_entries[] | select((.value.type // "direct") != "direct") | outbound(.value; .key; ("backup-" + (($node_index + 1)|tostring))) | with_dns($n; $node_index)])
+        + ([$nodes | to_entries[] | select((.value.outbound.type // "direct") != "direct" and any((.value.backup_outbounds // [])[]?; (.type // "direct") == "direct")) | .value as $n | .key as $i | {type:"direct",tag:("direct-" + (($i + 1)|tostring))} | with_dns($n; $i)])
         + ([$nodes | to_entries[] | .key as $node_index | select((.value.outbound.type // "direct") != "direct" and ((.value.backup_outbounds // []) | length > 0)) | {
             type: "selector",
             tag: ("health-" + ((.key + 1)|tostring)),
-            outbounds: ([("out-" + (($node_index + 1)|tostring))] + [(.value.backup_outbounds // []) | to_entries[] | select((.value.type // "direct") != "direct") | "backup-" + (($node_index + 1)|tostring) + "-" + ((.key + 1)|tostring)] + (if any((.value.backup_outbounds // [])[]?; (.type // "direct") == "direct") then ["direct"] else [] end)),
+            outbounds: ([("out-" + (($node_index + 1)|tostring))] + [(.value.backup_outbounds // []) | to_entries[] | select((.value.type // "direct") != "direct") | "backup-" + (($node_index + 1)|tostring) + "-" + ((.key + 1)|tostring)] + (if any((.value.backup_outbounds // [])[]?; (.type // "direct") == "direct") then ["direct-" + (($node_index + 1)|tostring)] else [] end)),
             default: ("out-" + ((.key + 1)|tostring)),
             interrupt_exist_connections: true
           }])
-        + [{type: "direct", tag: "direct"}, {type: "block", tag: "block"}]
+        + [({type: "direct", tag: "direct"} | with_dns({}; 0)), {type: "block", tag: "block"}]
       ),
-      route: {
+      route: ({
         rules: ([$nodes | to_entries[] | {
           inbound: [("in-" + ((.key + 1)|tostring))],
           action: "route",
@@ -4308,7 +4407,7 @@ generate_config_from_state() {
           end)
         }]),
         final: "direct"
-      },
+      } + (if $dns_level >= 1 then {default_domain_resolver:"sbox-system"} else {} end)),
       experimental: (if any($nodes[]?; (.outbound.type // "direct") != "direct" and ((.backup_outbounds // []) | length > 0)) then {
         clash_api: {
           external_controller: $health_api_addr,
@@ -5037,6 +5136,7 @@ print_node_summary_card() {
     printf "  混淆策略: %s\n" "$pad_str"
   fi
   printf "  出口分流: %s\n" "$out_str"
+  printf "  DNS 设置: %s\n" "$(jq -r 'if (.dns.mode // "system") == "custom" then "自定义 (" + .dns.server + ", UDP 53)" else "系统 DNS" end' <<<"$node")"
   printf "  流量策略: %s\n" "$traf_str"
   printf "%s====================================================================%s\n" "$C_CYAN" "$C_RESET"
 }
@@ -5228,6 +5328,7 @@ edit_node_protocol() {
       ;;
   esac
 
+  new_node=$(jq -c --argjson dns "$(jq -c '.dns // {mode:"system"}' <<<"$old")" '.dns = $dns' <<<"$new_node")
   if ! ensure_node_certificate "$new_node"; then
     warn "已取消证书配置，放弃协议修改。"
     return 0
@@ -5731,6 +5832,15 @@ edit_node_tfo() {
   ok "Shadowsocks TFO 配置已更新。"
 }
 
+edit_node_dns() {
+  local index=$1 nodes old node_dns
+  nodes=$(current_nodes_json)
+  old=$(jq -c ".[$index]" <<<"$nodes")
+  collect_dns_settings "$old" node_dns || return 0
+  save_nodes_json "$(jq -c --argjson index "$index" --argjson dns "$node_dns" '.[$index].dns = $dns' <<<"$nodes")"
+  ok "节点 DNS 设置已更新。"
+}
+
 edit_single_node_menu() {
   local index=$1
   local choice nodes node proto
@@ -5762,12 +5872,14 @@ edit_single_node_menu() {
         printf "  8) TCP Fast Open (TFO)\n"
       fi
       printf "  9) 完整重配\n"
+      printf " 10) DNS 设置\n"
       printf "  0) 返回上级\n"
-      read -r -p "请输入选择 [0-9，默认: 0]: " choice
+      read -r -p "请输入选择 [0-10，默认: 0]: " choice
     else
       printf "  8) 完整重配\n"
+      printf "  9) DNS 设置\n"
       printf "  0) 返回上级\n"
-      read -r -p "请输入选择 [0-8，默认: 0]: " choice
+      read -r -p "请输入选择 [0-9，默认: 0]: " choice
     fi
     choice=${choice:-0}
     if [[ "$proto" == "anytls" || "$proto" == "shadowsocks" ]]; then
@@ -5781,6 +5893,7 @@ edit_single_node_menu() {
         7) edit_node_traffic "$index" ;;
         8) if [[ "$proto" == "anytls" ]]; then edit_node_padding_scheme "$index"; else edit_node_tfo "$index"; fi ;;
         9) edit_node_wizard "$index" ;;
+        10) edit_node_dns "$index" ;;
         0|"") return 0 ;;
         *)
           warn "无效选择。"
@@ -5797,6 +5910,7 @@ edit_single_node_menu() {
         6) edit_node_domain "$index" ;;
         7) edit_node_traffic "$index" ;;
         8) edit_node_wizard "$index" ;;
+        9) edit_node_dns "$index" ;;
         0|"") return 0 ;;
         *)
           warn "无效选择。"
@@ -7974,6 +8088,8 @@ usage() {
   --no-ss-tfo             Shadowsocks 入站关闭 TCP Fast Open (默认)
   --ss-outbound-tfo       Shadowsocks 出站开启 TCP Fast Open
   --no-ss-outbound-tfo    Shadowsocks 出站关闭 TCP Fast Open (默认)
+  --dns-mode MODE         节点 DNS 模式 (system / custom，默认 system)
+  --dns-server IP         自定义 DNS 服务器 IP (UDP 53)
   --domain DOMAIN         节点域名或 IP
   --port PORT             监听端口
   --password PASS         密码或预共享密钥
@@ -8010,6 +8126,8 @@ parse_options() {
       --no-ss-tfo) SS_TFO="false"; shift;;
       --ss-outbound-tfo) SS_OUTBOUND_TFO="true"; shift;;
       --no-ss-outbound-tfo) SS_OUTBOUND_TFO="false"; shift;;
+      --dns-mode) [[ $# -ge 2 ]] || die "--dns-mode 缺少值"; DNS_MODE=$2; [[ "$DNS_MODE" == "system" || "$DNS_MODE" == "custom" ]] || die "DNS 模式仅支持 system 或 custom。"; shift 2;;
+      --dns-server) [[ $# -ge 2 ]] || die "--dns-server 缺少值"; DNS_SERVER=$2; shift 2;;
       --cert-mode) [[ $# -ge 2 ]] || die "--cert-mode 缺少值"; CERT_MODE=$2; shift 2;;
       --webroot) [[ $# -ge 2 ]] || die "--webroot 缺少值"; WEBROOT=$2; shift 2;;
       --outbound) [[ $# -ge 2 ]] || die "--outbound 缺少值"; OUTBOUND=$2; shift 2;;

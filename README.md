@@ -88,6 +88,10 @@ sudo env SBOX_DOWNLOAD_MIRROR=https://gh.zyun.vip sbox upgrade     # 优先指�
 sudo env SBOX_DOWNLOAD_TIMEOUT=1200 sbox upgrade                 # 每个来源最多 20 分钟
 ```
 
+新增节点时可选择系统 DNS（默认）或自定义 DNS；已有节点可在「节点管理 → 修改配置 → DNS 设置」中修改。自定义模式填写一个 IPv4 或 IPv6 地址，使用 UDP 53。选择保存在节点状态中，主出口、备用出口及 Direct 回退使用该节点的 DNS；代理出口的 DNS 用于解析代理服务器地址，目标域名若交给远端代理解析，则由远端决定 DNS。修改其他节点字段或完整重配时保留已有选择，不修改系统 `/etc/resolv.conf`，也不写入客户端分享链接。
+
+sing-box 1.13 及以上的系统 DNS 使用 `prefer_go`，避免依赖不可用的 `systemd-resolved`；1.12 使用新版本地 DNS 字段，更早版本使用旧版字段。旧节点没有 DNS 字段时按系统 DNS 处理。非交互安装可使用 `--dns-mode custom --dns-server 1.1.1.1`，或 `--dns-mode system`。
+
 安装完成后，脚本会自动安装至系统 PATH，后续随时在任意终端输入快捷命令即可唤出管理面板：
 
 ```bash

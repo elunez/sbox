@@ -118,6 +118,29 @@ class HealthTests(unittest.TestCase):
             state = self.cycle(state, False, [False, True, True])
         self.assertEqual(state["8388"]["current"], self.tags[2])
 
+    def test_direct_switch_uses_node_resolver_outbound_and_can_recover(self):
+        self.item.update(direct_fallback=True, direct_outbound="direct-1")
+        state = self.runtime("primary")
+        for _ in range(2):
+            state = self.cycle(state, False, [False, False, False])
+        self.assertEqual(self.switches, ["direct-1"])
+        self.assertEqual(state["8388"]["current"], "direct")
+        for _ in range(2):
+            state = self.cycle(state, True, [False, False, False])
+        self.assertEqual(self.switches, ["direct-1", "out-1"])
+        self.assertEqual(state["8388"]["current"], "primary")
+
+    def test_monitor_direct_tags_follow_node_index(self):
+        health = module(heredoc("PY_OUTBOUND_HEALTH_EOF"))
+        health.read_json = lambda *args: {"nodes": [
+            {"outbound": {"type": "direct"}},
+            {"port": 8389, "outbound": {"type": "shadowsocks"},
+             "backup_outbounds": [{"type": "shadowsocks"}, {"type": "direct"}]}]}
+        item = health.configured_nodes()[0]
+        self.assertEqual(item["direct_outbound"], "direct-2")
+        self.assertEqual(item["selector"], "health-2")
+        self.assertEqual(item["backups"], ["backup-2-1"])
+
     def test_probe_classifies_api_errors_as_unknown(self):
         for status, expected in ((200, True), (408, False), (504, False), (503, None), (401, None)):
             with self.subTest(status=status):
@@ -239,6 +262,179 @@ class ShellTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.directory = Path(self.tmp.name)
+
+    def dns_node(self, port=8388, dns=None):
+        node = {"name": "DNS", "protocol": "socks5", "domain": "example.com", "port": port,
+                "traffic": {"monthly_limit": "unlimited"}, "outbound": {"type": "direct"}}
+        if dns is not None:
+            node["dns"] = dns
+        return node
+
+    def test_dns_validation_rejects_invalid_state_before_generation(self):
+        state = self.directory / "state.json"
+        output = self.directory / "config.json"
+        for settings, valid in (({"mode": "system"}, True),
+                                ({"mode": "custom", "server": "1.1.1.1"}, True),
+                                ({"mode": "custom", "server": "2606:4700:4700::1111"}, True),
+                                (None, False), ({"mode": "other"}, False),
+                                ({"mode": "custom", "server": "dns.google"}, False),
+                                ({"mode": "custom", "server": "udp://1.1.1.1"}, False),
+                                ({"mode": "custom", "server": "fe80::1%eth0"}, False),
+                                ({"mode": "custom", "server": "999.1.1.1"}, False),
+                                ({"mode": "custom", "server": 123}, False)):
+            with self.subTest(settings=settings):
+                node = self.dns_node()
+                node["dns"] = settings
+                state.write_text(json.dumps({"nodes": [node]}))
+                result = bash(f'generate_config_from_state {shlex.quote(str(output))} {shlex.quote(str(state))}')
+                self.assertEqual(result.returncode, 0 if valid else 1, result.stderr)
+
+    def test_dns_collection_defaults_preserves_changes_and_cancels(self):
+        old = {"dns": {"mode": "custom", "server": "8.8.8.8"}}
+        encoded = shlex.quote(json.dumps(old))
+        result = bash(f'''NON_INTERACTIVE=1
+collect_dns_settings '{{}}' result
+echo "$result"
+collect_dns_settings {encoded} result
+echo "$result"
+parse_options --dns-mode custom --dns-server 2606:4700:4700::1111
+collect_dns_settings {encoded} result
+echo "$result"
+parse_options --dns-mode system
+collect_dns_settings {encoded} result
+echo "$result"''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([json.loads(line) for line in result.stdout.splitlines()],
+                         [{"mode": "system"}, old["dns"],
+                          {"mode": "custom", "server": "2606:4700:4700::1111"}, {"mode": "system"}])
+        result = bash('collect_dns_settings \'{}\' result <<< $\'2\\ndns.google\\n1.1.1.1\\n\'\necho "$result"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"mode": "custom", "server": "1.1.1.1"})
+        result = bash('result=unchanged\nif collect_dns_settings \'{}\' result <<< 0; then exit 99; fi\necho "$result"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "unchanged")
+
+    def test_dns_creation_and_reconfiguration_preserve_choice(self):
+        setup = '''NON_INTERACTIVE=1
+SKIP_PROTOCOL_PROMPT=1
+PROTOCOL=socks5
+NODE_DOMAIN=example.com
+NODE_PORT=8388
+generate_default_node_name() { echo DNS; }
+collect_traffic_settings() { printf -v "$2" '%s' '{"monthly_limit":"unlimited"}'; }
+collect_outbound_settings() { printf -v "$2" '%s' '{"type":"direct"}'; }
+'''
+        for settings in (None, {"mode": "custom", "server": "8.8.8.8"}):
+            with self.subTest(settings=settings):
+                old = self.dns_node(dns=settings)
+                result = bash(setup + f'collect_node_json {shlex.quote(json.dumps(old))} result\necho "$result"')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout.splitlines()[-1])["dns"], settings or {"mode": "system"})
+
+    def test_dns_edit_only_updates_selected_node_and_cancel_does_not_save(self):
+        nodes = [self.dns_node(), self.dns_node(8389, {"mode": "custom", "server": "8.8.8.8"})]
+        encoded = shlex.quote(json.dumps(nodes))
+        result = bash(f'''NON_INTERACTIVE=1
+current_nodes_json() {{ echo {encoded}; }}
+save_nodes_json() {{ echo "$1"; }}
+parse_options --dns-mode custom --dns-server 1.1.1.1
+edit_node_dns 0''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = json.loads(result.stdout.splitlines()[0])
+        expected = json.loads(json.dumps(nodes))
+        expected[0]["dns"] = {"mode": "custom", "server": "1.1.1.1"}
+        self.assertEqual(updated, expected)
+        result = bash(f'''current_nodes_json() {{ echo {encoded}; }}
+save_nodes_json() {{ exit 99; }}
+edit_node_dns 0 <<< 0''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_dns_schema_migration_defaults_only_missing_fields(self):
+        state = self.directory / "state.json"
+        nodes = [self.dns_node(), self.dns_node(8389, {"mode": "custom", "server": "8.8.8.8"}),
+                 self.dns_node(8390)]
+        nodes[2]["dns"] = None
+        state.write_text(json.dumps({"nodes": nodes}))
+        result = bash('ensure_state_schema', dict(os.environ, STATE_FILE=str(state)))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = json.loads(state.read_text())["nodes"]
+        self.assertEqual(saved[0]["dns"], {"mode": "system"})
+        self.assertEqual(saved[1]["dns"], nodes[1]["dns"])
+        self.assertIsNone(saved[2]["dns"])
+
+    def test_dns_protocol_change_preserves_settings_without_reprompting(self):
+        node = self.dns_node(dns={"mode": "custom", "server": "8.8.8.8"})
+        node.update(username="fixture", password="fixture")
+        encoded = shlex.quote(json.dumps([node]))
+        result = bash(f'''NON_INTERACTIVE=1
+current_nodes_json() {{ echo {encoded}; }}
+save_nodes_json() {{ echo "$1"; }}
+choose_protocol() {{ printf -v "$1" '%s' http; }}
+ensure_node_certificate() {{ return 0; }}
+firewall_remove_port() {{ :; }}
+collect_dns_settings() {{ exit 99; }}
+edit_node_protocol 0 <<< Y''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = next(json.loads(line) for line in result.stdout.splitlines() if line.startswith("[{"))
+        self.assertEqual(saved[0]["dns"], node["dns"])
+        self.assertEqual(saved[0]["protocol"], "http")
+        self.assertEqual(saved[0]["outbound"], node["outbound"])
+
+    def test_dns_menu_entry_and_summary_show_current_choice(self):
+        for protocol, choice in (("socks5", 9), ("shadowsocks", 10), ("anytls", 10)):
+            with self.subTest(protocol=protocol):
+                node = dict(self.dns_node(dns={"mode": "custom", "server": "8.8.8.8"}), protocol=protocol)
+                encoded = shlex.quote(json.dumps([node]))
+                result = bash(f'''current_nodes_json() {{ echo {encoded}; }}
+print_node_summary_card() {{ :; }}
+edit_node_dns() {{ echo EDIT-DNS-$1; }}
+edit_single_node_menu 0 <<< $'{choice}\\n0\\n' ''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("EDIT-DNS-0", result.stdout)
+        result = bash(f'print_node_summary_card {shlex.quote(json.dumps(self.dns_node(dns={"mode": "custom", "server": "8.8.8.8"})))} 1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DNS 设置: 自定义 (8.8.8.8, UDP 53)", result.stdout)
+
+    def test_dns_generation_and_migration_cover_core_versions_and_backup_exports(self):
+        state = self.directory / "state.json"
+        output = self.directory / "config.json"
+        nodes = [self.dns_node(), self.dns_node(8389, {"mode": "custom", "server": "1.1.1.1"}),
+                 self.dns_node(8390, {"mode": "custom", "server": "2606:4700:4700::1111"})]
+        nodes[1]["outbound"] = self.ss_outbound()
+        nodes[1]["backup_outbounds"] = [self.ss_outbound(True), {"type": "direct"}]
+        state.write_text(json.dumps({"nodes": nodes}))
+        (self.directory / "outbound_health_api.secret").write_text("test-secret")
+        env = dict(os.environ, STATE_DIR=str(self.directory), STATE_FILE=str(state), CONFIG_FILE=str(output))
+        for version, level in (("1.11.4", 0), ("1.12.1", 1), ("1.13.14", 2), ("1.14.3", 3)):
+            with self.subTest(version=version):
+                setup = f'''sing-box() {{ echo 'sing-box version {version}'; }}
+generate_config_from_state {shlex.quote(str(output))}
+outbound_health_config_ready'''
+                result = bash(setup, env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                config = json.loads(output.read_text())
+                servers = {server["tag"]: server for server in config["dns"]["servers"]}
+                outbounds = {outbound["tag"]: outbound for outbound in config["outbounds"]}
+                self.assertEqual(outbounds["health-2"]["outbounds"], ["out-2", "backup-2-1", "direct-2"])
+                self.assertEqual(config["dns"].get("independent_cache"), True if level < 3 else None)
+                if level:
+                    self.assertEqual(servers["dns-3"]["server"], "2606:4700:4700::1111")
+                    self.assertEqual(config["dns"]["rules"], [])
+                    self.assertEqual(servers["sbox-system"].get("prefer_go", False), level >= 2)
+                    for tag in ("out-2", "backup-2-1", "direct-2"):
+                        self.assertEqual(outbounds[tag]["domain_resolver"], "dns-2")
+                    self.assertEqual(outbounds["out-1"]["domain_resolver"], "sbox-system")
+                    config["outbounds"][0]["domain_resolver"] = "dns-2"
+                else:
+                    self.assertEqual(servers["dns-3"]["address"], "udp://[2606:4700:4700::1111]:53")
+                    self.assertEqual(config["dns"]["rules"][2], {"inbound": ["in-2"], "server": "dns-2"})
+                    self.assertEqual(config["dns"]["rules"][3]["outbound"], ["out-2", "direct-2", "backup-2-1"])
+                    self.assertNotIn("default_domain_resolver", config["route"])
+                    self.assertNotIn("prefer_go", servers["sbox-system"])
+                    config.pop("dns")
+                output.write_text(json.dumps(config))
+                result = bash(f"sing-box() {{ echo 'sing-box version {version}'; }}\noutbound_health_config_ready", env)
+                self.assertEqual(result.returncode, 1, result.stderr)
 
     def test_tfo_defaults_cli_generation_and_type_validation(self):
         node = {"name": "SS", "protocol": "shadowsocks", "domain": "example.com", "port": 8388,
