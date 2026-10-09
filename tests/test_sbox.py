@@ -1,5 +1,6 @@
 """本地隔离回归：模拟下载、服务和计数器，不访问网络或真实 nftables。"""
 import concurrent.futures
+import base64
 import contextlib
 import io
 import json
@@ -292,6 +293,143 @@ collect_outbound_settings() { printf -v "$2" '%s' '{"type":"direct"}'; }
                 node = json.loads(result.stdout.splitlines()[-1])
                 self.assertIs(node.get("tcp_fast_open"), expected)
                 self.assertEqual(node["protocol"], protocol)
+
+    def ss_outbound(self, flag=None):
+        outbound = {"type": "shadowsocks", "server": "example.com", "port": 8388,
+                    "method": "aes-128-gcm", "password": "test"}
+        if flag is not None:
+            outbound["tcp_fast_open"] = flag
+        return outbound
+
+    def test_ss_link_import_prompts_after_confirmation_and_can_cancel(self):
+        credentials = base64.urlsafe_b64encode(b"aes-128-gcm:test").decode().rstrip("=")
+        link = f"ss://{credentials}@example.com:8388#SS"
+        for choice, expected in (("1", False), ("2", True), ("", False), ("0", None)):
+            with self.subTest(choice=choice):
+                inputs = shlex.quote(link + "\ny\n" + choice + "\n")
+                result = bash(f'''ensure_python3() {{ :; }}
+imported=unchanged
+if collect_outbound_settings '{{}}' imported < <(printf '%s' {inputs}); then
+  printf '%s\\n' "$imported"
+else
+  printf '%s\\n' "$imported"
+fi''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Shadowsocks 出站 TCP Fast Open", result.stderr)
+                value = result.stdout.splitlines()[-1]
+                if expected is None:
+                    self.assertEqual(value, "unchanged")
+                else:
+                    self.assertEqual(json.loads(value), self.ss_outbound(expected))
+
+    def test_outbound_tfo_cli_import_paths_and_inbound_flags_are_independent(self):
+        link = "ss://" + base64.b64encode(b"aes-128-gcm:test@example.com:8388").decode()
+        for via_menu in (False, True):
+            for option, expected in (("", False), ("--ss-outbound-tfo", True), ("--no-ss-outbound-tfo", False)):
+                with self.subTest(via_menu=via_menu, option=option):
+                    selector = (f'OUTBOUND=direct\nchoose_outbound_protocol() {{ printf -v "$1" \'%s\' {shlex.quote(link)}; }}'
+                                if via_menu else f'OUTBOUND={shlex.quote(link)}')
+                    result = bash(f'''NON_INTERACTIVE=1
+ensure_python3() {{ :; }}
+parse_options --ss-tfo {option}
+{selector}
+collect_outbound_settings '{{}}' imported
+printf '%s\\n' "$imported"
+printf '%s\\n' "$SS_TFO"''')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout.splitlines()[-2]), self.ss_outbound(expected))
+                    self.assertEqual(result.stdout.splitlines()[-1], "true")
+
+    def test_manual_and_reimported_ss_outbounds_keep_per_export_choice(self):
+        link = "ss://" + base64.urlsafe_b64encode(b"aes-128-gcm:test").decode() + "@example.com:8388"
+        primary = self.ss_outbound(True)
+        backup = self.ss_outbound(False)
+        for field, expected in (("outbound", True), ("backup", False)):
+            for import_link in (False, True):
+                with self.subTest(field=field, import_link=import_link):
+                    old = {"outbound": primary, "backup": backup}
+                    result = bash(f'''NON_INTERACTIVE=1
+ensure_python3() {{ :; }}
+OUTBOUND={shlex.quote(link) if import_link else "shadowsocks"}
+collect_outbound_settings {shlex.quote(json.dumps(old))} imported {field}
+printf '%s\\n' "$imported"''')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(json.loads(result.stdout.splitlines()[-1]), self.ss_outbound(expected))
+        result = bash(f'''NON_INTERACTIVE=1
+ensure_python3() {{ :; }}
+OUTBOUND={shlex.quote(link)}
+collect_outbound_settings {shlex.quote(json.dumps({"outbound": primary}))} imported backup
+printf '%s\\n' "$imported"''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout.splitlines()[-1]), backup)
+
+    def test_non_ss_outbound_does_not_prompt_or_receive_tfo(self):
+        result = bash('''NON_INTERACTIVE=1
+parse_options --ss-outbound-tfo
+OUTBOUND=direct
+collect_outbound_settings '{}' imported
+printf '%s\\n' "$imported"''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"type": "direct"})
+        self.assertNotIn("出站 TCP Fast Open", result.stderr)
+
+    def test_outbound_tfo_generation_and_validation_cover_primary_and_backup(self):
+        state = self.directory / "state.json"
+        output = self.directory / "config.json"
+        for field in ("outbound", "backup_outbounds"):
+            for flag in ("missing", False, True, "true", None, 1):
+                with self.subTest(field=field, flag=flag):
+                    outbound = self.ss_outbound()
+                    if flag != "missing":
+                        outbound["tcp_fast_open"] = flag
+                    node = {"name": "SS", "protocol": "shadowsocks", "domain": "example.com", "port": 443,
+                            "method": "aes-128-gcm", "password": "test", "tcp_fast_open": False,
+                            "traffic": {"monthly_limit": "unlimited"}, "outbound": self.ss_outbound(False),
+                            "backup_outbounds": []}
+                    node[field] = outbound if field == "outbound" else [outbound]
+                    state.write_text(json.dumps({"nodes": [node]}))
+                    result = bash(f'''ensure_outbound_health_secret() {{ echo test; }}
+generate_config_from_state {shlex.quote(str(output))} {shlex.quote(str(state))}''')
+                    valid = flag == "missing" or isinstance(flag, bool)
+                    self.assertEqual(result.returncode, 0 if valid else 1, result.stderr)
+                    if valid:
+                        config = json.loads(output.read_text())
+                        tag = "out-1" if field == "outbound" else "backup-1-1"
+                        selected = next(item for item in config["outbounds"] if item["tag"] == tag)
+                        self.assertIs(selected["tcp_fast_open"], flag is True)
+                        self.assertFalse(config["inbounds"][0]["tcp_fast_open"])
+
+    def test_outbound_menu_edit_preserves_selected_backup_and_reorder_keeps_flags(self):
+        primary, backup = self.ss_outbound(False), self.ss_outbound(True)
+        backup["server"] = "backup.example.com"
+        node = {"name": "测试", "port": 443, "outbound": primary, "backup_outbounds": [backup]}
+        nodes = self.directory / "nodes.json"
+        nodes.write_text(json.dumps([node]))
+        setup = f'''NON_INTERACTIVE=1
+current_nodes_json() {{ cat {shlex.quote(str(nodes))}; }}
+save_nodes_json() {{ printf '%s' "$1" > {shlex.quote(str(nodes))}; }}
+'''
+        result = bash(setup + '''manage_single_node_outbounds 0 < <(printf '2\\n2\\n0\\n')''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(nodes.read_text())[0]["backup_outbounds"], [backup])
+        self.assertIn("TFO: 开启", result.stdout)
+        result = bash(setup + '''manage_single_node_outbounds 0 < <(printf '4\\n2\\n1\\n0\\n')''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        saved = json.loads(nodes.read_text())[0]
+        self.assertEqual(saved["outbound"], backup)
+        self.assertEqual(saved["backup_outbounds"], [primary])
+
+    def test_client_and_server_kernel_tfo_bits_are_checked_read_only(self):
+        for value in (0, 1, 2, 3, "unknown"):
+            for side, bit in (("client", 1), ("server", 2)):
+                with self.subTest(value=value, side=side):
+                    result = bash(f'''sysctl() {{ [[ "$1" == -n ]] || return 99; echo {value}; }}
+warn_ss_tfo_support {side}''')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    expected_warning = not isinstance(value, int) or (value & bit) == 0
+                    self.assertEqual(bool(result.stderr), expected_warning)
+                    if expected_warning and isinstance(value, int):
+                        self.assertIn("客户端" if side == "client" else "服务端", result.stderr)
 
     def test_dependency_failure_is_not_retried_and_cache_options_are_scoped(self):
         log = self.directory / "apt-calls"

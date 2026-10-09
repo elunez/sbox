@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.27"
+readonly SCRIPT_VERSION="0.0.28"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -68,6 +68,7 @@ NODE_PASSWORD=""
 NODE_USERNAME=""
 HTTP_TLS="false"
 SS_TFO=""
+SS_OUTBOUND_TFO=""
 CERT_MODE=""
 WEBROOT=""
 OUTBOUND=""
@@ -3349,13 +3350,32 @@ collect_ss_tfo_settings() {
 }
 
 warn_ss_tfo_support() {
-  local value
+  local value bit=2 direction="入站" side="服务端"
+  if [[ "${1:-server}" == "client" ]]; then
+    bit=1
+    direction="出站"
+    side="客户端"
+  fi
   value=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || true)
   if [[ ! "$value" =~ ^[0-9]+$ ]]; then
-    warn "无法确认内核 TFO 状态，SS TFO 能否生效取决于系统支持。"
-  elif (( (10#$value & 2) == 0 )); then
-    warn "SS 已配置开启 TFO，但内核尚未启用服务端 TFO（net.ipv4.tcp_fastopen=${value}）；需另行启用，脚本不会自动修改系统参数。"
+    warn "无法确认内核 TFO 状态，SS ${direction} TFO 能否生效取决于系统支持。"
+  elif (( (10#$value & bit) == 0 )); then
+    warn "SS ${direction}已配置开启 TFO，但内核尚未启用${side} TFO（net.ipv4.tcp_fastopen=${value}）；需另行启用，脚本不会自动修改系统参数。"
   fi
+}
+
+collect_ss_outbound_tfo_settings() {
+  local tfo_json=$1 old_outbound=${2:-'{}'} tfo_target=$3 outbound_tfo
+  if [[ "$(jq -r '.type // "direct"' <<<"$tfo_json")" == "shadowsocks" ]]; then
+    # 每个出口独立取默认值，不复用 SS 入站或上一个出口的交互选择。
+    outbound_tfo=${SS_OUTBOUND_TFO:-$(jq -r '.tcp_fast_open // false' <<<"$old_outbound")}
+    [[ "$outbound_tfo" == "true" || "$outbound_tfo" == "false" ]] || die "SS 出站 TFO 必须为 true 或 false。"
+    prompt_choice outbound_tfo "Shadowsocks 出站 TCP Fast Open (TFO)" "$outbound_tfo" \
+      "false|关闭" "true|开启（SS 服务器也需开启 TFO）" || return 1
+    [[ "$outbound_tfo" == "true" || "$outbound_tfo" == "false" ]] || die "SS 出站 TFO 选项无效。"
+    tfo_json=$(jq -c --argjson tfo "$outbound_tfo" '.tcp_fast_open=$tfo' <<<"$tfo_json") || return 1
+  fi
+  printf -v "$tfo_target" '%s' "$tfo_json"
 }
 
 collect_inbound_settings() {
@@ -3413,13 +3433,15 @@ collect_inbound_settings() {
 
 collect_outbound_settings() {
   local old=${1:-} target=${2:-} field=${3:-outbound}
-  local mode outbound_json=""
+  local mode outbound_json="" existing_outbound
   if [[ "$field" != "outbound" ]]; then
     old=$(jq -c --arg field "$field" '.outbound = (.[$field] // {type:"direct"})' <<<"${old:-"{}"}")
   fi
+  existing_outbound=$(jq -c '.outbound // {type:"direct"}' <<<"${old:-"{}"}")
 
   if [[ "$OUTBOUND" == *"://"* ]]; then
     if parse_proxy_link "$OUTBOUND" outbound_json; then
+      collect_ss_outbound_tfo_settings "$outbound_json" "$existing_outbound" outbound_json || return 1
       if [[ -n "$target" ]]; then
         printf -v "$target" "%s" "$outbound_json"
       else
@@ -3451,6 +3473,7 @@ collect_outbound_settings() {
         read -r -p "确认使用此出口配置？[Y/n，默认: Y]: " confirm_use
         confirm_use=${confirm_use:-Y}
         if [[ "$confirm_use" =~ ^[Yy]$ ]]; then
+          collect_ss_outbound_tfo_settings "$outbound_json" "$existing_outbound" outbound_json || return 1
           ok "已采用分享链接导入的出口配置！"
           if [[ -n "$target" ]]; then
             printf -v "$target" "%s" "$outbound_json"
@@ -3477,6 +3500,7 @@ collect_outbound_settings() {
 
   if [[ "$OUTBOUND" == *"://"* ]]; then
     if parse_proxy_link "$OUTBOUND" outbound_json; then
+      collect_ss_outbound_tfo_settings "$outbound_json" "$existing_outbound" outbound_json || return 1
       ok "已采用分享链接导入的出口配置！"
       if [[ -n "$target" ]]; then
         printf -v "$target" "%s" "$outbound_json"
@@ -3597,6 +3621,7 @@ collect_outbound_settings() {
       ;;
     *) die "不支持的出口协议：$OUTBOUND" ;;
   esac
+  collect_ss_outbound_tfo_settings "$outbound_json" "$existing_outbound" outbound_json || return 1
   if [[ -n "$target" ]]; then
     printf -v "$target" "%s" "$outbound_json"
   else
@@ -3919,6 +3944,7 @@ validate_outbound_config() {
     shadowsocks)
       validate_ss_method "$(jq -r '.method // empty' <<<"$outbound_json")" || die "${label} Shadowsocks 加密方法无效。"
       validate_ss_password "$(jq -r '.method' <<<"$outbound_json")" "$(jq -r '.password // empty' <<<"$outbound_json")" || die "${label} Shadowsocks 密码格式不匹配。"
+      jq -e '(has("tcp_fast_open") | not) or (.tcp_fast_open | type == "boolean")' <<<"$outbound_json" >/dev/null || die "${label} Shadowsocks tcp_fast_open 必须为布尔值。"
       ;;
     vless-reality)
       validate_uuid "$(jq -r '.uuid // empty' <<<"$outbound_json")" || die "${label} VLESS UUID 无效。"
@@ -4170,7 +4196,8 @@ generate_config_from_state() {
           server: $o.server,
           server_port: $o.port,
           method: $o.method,
-          password: $o.password
+          password: $o.password,
+          tcp_fast_open: ($o.tcp_fast_open // false)
         }
       elif $o.type == "anytls" then
         {
@@ -4271,6 +4298,9 @@ apply_config() {
   sing-box check -c "$candidate" || die "配置校验未通过，已放弃应用更改。"
   if jq -e 'any(.inbounds[]?; .type == "shadowsocks" and .tcp_fast_open == true)' "$candidate" >/dev/null 2>&1; then
     warn_ss_tfo_support
+  fi
+  if jq -e 'any(.outbounds[]?; .type == "shadowsocks" and .tcp_fast_open == true)' "$candidate" >/dev/null 2>&1; then
+    warn_ss_tfo_support client
   fi
   backup=$(backup_config)
   install -d -m 0750 -o root -g "$group" "$CONFIG_DIR"
@@ -5835,6 +5865,9 @@ manage_single_node_outbounds() {
         o_port=$(jq -r '.port // empty' <<<"$o_item")
         o_desc="$(protocol_label "$o_type")"
         [[ -n "$o_srv" && -n "$o_port" ]] && o_desc+=" (${o_srv}:${o_port})"
+        if [[ "$o_type" == "shadowsocks" ]]; then
+          o_desc+=" [TFO: $(if [[ "$(jq -r '.tcp_fast_open // false' <<<"$o_item")" == "true" ]]; then echo "开启"; else echo "关闭"; fi)]"
+        fi
         if (( o_idx == 1 )); then
           printf "  %d) %s  %s[首选]%s\n" "$o_idx" "$o_desc" "$C_GREEN" "$C_RESET"
         else
@@ -5898,7 +5931,7 @@ manage_single_node_outbounds() {
         info "正在重新配置出口 ${edit_idx}……"
         OUTBOUND=""
         local mock_old
-        mock_old=$(jq -c --argjson ob "$curr_item" '{outbound: $ob}' <<<"{}")
+        mock_old=$(jq -c --argjson ob "$curr_item" '{backup: $ob}' <<<"{}")
         if ! collect_outbound_settings "$mock_old" modified_outbound backup; then
           warn "已取消修改出口。"
           continue
@@ -7900,6 +7933,8 @@ usage() {
   --protocol PROTOCOL     协议类型 (anytls / shadowsocks / trojan / hysteria2 / vless-reality / socks5 / http)
   --ss-tfo                Shadowsocks 入站开启 TCP Fast Open
   --no-ss-tfo             Shadowsocks 入站关闭 TCP Fast Open (默认)
+  --ss-outbound-tfo       Shadowsocks 出站开启 TCP Fast Open
+  --no-ss-outbound-tfo    Shadowsocks 出站关闭 TCP Fast Open (默认)
   --domain DOMAIN         节点域名或 IP
   --port PORT             监听端口
   --password PASS         密码或预共享密钥
@@ -7934,6 +7969,8 @@ parse_options() {
       --no-http-tls) HTTP_TLS="false"; shift;;
       --ss-tfo) SS_TFO="true"; shift;;
       --no-ss-tfo) SS_TFO="false"; shift;;
+      --ss-outbound-tfo) SS_OUTBOUND_TFO="true"; shift;;
+      --no-ss-outbound-tfo) SS_OUTBOUND_TFO="false"; shift;;
       --cert-mode) [[ $# -ge 2 ]] || die "--cert-mode 缺少值"; CERT_MODE=$2; shift 2;;
       --webroot) [[ $# -ge 2 ]] || die "--webroot 缺少值"; WEBROOT=$2; shift 2;;
       --outbound) [[ $# -ge 2 ]] || die "--outbound 缺少值"; OUTBOUND=$2; shift 2;;
