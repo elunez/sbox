@@ -169,6 +169,8 @@ class TrafficTests(unittest.TestCase):
     def run_command(self, command, **kwargs):
         self.calls.append(command)
         if command[0] == "nft":
+            if command != ["nft", "-j", "list", "table", "inet", "sing_box_traffic"]:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="syntax error")
             counters = []
             for port, incoming, outgoing in ((8388, 512, 1024), (8080, 2048, 4096)):
                 for direction, value in (("in", incoming), ("out", outgoing)):
@@ -204,6 +206,23 @@ class TrafficTests(unittest.TestCase):
         self.assertEqual(result["nodes"][0]["domain"], "legacy.example")
         self.assertEqual(result["nodes"][0]["protocol"], "anytls")
         self.assertEqual(empty["total_nodes"], 0)
+
+    def test_table_snapshot_ignores_rules_quotas_and_unrelated_counters(self):
+        entries = [
+            {"metainfo": {"json_schema_version": 1}},
+            {"table": {"family": "inet", "name": "sing_box_traffic"}},
+            {"chain": {"family": "inet", "table": "sing_box_traffic", "name": "input"}},
+            {"rule": {"expr": [{"counter": {"bytes": 999999}}]}},
+            {"quota": {"name": "node_8388_quota", "bytes": 999999}},
+            {"counter": {"family": "inet", "table": "other", "name": "node_8388_out", "bytes": 999999}},
+            {"counter": {"family": "ip", "table": "sing_box_traffic", "name": "node_8388_out", "bytes": 999999}},
+            {"counter": {"family": "inet", "table": "sing_box_traffic", "name": "node_8388_out", "bytes": 1234}},
+        ]
+        result = types.SimpleNamespace(returncode=0, stdout=json.dumps({"nftables": entries}))
+        with patch.object(self.collector.subprocess, "run", side_effect=[result, types.SimpleNamespace(returncode=0)]):
+            snapshot = self.collector.collect_traffic_snapshot()
+        self.assertEqual(snapshot["nodes"][0]["total_bytes"], 1234)
+        self.assertEqual(snapshot["total_traffic"]["total_bytes"], 1234)
 
     def test_nft_failure_is_reported_not_zero_traffic(self):
         with patch.object(self.collector.subprocess, "run", return_value=types.SimpleNamespace(returncode=1)):
@@ -628,7 +647,7 @@ warn_ss_tfo_support {side}''')
                     if expected_warning and isinstance(value, int):
                         self.assertIn("客户端" if side == "client" else "服务端", result.stderr)
 
-    def test_dependency_failure_is_not_retried_and_cache_options_are_scoped(self):
+    def test_dependency_transaction_is_not_repeated_and_download_options_are_scoped(self):
         log = self.directory / "apt-calls"
         result = bash(f'''detect_os() {{ PKG_MGR=apt; }}
 apt-get() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; [[ "$*" != *" install "* ]]; }}
@@ -641,7 +660,27 @@ install_dependencies_and_core''')
         self.assertEqual(len(calls), 2)
         self.assertEqual(sum(" install " in call for call in calls), 1)
         self.assertTrue(all("APT::Keep-Downloaded-Packages=false" in call for call in calls))
+        for call in calls:
+            self.assertIn("Acquire::Retries=3", call)
+            self.assertIn("Acquire::http::Timeout=30", call)
+            self.assertIn("Acquire::https::Timeout=30", call)
+        self.assertIn("软件源、网络", result.stderr)
         self.assertNotIn("不应安装核心", result.stdout)
+
+    def test_apt_download_options_do_not_mask_errors_or_persist(self):
+        for operation in ("update", "install", "download"):
+            with self.subTest(operation=operation):
+                log = self.directory / ("apt-options-" + operation)
+                result = bash(f'''apt-get() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; return 42; }}
+apt_get_minimal {operation}''')
+                self.assertEqual(result.returncode, 42, result.stderr)
+                calls = log.read_text().splitlines()
+                self.assertEqual(len(calls), 1)
+                args = shlex.split(calls[0])
+                self.assertEqual(args[-1], operation)
+                self.assertEqual(args[::2][:-1], ["-o"] * 8)
+                self.assertNotIn("--fix-missing", args)
+                self.assertNotIn("--allow-unauthenticated", args)
 
     def test_update_skips_package_manager_when_dependencies_are_installed(self):
         for manager in ("apt", "dnf", "yum", "apk"):
@@ -824,16 +863,19 @@ printf '更新检查已返回\\n'
         api_path = state_dir / "api/http_server.py"
         api = module(api_path.read_text())
         self.assertTrue(callable(api.get_traffic_snapshot))
-        for running in (True, False):
-            with self.subTest(running=running):
-                api_path.write_text("old script")
-                result = bash(f'''ensure_api_service_file() {{ :; }}
+        self.assertEqual(api.TRAFFIC_COLLECTOR_VERSION, 2)
+        for old in ("old script", "def get_traffic_snapshot():\n    pass\n", "TRAFFIC_COLLECTOR_VERSION = 1\n"):
+            for running in (True, False):
+                with self.subTest(running=running, old=old):
+                    api_path.write_text(old)
+                    result = bash(f'''ensure_api_service_file() {{ :; }}
 service_is_running() {{ return {0 if running else 1}; }}
 service_restart() {{ echo 重启; }}
 refresh_api_service
 refresh_api_service''', env=env)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.splitlines(), ["重启"] if running else [])
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.splitlines(), ["重启"] if running else [])
+                    self.assertEqual(module(api_path.read_text()).TRAFFIC_COLLECTOR_VERSION, 2)
 
     def test_health_service_restarts_only_when_monitor_changes(self):
         env = dict(os.environ, STATE_DIR=str(self.directory / "state"), CONFIG_FILE=str(self.directory / "config"))

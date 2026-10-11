@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.33"
+readonly SCRIPT_VERSION="0.0.35"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -2858,7 +2858,9 @@ install_singbox_binary() (
 
 apt_get_minimal() {
   # 仅覆盖本次调用，不修改系统 APT 配置或清理其他任务的缓存。
+  # 由 APT 在执行安装前重试失败的下载，不重复执行整个安装事务。
   apt-get -o Acquire::Languages=none -o Acquire::GzipIndexes=true \
+    -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
     -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= \
     -o APT::Keep-Downloaded-Packages=false "$@"
 }
@@ -2896,7 +2898,7 @@ install_dependencies() {
       export DEBIAN_FRONTEND=noninteractive
       if (( ${#packages[@]} > 0 )); then
         apt_get_minimal update -y || die "更新依赖索引失败，请检查软件源、网络及 /var 分区空间。"
-        apt_get_minimal install "${apt_install_flags[@]}" "${packages[@]}" || die "安装依赖失败，请检查上方错误及 /var 分区空间。"
+        apt_get_minimal install "${apt_install_flags[@]}" "${packages[@]}" || die "安装依赖失败，请检查上方错误、软件源、网络及 /var 分区空间。"
       fi
       # 时间同步依赖由 ensure_time_sync_service 按现有服务情况单独补齐。
       ensure_certbot_environment
@@ -6629,6 +6631,8 @@ import re
 import subprocess
 from decimal import Decimal
 
+TRAFFIC_COLLECTOR_VERSION = 2
+
 
 def traffic_size_bytes(value):
     value = str(value or "unlimited")
@@ -6683,7 +6687,8 @@ def collect_traffic_snapshot(port_filter=None):
     counters = {}
     if nodes:
         table = os.environ.get("SBOX_NFT_TABLE", "sing_box_traffic")
-        result = subprocess.run(["nft", "-j", "list", "counters", "inet", table],
+        # list counters 不接受表名；读取指定表可保留一次查询并兼容旧版 nftables。
+        result = subprocess.run(["nft", "-j", "list", "table", "inet", table],
                                 capture_output=True, text=True, timeout=5)
         if result.returncode != 0:
             raise RuntimeError("读取 nftables 流量计数器失败，请检查表是否存在及读取权限")
@@ -7032,7 +7037,7 @@ restart_api_service() {
 refresh_api_service() {
   [[ -f "$API_SCRIPT_FILE" ]] || return 0
   # 升级旧 API 脚本时保持启停状态，已迁移的服务不重复重启。
-  if ! grep -q '^def get_traffic_snapshot():' "$API_SCRIPT_FILE"; then
+  if ! grep -q '^TRAFFIC_COLLECTOR_VERSION = 2$' "$API_SCRIPT_FILE"; then
     local running=0
     service_is_running "$API_SYSTEMD_SERVICE" && running=1
     install_api_server_script
