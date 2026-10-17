@@ -102,6 +102,35 @@ sbox
 （支持直接输入 `sbox` 快速调出面板，普通用户运行时会自动调起 sudo）
 
 
+## Debian IPv4 / IPv6 优先级
+
+独立脚本 `ip-priority.sh` 支持 Debian 及其衍生系统，可通过菜单选择 IPv4 优先、原生 IPv6 优先、恢复原设置或查看状态，无需安装 sbox。
+
+一键下载并打开菜单（需要已有 `curl`，普通用户需要 `sudo`；root 用户可去掉 `sudo`）：
+
+```bash
+curl -fsSLo ip-priority.sh https://raw.githubusercontent.com/elunez/sbox/main/ip-priority.sh && sudo bash ip-priority.sh
+```
+
+下载后也可直接指定操作：
+
+```bash
+sudo bash ip-priority.sh ipv4     # IPv4 优先
+sudo bash ip-priority.sh ipv6     # 原生 IPv6 优先
+sudo bash ip-priority.sh restore  # 撤销本脚本设置，恢复原有优先级规则
+bash ip-priority.sh status        # 查看配置，无需 root
+```
+
+脚本仅修改 `/etc/gai.conf` 的 `precedence` 表，遵循 [Debian gai.conf 文档](https://manpages.debian.org/trixie/manpages/gai.conf.5.en.html)；IPv4 模式将映射地址优先级设为 100，IPv6 模式采用 [glibc 默认优先级表](https://github.com/bminor/glibc/blob/master/posix/gai.conf)。两种模式都会暂时注释已有的优先级规则；恢复时重新启用这些规则，并保留管理块外后续新增的配置。每次实际改写已有文件前，都会备份为 `/etc/gai.conf.bak.随机后缀`；首次创建文件后再恢复，会留下空配置文件，等同使用 glibc 默认优先级。请勿手动编辑脚本管理块和暂存标记。
+
+这会影响使用 glibc `getaddrinfo` 地址排序的应用，不禁用 IPv4/IPv6、不修改 DNS 或路由，也不重启网络。原生 IPv6 优先仍取决于可用地址和路由；应用自行解析 DNS、代理、Happy Eyeballs 等机制可能影响实际连接选择。长驻应用可能需要重启，脚本状态只表示配置，不表示外网连通性。
+
+脚本的隔离测试仅使用一次性本地临时文件，不修改真实系统配置，也不访问网络，可直接运行：
+
+```bash
+python3 -m unittest discover -s tests -p 'test_ip_priority.py' -v
+```
+
 ## 节点管理与多协议
 
 进入 **3. 节点管理**，支持：
