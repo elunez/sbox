@@ -131,6 +131,32 @@ bash ip-priority.sh status        # 查看配置，无需 root
 python3 -m unittest discover -s tests -p 'test_ip_priority.py' -v
 ```
 
+## Debian 修改主机名
+
+独立脚本 `set-hostname.sh` 支持 Debian 及其衍生系统，无参数运行时提示输入新主机名，直接回车退出。普通用户需要 `sudo`，root 用户可去掉 `sudo`：
+
+```bash
+curl -fsSLo set-hostname.sh https://raw.githubusercontent.com/elunez/sbox/main/set-hostname.sh && sudo bash set-hostname.sh
+```
+
+下载后可直接指定名称或查看状态：
+
+```bash
+sudo bash set-hostname.sh vps-01
+sudo bash set-hostname.sh node.example.com
+bash set-hostname.sh --status
+```
+
+主机名支持小写字母、数字、连字符和点分隔的域名，总长度不超过 64 字符，每段不超过 63 字符；不允许纯数字、IP 地址、空白、下划线或保留名称 `localhost`。脚本用 `hostname` 命令立即修改运行时名称，并写入 `/etc/hostname` 使其持久生效，同时更新 `/etc/hosts` 的 `127.0.1.1` 记录，域名形式会同时配置短名称；保留无关别名、localhost、IPv6 和其他地址映射。原理可参阅 [Debian hostname 文档](https://manpages.debian.org/trixie/hostname/hostname.1.en.html)。
+
+**不生成备份文件。** 旧内容仅在执行期间保存在内存中，失败时尝试回滚，并明确报告结果；断电或强制终止无法保证回滚。无需重启网络或系统，已有终端可能需要重新登录以刷新提示符。脚本不修改云平台或 cloud-init 配置；这些服务若管理主机名或 hosts，后续启动可能覆盖设置，需要同步核对其配置。
+
+隔离测试仅操作一次性临时文件，并模拟 `hostname` 命令，不修改真实系统主机名、配置或访问网络，可直接运行：
+
+```bash
+python3 -m unittest discover -s tests -p 'test_set_hostname.py' -v
+```
+
 ## 节点管理与多协议
 
 进入 **3. 节点管理**，支持：
