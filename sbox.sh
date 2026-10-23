@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.42"
+readonly SCRIPT_VERSION="0.0.43"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -5697,8 +5697,8 @@ edit_node_padding_scheme() {
     printf "  2) 还原默认规则\n"
     printf "  0) 返回上级\n"
     local pad_choice
-    read -r -p "请输入选择 [0-2，默认: 0]: " pad_choice
-    pad_choice=${pad_choice:-0}
+    read -r -p "请输入选择 [0-2，默认: 1]: " pad_choice || return 0
+    pad_choice=${pad_choice:-1}
     case "$pad_choice" in
       1)
         if collect_and_apply_padding_scheme "$index"; then
