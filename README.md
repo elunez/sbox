@@ -20,8 +20,7 @@
   - 默认自启：安装及节点应用时默认启用 systemd 开机常驻自启；
   - 底部实时动态状态栏显示当前活跃节点数、服务状态（运行中/已停止/未安装）、流量 API 服务状态等。
 - **输入安全保障**：输入密码、密钥与 API 凭据时简洁直观，无冗余提示。
-- **SS 入站 TFO 开关**：新增或完整重配 Shadowsocks 节点时可选择 TCP Fast Open，默认关闭；也可在节点修改菜单单独切换。命令行支持 `--ss-tfo` / `--no-ss-tfo`。设置保存在节点状态中，编辑其他字段时保留。启用时会检查内核服务端 TFO 状态并提示，脚本不会自动修改系统参数；客户端同样需要支持并使用 TFO。
-- **SS 出站 TFO 开关**：粘贴 SS 分享链接并确认后，或手动配置 SS 出口时，可选择是否开启 TFO，默认关闭；修改出口时默认保留原选择。主出口和各备用出口独立保存，调整顺序时保留，出口管理列表显示开启状态。命令行支持 `--ss-outbound-tfo` / `--no-ss-outbound-tfo`，与入站开关分开。开启后检查本机内核的客户端 TFO 支持（`net.ipv4.tcp_fastopen` 为 `1` 或 `3` 即满足基本客户端支持），SS 服务器也需要启用服务端 TFO。脚本不修改系统参数，旧配置不会自动开启。
+- **SS TFO 默认关闭**：新建 Shadowsocks 入站与出站默认关闭 TCP Fast Open，交互菜单不再询问或展示 TFO。编辑已有节点和出口时保留各自的旧设置；命令行 `--ss-tfo` / `--no-ss-tfo`、`--ss-outbound-tfo` / `--no-ss-outbound-tfo` 保持兼容，可显式覆盖。
 - **系统时钟守护（NTP 自动对时）**：安装与更新时自动守护系统时间同步服务（systemd-timesyncd / chrony），服务依赖等待时间同步完成（`time-sync.target`），从根源杜绝 Shadowsocks 2022、TLS 证书等因服务器开机时间漂移/倒流导致的握手失败。
 
 ## 控制面板布局
@@ -102,6 +101,34 @@ sbox
 （支持直接输入 `sbox` 快速调出面板，普通用户运行时会自动调起 sudo）
 
 
+## 系统 DNS 管理
+
+独立脚本 `dns-manager.sh` 支持 NetworkManager、systemd-resolved、resolvconf/openresolv、dhclient、SUSE netconfig，以及 Alpine 常用的 dhcpcd。需要 Bash；Alpine 上请使用 `bash` 运行。root 用户可去掉下面的 `sudo`。
+
+```bash
+curl -fsSLo dns-manager.sh https://raw.githubusercontent.com/elunez/sbox/main/dns-manager.sh && sudo bash dns-manager.sh
+```
+
+也可以直接设置、查看或恢复：
+
+```bash
+sudo bash dns-manager.sh --set "1.1.1.1 8.8.8.8"
+bash dns-manager.sh --status
+sudo bash dns-manager.sh --restore
+# 自动检测不适用时，可明确指定后端和接口：
+sudo bash dns-manager.sh --backend dhcpcd --interface eth0 --set "1.1.1.1 8.8.8.8"
+```
+
+dhcpcd 模式会立即更新系统 DNS，并在 `/etc/dhcpcd.exit-hook` 追加指定接口的 DNS 管理块。按 [dhcpcd 钩子约定](https://manpages.debian.org/testing/dhcpcd-base/dhcpcd-run-hooks.8.en.html)，每次启动和 DHCP 续租等网络事件结束后都会重新加载该钩子，因此无需重启网络或主动续租；已有钩子内容会保留。未检测到支持的管理器时回退为静态文件模式，并明确提示可能被 DHCP 覆盖。
+
+首次修改前的配置保存在 `/var/lib/dns-manager/original`，重复设置不会覆盖原备份；`--restore` 恢复原配置并归档快照。此前旧版脚本在台湾机器上留下的静态模式快照可继续使用。该脚本修改的是系统 DNS，使用系统 DNS 的 sbox 节点也会受影响；节点单独配置的自定义 DNS 仍由节点设置决定。
+
+隔离测试模拟 DHCP 事件、重复设置及恢复，仅操作临时文件，不修改系统配置或访问网络：
+
+```bash
+python3 -m unittest discover -s tests -p 'test_dns_manager.py' -v
+```
+
 ## Debian IPv4 / IPv6 优先级
 
 独立脚本 `ip-priority.sh` 支持 Debian 及其衍生系统，可通过菜单选择 IPv4 优先、原生 IPv6 优先、恢复原设置或查看状态，无需安装 sbox。
@@ -164,9 +191,9 @@ python3 -m unittest discover -s tests -p 'test_set_hostname.py' -v
    - 选择入站协议：AnyTLS、Shadowsocks、Trojan、Hysteria2、VLESS + REALITY、SOCKS5、HTTP / HTTPS；
    - 设定节点域名或公网 IP、端口、认证信息；
    - 若所填域名无本地证书，脚本自动提示并调用 Let's Encrypt 快速签发；
-   - 配置流量计费模式（单向/双向）、月度限额（如 100GB）以及每月重置日（如 1日）；
-   - 配置节点主出口（Direct，或转至外部 AnyTLS / Shadowsocks / Trojan / Hysteria2 / VLESS REALITY / SOCKS5 / HTTP 出口）；配置完成后可二选一决定是否添加备用出口（默认回车跳过）。
-2. **修改配置**：随时调整现有节点的入站协议、监听端口、认证密钥、AnyTLS 混淆规则（Padding Scheme，支持多行整段粘贴与自动补全 stop=*）、伪装域名、网络出口路由或流量策略；
+   - 保留密码等认证信息的输入步骤；流量策略直接采用单向计费、不限额、每月 1 日重置，后续可从“流量策略”或“调整流量”修改；
+   - 网络出口直接回车使用 Direct，粘贴分享链接即可导入，输入 `m` 手动选择协议，输入 `0` 取消；不再重复确认链接或追问备用出口，备用出口可随后从“网络出口”添加。
+2. **修改配置**：完整重配时保留原有流量策略；出口输入框回车保留当前出口，主出口仍为代理时保留已有备用出口。随时调整现有节点的入站协议、监听端口、认证密钥、AnyTLS 混淆规则（Padding Scheme，支持多行整段粘贴与自动补全 stop=*）、伪装域名、网络出口路由或流量策略；
 3. **网络出口**：全流程可视化管理节点的出口路线与优先级顺位列表。
    - 模糊化主备出口概念，按顺位（首选、备选2、备选3...）清晰呈现链路；
    - 支持自由添加出口、修改指定出口、删除指定出口；

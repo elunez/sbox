@@ -400,7 +400,7 @@ edit_node_protocol 0 <<< Y''')
         self.assertEqual(saved[0]["outbound"], node["outbound"])
 
     def test_dns_menu_entry_and_summary_show_current_choice(self):
-        for protocol, choice in (("socks5", 9), ("shadowsocks", 10), ("anytls", 10)):
+        for protocol, choice in (("socks5", 9), ("shadowsocks", 9), ("anytls", 10)):
             with self.subTest(protocol=protocol):
                 node = dict(self.dns_node(dns={"mode": "custom", "server": "8.8.8.8"}), protocol=protocol)
                 encoded = shlex.quote(json.dumps([node]))
@@ -454,6 +454,101 @@ outbound_health_config_ready'''
                 output.write_text(json.dumps(config))
                 result = bash(f"sing-box() {{ echo 'sing-box version {version}'; }}\noutbound_health_config_ready", env)
                 self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_creation_keeps_password_prompt_and_skips_tfo_traffic_and_backup_questions(self):
+        for outbound_input in ("", "ss://YWVzLTEyOC1nY206dGVzdA@example.com:8388"):
+            with self.subTest(outbound=outbound_input):
+                # 协议、名称、地址、端口、SS 加密方式、密码、DNS、出口。
+                inputs = "\n".join(["2", "", "", "", "", "my-password", "", outbound_input]) + "\n"
+                result = bash(f'''NODE_DOMAIN=192.0.2.1
+NODE_PORT=8388
+SS_METHOD=aes-128-gcm
+generate_default_node_name() {{ echo fixture; }}
+ensure_python3() {{ :; }}
+collect_node_json '{{}}' created < <(printf '%s' {shlex.quote(inputs)})
+echo "$created"''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                node = json.loads(result.stdout.splitlines()[-1])
+                self.assertEqual(node["password"], "my-password")
+                self.assertFalse(node["tcp_fast_open"])
+                self.assertEqual(node["traffic"], {"enabled": True, "billing_mode": "single",
+                                 "monthly_limit": "unlimited", "reset_day": 1,
+                                 "rate_limit": {"enabled": False, "upload": None, "download": None}})
+                self.assertEqual(node["backup_outbounds"], [])
+                self.assertEqual(node["outbound"], self.ss_outbound(False) if outbound_input else {"type": "direct"})
+                self.assertNotIn("TCP Fast Open", result.stdout + result.stderr)
+                self.assertNotIn("流量计费统计方式", result.stderr)
+                self.assertNotIn("是否添加备用出口", result.stdout)
+
+    def test_traffic_defaults_preserve_existing_settings_and_accept_cli_overrides(self):
+        traffic = {"enabled": True, "billing_mode": "double", "monthly_limit": "500GB", "reset_day": None,
+                   "rate_limit": {"enabled": True, "upload": "10Mbps", "download": "20Mbps"}}
+        old = {"traffic": traffic}
+        for option, expected in (("", traffic), ("--traffic-limit 200GB --reset-day 15",
+                                                dict(traffic, monthly_limit="200GB", reset_day=15))):
+            with self.subTest(option=option):
+                result = bash(f'''prompt_value() {{ exit 99; }}
+prompt_choice() {{ exit 99; }}
+parse_options {option}
+collect_traffic_settings {shlex.quote(json.dumps(old))} settings 0
+echo "$settings"''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), expected)
+        for option, valid in (("--reset-day 0", True), ("--reset-day 32", False), ("--traffic-limit invalid", False)):
+            result = bash(f'''parse_options {option}
+collect_traffic_settings '{{}}' settings 0
+echo "$settings"''')
+            self.assertEqual(result.returncode == 0, valid, result.stderr)
+            if valid:
+                self.assertIsNone(json.loads(result.stdout)["reset_day"])
+
+    def test_traffic_can_still_be_edited_interactively(self):
+        result = bash('''collect_traffic_settings '{}' settings <<< $'2\\n100GB\\n15\\n'
+echo "$settings"''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        traffic = json.loads(result.stdout)
+        self.assertEqual((traffic["billing_mode"], traffic["monthly_limit"], traffic["reset_day"]),
+                         ("double", "100GB", 15))
+
+    def test_outbound_enter_preserves_existing_proxy_and_manual_selection_still_works(self):
+        for old, expected in (({}, {"type": "direct"}), ({"outbound": self.ss_outbound(True)}, self.ss_outbound(True))):
+            with self.subTest(old=old):
+                result = bash(f'''collect_outbound_settings {shlex.quote(json.dumps(old))} result <<< ''
+echo "$result"''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout.splitlines()[-1]), expected)
+                self.assertNotIn("出口协议设置", result.stderr)
+                self.assertNotIn("TCP Fast Open", result.stdout + result.stderr)
+        inputs = shlex.quote("m\n3\nexample.com\n8388\n5\ntest\n")
+        result = bash(f'''collect_outbound_settings '{{}}' result < <(printf '%s' {inputs})
+echo "$result"''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout.splitlines()[-1]), self.ss_outbound(False))
+
+    def test_bad_outbound_link_retries_in_place_and_cli_fails_without_fallback(self):
+        bad_link = "vless://invalid@example.com:443?security=none"
+        result = bash(f'''ensure_python3() {{ :; }}
+collect_outbound_settings '{{}}' result < <(printf '%s' {shlex.quote(bad_link + chr(10) + chr(10))})
+echo "$result"''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout.splitlines()[-1]), {"type": "direct"})
+        self.assertIn("解析失败", result.stderr)
+        result = bash(f'''NON_INTERACTIVE=1
+ensure_python3() {{ :; }}
+OUTBOUND={shlex.quote(bad_link)}
+collect_outbound_settings '{{}}' result''')
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_tfo_is_hidden_from_node_summary_share_output_and_edit_menu(self):
+        node = dict(self.dns_node(), protocol="shadowsocks", method="aes-128-gcm", password="test",
+                    tcp_fast_open=True, outbound=self.ss_outbound(True))
+        result = bash(f'''current_nodes_json() {{ echo {shlex.quote(json.dumps([node]))}; }}
+print_node_summary_card {shlex.quote(json.dumps(node))}
+show_client
+edit_single_node_menu 0 <<< 0''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("TFO", result.stdout + result.stderr)
+        self.assertNotIn("TCP Fast Open", result.stdout + result.stderr)
 
     def test_vless_links_require_reality_and_keep_legacy_reality_compatibility(self):
         uuid = "bf000d23-0752-40b4-affe-68f7707a9661"
@@ -541,17 +636,14 @@ echo "$imported"''')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["true", "false", "true"])
 
-    def test_tfo_edit_preserves_other_fields_and_checks_kernel_read_only(self):
-        nodes = [{"protocol": "shadowsocks", "port": 8388, "tcp_fast_open": True, "password": "test"}]
-        encoded = shlex.quote(json.dumps(nodes))
-        result = bash(f'''current_nodes_json() {{ printf '%s' {encoded}; }}
-save_nodes_json() {{ printf '%s\\n' "$1"; }}
-NON_INTERACTIVE=1
-edit_node_tfo 0
-sysctl() {{ [[ "$1" == "-n" ]] || return 99; echo 1; }}
+    def test_tfo_preserves_existing_value_without_prompt_and_checks_kernel_read_only(self):
+        result = bash('''prompt_choice() { exit 99; }
+collect_ss_tfo_settings '{"tcp_fast_open":true}'
+echo "$SS_TFO"
+sysctl() { [[ "$1" == "-n" ]] || return 99; echo 1; }
 warn_ss_tfo_support''')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout.splitlines()[0]), nodes)
+        self.assertEqual(result.stdout.strip(), "true")
         self.assertIn("内核尚未启用", result.stderr)
 
     def test_tfo_creation_reconfiguration_and_protocol_change(self):
@@ -583,26 +675,26 @@ collect_outbound_settings() { printf -v "$2" '%s' '{"type":"direct"}'; }
             outbound["tcp_fast_open"] = flag
         return outbound
 
-    def test_ss_link_import_prompts_after_confirmation_and_can_cancel(self):
+    def test_ss_link_import_needs_one_input_and_can_cancel_before_import(self):
         credentials = base64.urlsafe_b64encode(b"aes-128-gcm:test").decode().rstrip("=")
         link = f"ss://{credentials}@example.com:8388#SS"
-        for choice, expected in (("1", False), ("2", True), ("", False), ("0", None)):
-            with self.subTest(choice=choice):
-                inputs = shlex.quote(link + "\ny\n" + choice + "\n")
+        for value in (link, "0"):
+            with self.subTest(value=value):
                 result = bash(f'''ensure_python3() {{ :; }}
 imported=unchanged
-if collect_outbound_settings '{{}}' imported < <(printf '%s' {inputs}); then
-  printf '%s\\n' "$imported"
+if collect_outbound_settings '{{}}' imported <<< {shlex.quote(value)}; then
+  echo "$imported"
 else
-  printf '%s\\n' "$imported"
+  echo "$imported"
 fi''')
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("Shadowsocks 出站 TCP Fast Open", result.stderr)
-                value = result.stdout.splitlines()[-1]
-                if expected is None:
-                    self.assertEqual(value, "unchanged")
+                self.assertNotIn("TCP Fast Open", result.stdout + result.stderr)
+                self.assertNotIn("确认使用", result.stdout + result.stderr)
+                output = result.stdout.splitlines()[-1]
+                if value == "0":
+                    self.assertEqual(output, "unchanged")
                 else:
-                    self.assertEqual(json.loads(value), self.ss_outbound(expected))
+                    self.assertEqual(json.loads(output), self.ss_outbound(False))
 
     def test_outbound_tfo_cli_import_paths_and_inbound_flags_are_independent(self):
         link = "ss://" + base64.b64encode(b"aes-128-gcm:test@example.com:8388").decode()
@@ -694,7 +786,7 @@ save_nodes_json() {{ printf '%s' "$1" > {shlex.quote(str(nodes))}; }}
         result = bash(setup + '''manage_single_node_outbounds 0 < <(printf '2\\n2\\n0\\n')''')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(nodes.read_text())[0]["backup_outbounds"], [backup])
-        self.assertIn("TFO: 开启", result.stdout)
+        self.assertNotIn("TFO", result.stdout)
         result = bash(setup + '''manage_single_node_outbounds 0 < <(printf '4\\n2\\n1\\n0\\n')''')
         self.assertEqual(result.returncode, 0, result.stderr)
         saved = json.loads(nodes.read_text())[0]

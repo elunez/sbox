@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.38"
+readonly SCRIPT_VERSION="0.0.39"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -84,8 +84,7 @@ REALITY_PUBLIC_KEY=""
 REALITY_SHORT_ID=""
 REALITY_HANDSHAKE_SERVER="www.microsoft.com"
 REALITY_HANDSHAKE_PORT="443"
-TRAFFIC_BILLING="single"
-TRAFFIC_LIMIT="unlimited"
+TRAFFIC_LIMIT=""
 TRAFFIC_RESET_DAY=""
 SKIP_PROTOCOL_PROMPT=0
 DNSPOD_TOKEN_ID=""
@@ -3333,28 +3332,29 @@ traffic_defaults_json() {
 }
 
 collect_traffic_settings() {
-  local old=${1:-} target=${2:-}
-  local old_billing old_limit old_day old_rate_limit traffic_json
-  old_billing=$(jq -r '.traffic.billing_mode // "single"' <<<"${old:-"{}"}")
-  old_limit=$(jq -r '.traffic.monthly_limit // "unlimited"' <<<"${old:-"{}"}")
-  old_day=$(jq -r '.traffic.reset_day // empty' <<<"${old:-"{}"}")
-  TRAFFIC_BILLING="$old_billing"; TRAFFIC_LIMIT="$old_limit"; TRAFFIC_RESET_DAY="$old_day"
-  if (( ! NON_INTERACTIVE )); then
-    prompt_choice TRAFFIC_BILLING "流量计费统计方式" "$TRAFFIC_BILLING" \
+  local old=${1:-'{}'} target=${2:-} prompt_settings=${3:-1}
+  local billing limit reset_day old_rate_limit traffic_json
+  billing=$(jq -r '.traffic.billing_mode // "single"' <<<"$old")
+  limit=${TRAFFIC_LIMIT:-$(jq -r '.traffic.monthly_limit // "unlimited"' <<<"$old")}
+  reset_day=${TRAFFIC_RESET_DAY:-$(jq -r 'if ((.traffic // {}) | has("reset_day")) then (.traffic.reset_day // 0) else 1 end' <<<"$old")}
+  if (( prompt_settings && ! NON_INTERACTIVE )); then
+    prompt_choice billing "流量计费统计方式" "$billing" \
       "single|单向计费（仅统计出站/下行流量）" \
       "double|双向计费（同时统计入站与出站流量）" || return 1
   fi
-  prompt_value TRAFFIC_LIMIT "月流量配额（如 100、1.5、100GB、1.5TB，未填单位默认 GB，输入 0 或 unlimited 表示不限额）" "$TRAFFIC_LIMIT"
-  TRAFFIC_LIMIT=$(normalize_quota "$TRAFFIC_LIMIT")
-  validate_quota "$TRAFFIC_LIMIT" || die "流量配额格式无效，请输入类似 100、1.5、100MB、500GB、2TB 或 unlimited。"
-  [[ "$TRAFFIC_LIMIT" == "0" ]] && TRAFFIC_LIMIT="unlimited"
-  prompt_value TRAFFIC_RESET_DAY "每月重置日（1-31日，输入 0 或留空表示不自动重置）" "${TRAFFIC_RESET_DAY:-1}"
-  if [[ -n "$TRAFFIC_RESET_DAY" && "$TRAFFIC_RESET_DAY" != "0" ]]; then
-    validate_reset_day "$TRAFFIC_RESET_DAY" || die "重置日必须在 1 到 31 之间。"
-  else
-    TRAFFIC_RESET_DAY=""
+  if (( prompt_settings )); then
+    prompt_value limit "月流量配额（如 100、1.5、100GB、1.5TB，未填单位默认 GB，输入 0 或 unlimited 表示不限额）" "$limit"
+    prompt_value reset_day "每月重置日（1-31日，输入 0 表示不自动重置）" "$reset_day"
   fi
-  traffic_json=$(traffic_defaults_json "$TRAFFIC_BILLING" "$TRAFFIC_LIMIT" "$TRAFFIC_RESET_DAY")
+  limit=$(normalize_quota "$limit")
+  validate_quota "$limit" || die "流量配额格式无效，请输入类似 100、1.5、100MB、500GB、2TB 或 unlimited。"
+  [[ "$limit" == "0" ]] && limit="unlimited"
+  if [[ -n "$reset_day" && "$reset_day" != "0" ]]; then
+    validate_reset_day "$reset_day" || die "重置日必须在 1 到 31 之间。"
+  else
+    reset_day=""
+  fi
+  traffic_json=$(traffic_defaults_json "$billing" "$limit" "$reset_day")
   old_rate_limit=$(jq -c '.traffic.rate_limit // {enabled:false,upload:null,download:null}' <<<"${old:-"{}"}")
   traffic_json=$(jq -c --argjson rate_limit "$old_rate_limit" '.rate_limit = $rate_limit' <<<"$traffic_json")
   if [[ -n "$target" ]]; then
@@ -3418,9 +3418,6 @@ collect_ss_tfo_settings() {
   local old=${1:-'{}'}
   SS_TFO=${SS_TFO:-$(jq -r '.tcp_fast_open // false' <<<"$old")}
   [[ "$SS_TFO" == "true" || "$SS_TFO" == "false" ]] || die "SS TFO 必须为 true 或 false。"
-  prompt_choice SS_TFO "Shadowsocks TCP Fast Open (TFO)" "$SS_TFO" \
-    "false|关闭" "true|开启（客户端也需支持 TFO）" || return 1
-  [[ "$SS_TFO" == "true" || "$SS_TFO" == "false" ]] || die "SS TFO 选项无效。"
 }
 
 warn_ss_tfo_support() {
@@ -3441,12 +3438,9 @@ warn_ss_tfo_support() {
 collect_ss_outbound_tfo_settings() {
   local tfo_json=$1 old_outbound=${2:-'{}'} tfo_target=$3 outbound_tfo
   if [[ "$(jq -r '.type // "direct"' <<<"$tfo_json")" == "shadowsocks" ]]; then
-    # 每个出口独立取默认值，不复用 SS 入站或上一个出口的交互选择。
+    # 新出口默认关闭；编辑时保留该出口的已有设置，命令行参数可显式覆盖。
     outbound_tfo=${SS_OUTBOUND_TFO:-$(jq -r '.tcp_fast_open // false' <<<"$old_outbound")}
     [[ "$outbound_tfo" == "true" || "$outbound_tfo" == "false" ]] || die "SS 出站 TFO 必须为 true 或 false。"
-    prompt_choice outbound_tfo "Shadowsocks 出站 TCP Fast Open (TFO)" "$outbound_tfo" \
-      "false|关闭" "true|开启（SS 服务器也需开启 TFO）" || return 1
-    [[ "$outbound_tfo" == "true" || "$outbound_tfo" == "false" ]] || die "SS 出站 TFO 选项无效。"
     tfo_json=$(jq -c --argjson tfo "$outbound_tfo" '.tcp_fast_open=$tfo' <<<"$tfo_json") || return 1
   fi
   printf -v "$tfo_target" '%s' "$tfo_json"
@@ -3507,194 +3501,158 @@ collect_inbound_settings() {
 
 collect_outbound_settings() {
   local old=${1:-} target=${2:-} field=${3:-outbound}
-  local mode outbound_json="" existing_outbound
+  local mode outbound_json="" existing_outbound outbound_input current_label
   if [[ "$field" != "outbound" ]]; then
     old=$(jq -c --arg field "$field" '.outbound = (.[$field] // {type:"direct"})' <<<"${old:-"{}"}")
   fi
   existing_outbound=$(jq -c '.outbound // {type:"direct"}' <<<"${old:-"{}"}")
+  mode="$OUTBOUND"
 
-  if [[ "$OUTBOUND" == *"://"* ]]; then
-    if parse_proxy_link "$OUTBOUND" outbound_json; then
-      collect_ss_outbound_tfo_settings "$outbound_json" "$existing_outbound" outbound_json || return 1
-      if [[ -n "$target" ]]; then
-        printf -v "$target" "%s" "$outbound_json"
-      else
-        printf "%s" "$outbound_json"
+  while true; do
+    if (( ! NON_INTERACTIVE )) && [[ -z "$mode" ]]; then
+      current_label=$(protocol_label "$(jq -r '.type // "direct"' <<<"$existing_outbound")")
+      if [[ "$(jq -r '.type // "direct"' <<<"$existing_outbound")" != "direct" ]]; then
+        current_label+=" ($(jq -r '.server' <<<"$existing_outbound"):$(jq -r '.port' <<<"$existing_outbound"))"
       fi
-      return 0
+      printf '\n当前出口：%s\n' "$current_label"
+      prompt_value outbound_input "粘贴出口分享链接，m 手动配置，0 取消（回车保留当前出口）" "" || return 1
+      case "$outbound_input" in
+        "") outbound_json="$existing_outbound"; break ;;
+        0) return 1 ;;
+        m|M)
+          mode=$(jq -r '.type // "direct"' <<<"$existing_outbound")
+          choose_outbound_protocol mode "$mode" "出口协议设置" || return 1
+          ;;
+        *://*) mode="$outbound_input" ;;
+        *) warn "请粘贴分享链接、输入 m 手动配置，或直接回车。"; continue ;;
+      esac
     else
-      warn "命令行传入的出口分享链接解析失败。"
+      mode=${mode:-$(jq -r '.type // "direct"' <<<"$existing_outbound")}
+      [[ "$mode" != "ss" ]] || mode="shadowsocks"
+      if [[ "$mode" != *"://"* ]]; then
+        choose_outbound_protocol mode "$mode" "出口协议设置" || return 1
+      fi
     fi
-  fi
+    if [[ "$mode" == *"://"* ]]; then
+      if parse_proxy_link "$mode" outbound_json; then break; fi
+      if (( NON_INTERACTIVE )) || [[ -n "$OUTBOUND" ]]; then return 1; fi
+      mode=""
+      continue
+    fi
+    break
+  done
 
-  if (( ! NON_INTERACTIVE )); then
-    echo
-    if [[ "$field" == "outbound" ]]; then
-      info "配置节点主出口分流路由……"
-    else
-      info "配置备用出口分流路由……"
-    fi
-    printf "%s提示：%s可直接粘贴出口节点分享链接 (支持 anytls://, ss://, vless://, trojan://, hy2://, socks5://, http://)\n" "$C_CYAN" "$C_RESET"
-    printf "      直接按回车，则进入出口协议菜单进行手动选择配置。\n"
-    local outbound_link=""
-    prompt_value outbound_link "出口节点分享链接 (可直接粘贴，留空手动选择)" ""
-    if [[ "$outbound_link" == "0" ]]; then
-      return 1
-    fi
-    if [[ -n "$outbound_link" ]]; then
-      if parse_proxy_link "$outbound_link" outbound_json; then
-        local confirm_use=""
-        read -r -p "确认使用此出口配置？[Y/n，默认: Y]: " confirm_use
-        confirm_use=${confirm_use:-Y}
-        if [[ "$confirm_use" =~ ^[Yy]$ ]]; then
-          collect_ss_outbound_tfo_settings "$outbound_json" "$existing_outbound" outbound_json || return 1
-          ok "已采用分享链接导入的出口配置！"
-          if [[ -n "$target" ]]; then
-            printf -v "$target" "%s" "$outbound_json"
-          else
-            printf "%s" "$outbound_json"
-          fi
-          return 0
+  if [[ -z "$outbound_json" ]]; then
+    OUTBOUND="$mode"
+    case "$OUTBOUND" in
+      direct)
+        outbound_json=$(jq -cn '{type:"direct"}')
+        ;;
+      socks5|socks)
+        local socks_server socks_port socks_user socks_pass
+        socks_server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
+        socks_port=$(jq -r '.outbound.port // "1080"' <<<"${old:-"{}"}")
+        socks_user=$(jq -r '.outbound.username // empty' <<<"${old:-"{}"}")
+        socks_pass=$(jq -r '.outbound.password // empty' <<<"${old:-"{}"}")
+        prompt_value socks_server "出口 SOCKS5 服务器地址 (域名或 IP)" "$socks_server"
+        prompt_value socks_port "出口 SOCKS5 端口" "$socks_port"
+        prompt_value socks_user "出口 SOCKS5 认证用户名 (可选，留空表示无认证)" "$socks_user"
+        prompt_secret socks_pass "出口 SOCKS5 认证密码 (可选，留空表示无认证)" "$socks_pass"
+        validate_host "$socks_server" && validate_port "$socks_port" || die "SOCKS5 出口参数无效。"
+        outbound_json=$(jq -cn \
+          --arg server "$socks_server" \
+          --argjson port "$socks_port" \
+          --arg username "$socks_user" \
+          --arg password "$socks_pass" \
+          '{type:"socks5",server:$server,port:$port,username:$username,password:$password}')
+        ;;
+      http)
+        local http_server http_port http_user http_pass http_tls http_sni
+        http_server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
+        http_port=$(jq -r '.outbound.port // "8080"' <<<"${old:-"{}"}")
+        http_user=$(jq -r '.outbound.username // empty' <<<"${old:-"{}"}")
+        http_pass=$(jq -r '.outbound.password // empty' <<<"${old:-"{}"}")
+        http_tls=$(jq -r '.outbound.tls.enabled // false' <<<"${old:-"{}"}")
+        http_sni=$(jq -r '.outbound.tls.server_name // empty' <<<"${old:-"{}"}")
+        prompt_value http_server "出口 HTTP 代理服务器地址 (域名或 IP)" "$http_server"
+        prompt_value http_port "出口 HTTP 代理端口" "$http_port"
+        prompt_value http_user "出口 HTTP 认证用户名 (可选，留空表示无认证)" "$http_user"
+        prompt_secret http_pass "出口 HTTP 认证密码 (可选，留空表示无认证)" "$http_pass"
+        local tls_choice="no"
+        [[ "$http_tls" == "true" ]] && tls_choice="yes"
+        prompt_choice tls_choice "是否启用 HTTPS/TLS 代理连接" "$tls_choice" \
+          "no|普通 HTTP 代理 (明文传输)" \
+          "yes|HTTPS 代理 (TLS 加密传输)" || return 1
+        if [[ "$tls_choice" == "yes" ]]; then
+          prompt_value http_sni "TLS SNI / 证书域名" "${http_sni:-$http_server}"
+          http_tls="true"
+        else
+          http_tls="false"
+          http_sni=""
         fi
-        warn "已取消使用该分享链接，进入手动协议配置菜单。"
-      else
-        warn "分享链接解析失败，进入手动协议配置菜单。"
-      fi
-    fi
+        validate_host "$http_server" && validate_port "$http_port" || die "HTTP 代理出口参数无效。"
+        outbound_json=$(jq -cn \
+          --arg server "$http_server" \
+          --argjson port "$http_port" \
+          --arg username "$http_user" \
+          --arg password "$http_pass" \
+          --argjson tls "$http_tls" \
+          --arg sni "$http_sni" \
+          '{type:"http",server:$server,port:$port,username:$username,password:$password,tls:{enabled:$tls,server_name:$sni}}')
+        ;;
+      shadowsocks)
+        local ss_server ss_port ss_method ss_password
+        ss_server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
+        ss_port=$(jq -r '.outbound.port // "8388"' <<<"${old:-"{}"}")
+        ss_method=$(jq -r '.outbound.method // "2022-blake3-aes-128-gcm"' <<<"${old:-"{}"}")
+        ss_password=$(jq -r '.outbound.password // empty' <<<"${old:-"{}"}")
+        prompt_value ss_server "出口 Shadowsocks 服务器地址" "$ss_server"
+        prompt_value ss_port "出口 Shadowsocks 端口" "$ss_port"
+        SS_METHOD="$ss_method"
+        if (( ! NON_INTERACTIVE )); then choose_ss_method || return 1; fi
+        ss_method="$SS_METHOD"
+        prompt_secret ss_password "出口 Shadowsocks 密码" "$ss_password"
+        validate_host "$ss_server" && validate_port "$ss_port" && validate_ss_method "$ss_method" || die "Shadowsocks 出口参数无效。"
+        validate_ss_password "$ss_method" "$ss_password" || die "Shadowsocks 出口密码格式不匹配。"
+        outbound_json=$(jq -cn --arg server "$ss_server" --argjson port "$ss_port" --arg method "$ss_method" --arg password "$ss_password" \
+          '{type:"shadowsocks",server:$server,port:$port,method:$method,password:$password}')
+        ;;
+      anytls|trojan|hysteria2)
+        local server port password server_name
+        server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
+        port=$(jq -r '.outbound.port // "443"' <<<"${old:-"{}"}")
+        password=$(jq -r '.outbound.password // empty' <<<"${old:-"{}"}")
+        server_name=$(jq -r '.outbound.server_name // empty' <<<"${old:-"{}"}")
+        prompt_value server "出口服务器地址" "$server"
+        prompt_value port "出口端口" "$port"
+        prompt_secret password "$(protocol_label "$OUTBOUND") 出口密码" "$password"
+        prompt_value server_name "TLS 域名 (SNI)" "${server_name:-$server}"
+        validate_host "$server" && validate_port "$port" && [[ -n "$password" ]] || die "出口参数无效。"
+        outbound_json=$(jq -cn --arg type "$OUTBOUND" --arg server "$server" --argjson port "$port" --arg password "$password" --arg server_name "$server_name" \
+          '{type:$type,server:$server,port:$port,password:$password,server_name:$server_name}')
+        ;;
+      vless-reality)
+        local server port uuid server_name public_key short_id
+        server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
+        port=$(jq -r '.outbound.port // "443"' <<<"${old:-"{}"}")
+        uuid=$(jq -r '.outbound.uuid // empty' <<<"${old:-"{}"}")
+        server_name=$(jq -r '.outbound.server_name // "www.microsoft.com"' <<<"${old:-"{}"}")
+        public_key=$(jq -r '.outbound.public_key // empty' <<<"${old:-"{}"}")
+        short_id=$(jq -r '.outbound.short_id // empty' <<<"${old:-"{}"}")
+        prompt_value server "出口服务器地址" "$server"
+        prompt_value port "出口端口" "$port"
+        prompt_value uuid "出口 VLESS UUID" "$uuid"
+        prompt_value server_name "出口 REALITY SNI 握手域名" "$server_name"
+        prompt_value public_key "出口 REALITY 公钥" "$public_key"
+        prompt_value short_id "出口 REALITY Short ID" "$short_id"
+        validate_host "$server" && validate_port "$port" && validate_uuid "$uuid" || die "VLESS 出口参数无效。"
+        [[ -n "$public_key" && "$short_id" =~ ^[0-9a-fA-F]{2,32}$ ]] || die "REALITY 出口公钥或 Short ID 无效。"
+        outbound_json=$(jq -cn --arg server "$server" --argjson port "$port" --arg uuid "$uuid" --arg server_name "$server_name" --arg public_key "$public_key" --arg short_id "$short_id" \
+          '{type:"vless-reality",server:$server,port:$port,uuid:$uuid,server_name:$server_name,public_key:$public_key,short_id:$short_id}')
+        ;;
+      *) die "不支持的出口协议：$OUTBOUND" ;;
+    esac
   fi
-
-  if [[ -n "$OUTBOUND" && "$OUTBOUND" != *"://"* ]]; then
-    mode="$OUTBOUND"
-  else
-    mode=$(jq -r '.outbound.type // "direct"' <<<"${old:-"{}"}")
-  fi
-  OUTBOUND="$mode"
-  [[ "$OUTBOUND" == "ss" ]] && OUTBOUND="shadowsocks"
-  choose_outbound_protocol OUTBOUND "$OUTBOUND" "出口协议设置" || return 1
-
-  if [[ "$OUTBOUND" == *"://"* ]]; then
-    if parse_proxy_link "$OUTBOUND" outbound_json; then
-      collect_ss_outbound_tfo_settings "$outbound_json" "$existing_outbound" outbound_json || return 1
-      ok "已采用分享链接导入的出口配置！"
-      if [[ -n "$target" ]]; then
-        printf -v "$target" "%s" "$outbound_json"
-      else
-        printf "%s" "$outbound_json"
-      fi
-      return 0
-    else
-      warn "分享链接解析失败，已退出出口配置。"
-      return 1
-    fi
-  fi
-  case "$OUTBOUND" in
-    direct)
-      outbound_json=$(jq -cn '{type:"direct"}')
-      ;;
-    socks5|socks)
-      local socks_server socks_port socks_user socks_pass
-      socks_server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
-      socks_port=$(jq -r '.outbound.port // "1080"' <<<"${old:-"{}"}")
-      socks_user=$(jq -r '.outbound.username // empty' <<<"${old:-"{}"}")
-      socks_pass=$(jq -r '.outbound.password // empty' <<<"${old:-"{}"}")
-      prompt_value socks_server "出口 SOCKS5 服务器地址 (域名或 IP)" "$socks_server"
-      prompt_value socks_port "出口 SOCKS5 端口" "$socks_port"
-      prompt_value socks_user "出口 SOCKS5 认证用户名 (可选，留空表示无认证)" "$socks_user"
-      prompt_secret socks_pass "出口 SOCKS5 认证密码 (可选，留空表示无认证)" "$socks_pass"
-      validate_host "$socks_server" && validate_port "$socks_port" || die "SOCKS5 出口参数无效。"
-      outbound_json=$(jq -cn \
-        --arg server "$socks_server" \
-        --argjson port "$socks_port" \
-        --arg username "$socks_user" \
-        --arg password "$socks_pass" \
-        '{type:"socks5",server:$server,port:$port,username:$username,password:$password}')
-      ;;
-    http)
-      local http_server http_port http_user http_pass http_tls http_sni
-      http_server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
-      http_port=$(jq -r '.outbound.port // "8080"' <<<"${old:-"{}"}")
-      http_user=$(jq -r '.outbound.username // empty' <<<"${old:-"{}"}")
-      http_pass=$(jq -r '.outbound.password // empty' <<<"${old:-"{}"}")
-      http_tls=$(jq -r '.outbound.tls.enabled // false' <<<"${old:-"{}"}")
-      http_sni=$(jq -r '.outbound.tls.server_name // empty' <<<"${old:-"{}"}")
-      prompt_value http_server "出口 HTTP 代理服务器地址 (域名或 IP)" "$http_server"
-      prompt_value http_port "出口 HTTP 代理端口" "$http_port"
-      prompt_value http_user "出口 HTTP 认证用户名 (可选，留空表示无认证)" "$http_user"
-      prompt_secret http_pass "出口 HTTP 认证密码 (可选，留空表示无认证)" "$http_pass"
-      local tls_choice="no"
-      [[ "$http_tls" == "true" ]] && tls_choice="yes"
-      prompt_choice tls_choice "是否启用 HTTPS/TLS 代理连接" "$tls_choice" \
-        "no|普通 HTTP 代理 (明文传输)" \
-        "yes|HTTPS 代理 (TLS 加密传输)" || return 1
-      if [[ "$tls_choice" == "yes" ]]; then
-        prompt_value http_sni "TLS SNI / 证书域名" "${http_sni:-$http_server}"
-        http_tls="true"
-      else
-        http_tls="false"
-        http_sni=""
-      fi
-      validate_host "$http_server" && validate_port "$http_port" || die "HTTP 代理出口参数无效。"
-      outbound_json=$(jq -cn \
-        --arg server "$http_server" \
-        --argjson port "$http_port" \
-        --arg username "$http_user" \
-        --arg password "$http_pass" \
-        --argjson tls "$http_tls" \
-        --arg sni "$http_sni" \
-        '{type:"http",server:$server,port:$port,username:$username,password:$password,tls:{enabled:$tls,server_name:$sni}}')
-      ;;
-    shadowsocks)
-      local ss_server ss_port ss_method ss_password
-      ss_server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
-      ss_port=$(jq -r '.outbound.port // "8388"' <<<"${old:-"{}"}")
-      ss_method=$(jq -r '.outbound.method // "2022-blake3-aes-128-gcm"' <<<"${old:-"{}"}")
-      ss_password=$(jq -r '.outbound.password // empty' <<<"${old:-"{}"}")
-      prompt_value ss_server "出口 Shadowsocks 服务器地址" "$ss_server"
-      prompt_value ss_port "出口 Shadowsocks 端口" "$ss_port"
-      SS_METHOD="$ss_method"
-      if (( ! NON_INTERACTIVE )); then choose_ss_method || return 1; fi
-      ss_method="$SS_METHOD"
-      prompt_secret ss_password "出口 Shadowsocks 密码" "$ss_password"
-      validate_host "$ss_server" && validate_port "$ss_port" && validate_ss_method "$ss_method" || die "Shadowsocks 出口参数无效。"
-      validate_ss_password "$ss_method" "$ss_password" || die "Shadowsocks 出口密码格式不匹配。"
-      outbound_json=$(jq -cn --arg server "$ss_server" --argjson port "$ss_port" --arg method "$ss_method" --arg password "$ss_password" \
-        '{type:"shadowsocks",server:$server,port:$port,method:$method,password:$password}')
-      ;;
-    anytls|trojan|hysteria2)
-      local server port password server_name
-      server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
-      port=$(jq -r '.outbound.port // "443"' <<<"${old:-"{}"}")
-      password=$(jq -r '.outbound.password // empty' <<<"${old:-"{}"}")
-      server_name=$(jq -r '.outbound.server_name // empty' <<<"${old:-"{}"}")
-      prompt_value server "出口服务器地址" "$server"
-      prompt_value port "出口端口" "$port"
-      prompt_secret password "$(protocol_label "$OUTBOUND") 出口密码" "$password"
-      prompt_value server_name "TLS 域名 (SNI)" "${server_name:-$server}"
-      validate_host "$server" && validate_port "$port" && [[ -n "$password" ]] || die "出口参数无效。"
-      outbound_json=$(jq -cn --arg type "$OUTBOUND" --arg server "$server" --argjson port "$port" --arg password "$password" --arg server_name "$server_name" \
-        '{type:$type,server:$server,port:$port,password:$password,server_name:$server_name}')
-      ;;
-    vless-reality)
-      local server port uuid server_name public_key short_id
-      server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
-      port=$(jq -r '.outbound.port // "443"' <<<"${old:-"{}"}")
-      uuid=$(jq -r '.outbound.uuid // empty' <<<"${old:-"{}"}")
-      server_name=$(jq -r '.outbound.server_name // "www.microsoft.com"' <<<"${old:-"{}"}")
-      public_key=$(jq -r '.outbound.public_key // empty' <<<"${old:-"{}"}")
-      short_id=$(jq -r '.outbound.short_id // empty' <<<"${old:-"{}"}")
-      prompt_value server "出口服务器地址" "$server"
-      prompt_value port "出口端口" "$port"
-      prompt_value uuid "出口 VLESS UUID" "$uuid"
-      prompt_value server_name "出口 REALITY SNI 握手域名" "$server_name"
-      prompt_value public_key "出口 REALITY 公钥" "$public_key"
-      prompt_value short_id "出口 REALITY Short ID" "$short_id"
-      validate_host "$server" && validate_port "$port" && validate_uuid "$uuid" || die "VLESS 出口参数无效。"
-      [[ -n "$public_key" && "$short_id" =~ ^[0-9a-fA-F]{2,32}$ ]] || die "REALITY 出口公钥或 Short ID 无效。"
-      outbound_json=$(jq -cn --arg server "$server" --argjson port "$port" --arg uuid "$uuid" --arg server_name "$server_name" --arg public_key "$public_key" --arg short_id "$short_id" \
-        '{type:"vless-reality",server:$server,port:$port,uuid:$uuid,server_name:$server_name,public_key:$public_key,short_id:$short_id}')
-      ;;
-    *) die "不支持的出口协议：$OUTBOUND" ;;
-  esac
   collect_ss_outbound_tfo_settings "$outbound_json" "$existing_outbound" outbound_json || return 1
   if [[ -n "$target" ]]; then
     printf -v "$target" "%s" "$outbound_json"
@@ -3733,43 +3691,6 @@ normalize_backup_outbounds() {
     [.[] | select((.type // "direct") != "direct")]
     + (if any(.[]; (.type // "direct") == "direct") then [{type:"direct"}] else [] end)
   ' <<<"$backups"
-}
-
-collect_backup_outbounds() {
-  local old=${1:-} target=${2:-} backups backup_json choice
-  backups=$(jq -c '.backup_outbounds // []' <<<"${old:-"{}"}")
-  backups=$(normalize_backup_outbounds "$backups")
-  if (( NON_INTERACTIVE )); then
-    printf -v "$target" '%s' "$backups"
-    return 0
-  fi
-  while true; do
-    echo
-    printf "%s=== 是否添加备用出口 ===%s\n" "$C_CYAN" "$C_RESET"
-    printf "   1) 是，添加一个备用出口\n"
-    printf "   2) 否，暂不添加备用出口\n"
-    choice=""
-    read -r -p "请输入选择【是否添加备用出口】[1-2，默认: 2]: " choice
-    choice=${choice:-2}
-    if [[ "$choice" != "1" ]]; then
-      break
-    fi
-    OUTBOUND=""
-    if ! collect_outbound_settings "$old" backup_json backup; then
-      warn "已取消本次备用出口配置。"
-      break
-    fi
-    local new_type
-    new_type=$(jq -r '.type // "direct"' <<<"$backup_json")
-    if [[ "$new_type" == "direct" ]] && jq -e 'any(.[]; (.type // "direct") == "direct")' <<<"$backups" >/dev/null 2>&1; then
-      warn "已配置 Direct 回退，无需重复添加。"
-      continue
-    fi
-    backups=$(jq -c --argjson item "$backup_json" '. + [$item]' <<<"$backups")
-    ok "备用出口已添加（当前共 $(jq 'length' <<<"$backups") 个）。"
-  done
-  backups=$(normalize_backup_outbounds "$backups")
-  printf -v "$target" '%s' "$backups"
 }
 
 validate_dns_settings() {
@@ -3917,14 +3838,10 @@ collect_node_json() {
   validate_port "$NODE_PORT" || die "监听端口无效。"
   collect_inbound_settings "$old" || return 1
   collect_dns_settings "${old:-'{}'}" node_dns || return 1
-  echo
-  info "配置流量管理与配额策略……"
-  collect_traffic_settings "$old" traffic || return 1
-  echo
-  info "配置节点主出口分流路由……"
+  collect_traffic_settings "${old:-'{}'}" traffic 0 || return 1
   collect_outbound_settings "$old" outbound || return 1
   if [[ "$(jq -r '.type // "direct"' <<<"$outbound")" != "direct" ]]; then
-    collect_backup_outbounds "$old" backup_outbounds
+    backup_outbounds=$(normalize_backup_outbounds "$(jq -c '.backup_outbounds // []' <<<"${old:-'{}'}")")
   else
     backup_outbounds='[]'
   fi
@@ -5146,9 +5063,6 @@ print_node_summary_card() {
   printf "  监听端口: %s\n" "$port"
   printf "  连接地址: %s\n" "$domain"
   printf "  认证凭据: %s\n" "$cred_str"
-  if [[ "$raw_proto" == "shadowsocks" ]]; then
-    printf "  TCP Fast Open: %s\n" "$(if [[ "$(jq -r '.tcp_fast_open // false' <<<"$node")" == "true" ]]; then echo "开启"; else echo "关闭"; fi)"
-  fi
   if [[ -n "$pad_str" ]]; then
     printf "  混淆策略: %s\n" "$pad_str"
   fi
@@ -5838,17 +5752,6 @@ edit_node_wizard() {
   ok "节点已成功完整重新配置！"
 }
 
-edit_node_tfo() {
-  local index=$1 nodes old
-  nodes=$(current_nodes_json)
-  old=$(jq -c ".[$index]" <<<"$nodes")
-  [[ "$(jq -r '.protocol' <<<"$old")" == "shadowsocks" ]] || return 0
-  SS_TFO=""
-  collect_ss_tfo_settings "$old" || return 0
-  save_nodes_json "$(jq -c --argjson index "$index" --argjson tfo "$SS_TFO" '.[$index].tcp_fast_open = $tfo' <<<"$nodes")"
-  ok "Shadowsocks TFO 配置已更新。"
-}
-
 edit_node_dns() {
   local index=$1 nodes old node_dns
   nodes=$(current_nodes_json)
@@ -5882,12 +5785,8 @@ edit_single_node_menu() {
     printf "  5) 节点名称\n"
     printf "  6) 连接地址\n"
     printf "  7) 流量策略\n"
-    if [[ "$proto" == "anytls" || "$proto" == "shadowsocks" ]]; then
-      if [[ "$proto" == "anytls" ]]; then
-        printf "  8) 混淆规则 (AnyTLS)\n"
-      else
-        printf "  8) TCP Fast Open (TFO)\n"
-      fi
+    if [[ "$proto" == "anytls" ]]; then
+      printf "  8) 混淆规则 (AnyTLS)\n"
       printf "  9) 完整重配\n"
       printf " 10) DNS 设置\n"
       printf "  0) 返回上级\n"
@@ -5899,7 +5798,7 @@ edit_single_node_menu() {
       read -r -p "请输入选择 [0-9，默认: 0]: " choice
     fi
     choice=${choice:-0}
-    if [[ "$proto" == "anytls" || "$proto" == "shadowsocks" ]]; then
+    if [[ "$proto" == "anytls" ]]; then
       case "$choice" in
         1) edit_node_protocol "$index" ;;
         2) edit_node_outbound "$index" ;;
@@ -5908,7 +5807,7 @@ edit_single_node_menu() {
         5) edit_node_name "$index" ;;
         6) edit_node_domain "$index" ;;
         7) edit_node_traffic "$index" ;;
-        8) if [[ "$proto" == "anytls" ]]; then edit_node_padding_scheme "$index"; else edit_node_tfo "$index"; fi ;;
+        8) edit_node_padding_scheme "$index" ;;
         9) edit_node_wizard "$index" ;;
         10) edit_node_dns "$index" ;;
         0|"") return 0 ;;
@@ -6031,9 +5930,6 @@ manage_single_node_outbounds() {
         o_port=$(jq -r '.port // empty' <<<"$o_item")
         o_desc="$(protocol_label "$o_type")"
         [[ -n "$o_srv" && -n "$o_port" ]] && o_desc+=" (${o_srv}:${o_port})"
-        if [[ "$o_type" == "shadowsocks" ]]; then
-          o_desc+=" [TFO: $(if [[ "$(jq -r '.tcp_fast_open // false' <<<"$o_item")" == "true" ]]; then echo "开启"; else echo "关闭"; fi)]"
-        fi
         if (( o_idx == 1 )); then
           printf "  %d) %s  %s[首选]%s\n" "$o_idx" "$o_desc" "$C_GREEN" "$C_RESET"
         else
@@ -6350,9 +6246,6 @@ show_client() {
     domain=$(jq -r '.domain' <<<"$node")
     port=$(jq -r '.port' <<<"$node")
     printf "\n%s[%d] 节点名称: %s%s\n" "$C_GREEN" "$index" "$name" "$C_RESET"
-    if [[ "$protocol" == "shadowsocks" ]]; then
-      printf "  TFO 状态: %s\n" "$(jq -r 'if .tcp_fast_open == true then "开启" else "关闭" end' <<<"$node")"
-    fi
     printf "  协议类型: %s\n" "$(protocol_label "$protocol")"
     printf "  连接地址: %s:%s\n" "$domain" "$port"
     case "$protocol" in
