@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.35"
+readonly SCRIPT_VERSION="0.0.36"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -1131,6 +1131,7 @@ protocol_label() {
     shadowsocks) printf "Shadowsocks" ;;
     trojan) printf "Trojan" ;;
     hysteria2) printf "Hysteria2" ;;
+    vless) printf "VLESS (TCP)" ;;
     vless-reality) printf "VLESS + REALITY" ;;
     socks5|socks) printf "SOCKS5" ;;
     http) printf "HTTP / HTTPS" ;;
@@ -1149,7 +1150,8 @@ choose_protocol() {
     "hysteria2|Hysteria2" \
     "vless-reality|VLESS + REALITY" \
     "socks5|SOCKS5" \
-    "http|HTTP / HTTPS"
+    "http|HTTP / HTTPS" \
+    "vless|VLESS (TCP，无 TLS)"
 }
 
 choose_outbound_protocol() {
@@ -1163,7 +1165,8 @@ choose_outbound_protocol() {
     "hysteria2|Hysteria2" \
     "vless-reality|VLESS + REALITY" \
     "socks5|SOCKS5 / SOCKS5H" \
-    "http|HTTP / HTTPS"
+    "http|HTTP / HTTPS" \
+    "vless|VLESS (TCP，无 TLS)"
 }
 
 choose_ss_method() {
@@ -1253,6 +1256,10 @@ def parse(link):
         }
 
     elif scheme in ("vless",):
+        pairs = urllib.parse.parse_qsl(u.query, keep_blank_values=True)
+        if len({key for key, _ in pairs}) != len(pairs):
+            raise ValueError("VLESS 链接包含重复参数")
+        params = dict(pairs)
         uuid = urllib.parse.unquote(u.username or "")
         host = u.hostname or ""
         port = int(u.port or 443)
@@ -1261,6 +1268,24 @@ def parse(link):
         sid = params.get("sid") or params.get("short_id") or ""
         if not host or not uuid:
             raise ValueError("VLESS 链接缺少主机或 UUID")
+        security = params.get("security") or ("reality" if pbk else "none")
+        if (params.get("type") or "tcp") != "tcp":
+            raise ValueError("VLESS 仅支持 TCP 传输，暂不支持 WS、gRPC 等传输")
+        if (params.get("encryption") or "none") != "none":
+            raise ValueError("VLESS encryption 仅支持 none")
+        if (params.get("headerType") or "none") != "none":
+            raise ValueError("VLESS 暂不支持 TCP 头部伪装")
+        if security == "none":
+            if params.get("flow"):
+                raise ValueError("普通 VLESS 不支持 flow，请使用无 Vision 的 TCP 链接")
+            allowed = {"encryption", "security", "type", "flow", "headerType"}
+            if any(value for key, value in pairs if key not in allowed):
+                raise ValueError("普通 VLESS 链接包含不支持的参数，仅支持 TCP、无 TLS、无 REALITY")
+            return {"type": "vless", "server": host, "port": port, "uuid": uuid}
+        if security != "reality":
+            raise ValueError("VLESS 暂仅支持 security=none 或 reality，不支持普通 TLS")
+        if params.get("flow") not in (None, "", "xtls-rprx-vision"):
+            raise ValueError("REALITY flow 仅支持 xtls-rprx-vision")
         if not pbk:
             raise ValueError("VLESS 链接缺少 REALITY 公钥 (pbk)")
         return {
@@ -1406,12 +1431,15 @@ EOF_PY
       validate_ss_method "$ss_m" || { warn "解析失败：Shadowsocks 加密方法不受支持 ($ss_m)。"; return 1; }
       validate_ss_password "$ss_m" "$ss_p" || { warn "解析失败：Shadowsocks 密码格式不符合 $ss_m 要求。"; return 1; }
       ;;
-    vless-reality)
+    vless|vless-reality)
       local v_uuid v_pbk
       v_uuid=$(jq -r '.uuid' <<<"$parsed_json")
       v_pbk=$(jq -r '.public_key' <<<"$parsed_json")
       validate_uuid "$v_uuid" || { warn "解析失败：VLESS UUID 格式无效 ($v_uuid)。"; return 1; }
-      [[ -n "$v_pbk" ]] || { warn "解析失败：REALITY 公钥 (pbk) 不能为空。"; return 1; }
+      if [[ "$p_type" == "vless-reality" && -z "$v_pbk" ]]; then
+        warn "解析失败：REALITY 公钥 (pbk) 不能为空。"
+        return 1
+      fi
       ;;
     anytls|trojan|hysteria2)
       local p_pwd
@@ -1433,6 +1461,10 @@ EOF_PY
       local s_sni
       s_sni=$(jq -r '.server_name // empty' <<<"$parsed_json")
       [[ -n "$s_sni" ]] && printf "  TLS 域名:   %s\n" "$s_sni"
+      ;;
+    vless)
+      printf "  UUID:       %s\n" "$(jq -r '.uuid' <<<"$parsed_json")"
+      printf "  传输方式:   TCP，无 TLS\n"
       ;;
     vless-reality)
       printf "  UUID:       %s\n" "$(jq -r '.uuid' <<<"$parsed_json")"
@@ -3349,6 +3381,14 @@ collect_traffic_settings() {
   fi
 }
 
+collect_vless_settings() {
+  local old=${1:-'{}'}
+  NODE_UUID=${NODE_UUID:-$(jq -r '.uuid // empty' <<<"$old")}
+  NODE_UUID=${NODE_UUID:-$(generate_uuid)}
+  prompt_value NODE_UUID "VLESS UUID" "$NODE_UUID"
+  validate_uuid "$NODE_UUID" || die "VLESS UUID 格式无效。"
+}
+
 collect_reality_settings() {
   local old=${1:-} keypair priv pub
   NODE_UUID=$(jq -r '.uuid // empty' <<<"${old:-"{}"}")
@@ -3450,6 +3490,9 @@ collect_inbound_settings() {
       ;;
     shadowsocks)
       collect_ss_settings "$old" || return 1
+      ;;
+    vless)
+      collect_vless_settings "${old:-'{}'}"
       ;;
     vless-reality)
       collect_reality_settings "$old"
@@ -3658,6 +3701,18 @@ collect_outbound_settings() {
       validate_host "$server" && validate_port "$port" && [[ -n "$password" ]] || die "出口参数无效。"
       outbound_json=$(jq -cn --arg type "$OUTBOUND" --arg server "$server" --argjson port "$port" --arg password "$password" --arg server_name "$server_name" \
         '{type:$type,server:$server,port:$port,password:$password,server_name:$server_name}')
+      ;;
+    vless)
+      local server port uuid
+      server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
+      port=$(jq -r '.outbound.port // "443"' <<<"${old:-"{}"}")
+      uuid=$(jq -r '.outbound.uuid // empty' <<<"${old:-"{}"}")
+      prompt_value server "出口服务器地址 (域名或 IP)" "$server"
+      prompt_value port "出口端口" "$port"
+      prompt_value uuid "出口 VLESS UUID" "$uuid"
+      validate_host "$server" && validate_port "$port" && validate_uuid "$uuid" || die "VLESS 出口参数无效。"
+      outbound_json=$(jq -cn --arg server "$server" --argjson port "$port" --arg uuid "$uuid" \
+        '{type:"vless",server:$server,port:$port,uuid:$uuid}')
       ;;
     vless-reality)
       local server port uuid server_name public_key short_id
@@ -3914,6 +3969,11 @@ collect_node_json() {
     backup_outbounds='[]'
   fi
   case "$PROTOCOL" in
+    vless)
+      node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
+        --arg uuid "$NODE_UUID" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,uuid:$uuid,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
+      ;;
     vless-reality)
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
         --arg uuid "$NODE_UUID" --arg private_key "$REALITY_PRIVATE_KEY" --arg public_key "$REALITY_PUBLIC_KEY" \
@@ -4049,7 +4109,7 @@ node_count() {
 validate_outbound_config() {
   local outbound_json=$1 label=${2:-出口} outbound_type
   outbound_type=$(jq -r '.type // "direct"' <<<"$outbound_json")
-  [[ "$outbound_type" == "direct" || "$outbound_type" == "socks5" || "$outbound_type" == "socks" || "$outbound_type" == "http" || "$outbound_type" == "shadowsocks" || "$outbound_type" == "anytls" || "$outbound_type" == "vless-reality" || "$outbound_type" == "trojan" || "$outbound_type" == "hysteria2" ]] || die "不支持的${label}协议：$outbound_type"
+  [[ "$outbound_type" == "direct" || "$outbound_type" == "socks5" || "$outbound_type" == "socks" || "$outbound_type" == "http" || "$outbound_type" == "shadowsocks" || "$outbound_type" == "anytls" || "$outbound_type" == "vless" || "$outbound_type" == "vless-reality" || "$outbound_type" == "trojan" || "$outbound_type" == "hysteria2" ]] || die "不支持的${label}协议：$outbound_type"
   if [[ "$outbound_type" != "direct" ]]; then
     validate_host "$(jq -r '.server // empty' <<<"$outbound_json")" || die "${label}服务器地址无效。"
     validate_port "$(jq -r '.port // empty' <<<"$outbound_json")" || die "${label}端口无效。"
@@ -4059,6 +4119,9 @@ validate_outbound_config() {
       validate_ss_method "$(jq -r '.method // empty' <<<"$outbound_json")" || die "${label} Shadowsocks 加密方法无效。"
       validate_ss_password "$(jq -r '.method' <<<"$outbound_json")" "$(jq -r '.password // empty' <<<"$outbound_json")" || die "${label} Shadowsocks 密码格式不匹配。"
       jq -e '(has("tcp_fast_open") | not) or (.tcp_fast_open | type == "boolean")' <<<"$outbound_json" >/dev/null || die "${label} Shadowsocks tcp_fast_open 必须为布尔值。"
+      ;;
+    vless)
+      validate_uuid "$(jq -r '.uuid // empty' <<<"$outbound_json")" || die "${label} VLESS UUID 无效。"
       ;;
     vless-reality)
       validate_uuid "$(jq -r '.uuid // empty' <<<"$outbound_json")" || die "${label} VLESS UUID 无效。"
@@ -4072,7 +4135,7 @@ validate_outbound_config() {
 
 validate_nodes_state() {
   local state_file=$1 node protocol
-  jq -e '(.nodes|type=="array") and (if (.nodes|length > 0) then (([.nodes[].port]|length==(unique|length)) and all(.nodes[]; (.name|type=="string" and length>0) and (.port|type=="number" and floor==. and .>=1 and .<=65535) and (.protocol|IN("anytls","shadowsocks","vless-reality","trojan","hysteria2","socks5","http")) and (.traffic.monthly_limit|type=="string") and (.traffic.reset_day==null or (.traffic.reset_day|type=="number" and floor==. and .>=1 and .<=31)))) else true end)' "$state_file" >/dev/null 2>&1 || die "节点状态校验失败：请检查协议类型、名称、端口、流量配置是否存在冲突或非法值。"
+  jq -e '(.nodes|type=="array") and (if (.nodes|length > 0) then (([.nodes[].port]|length==(unique|length)) and all(.nodes[]; (.name|type=="string" and length>0) and (.port|type=="number" and floor==. and .>=1 and .<=65535) and (.protocol|IN("anytls","shadowsocks","vless","vless-reality","trojan","hysteria2","socks5","http")) and (.traffic.monthly_limit|type=="string") and (.traffic.reset_day==null or (.traffic.reset_day|type=="number" and floor==. and .>=1 and .<=31)))) else true end)' "$state_file" >/dev/null 2>&1 || die "节点状态校验失败：请检查协议类型、名称、端口、流量配置是否存在冲突或非法值。"
   jq -e 'all(.nodes[]?; ((.backup_outbounds // []) | type == "array") and all((.backup_outbounds // [])[]?; type == "object"))' "$state_file" >/dev/null 2>&1 || die "节点状态校验失败：备用出口列表格式无效。"
   jq -e 'all(.nodes[]?; (has("tcp_fast_open") | not) or (.tcp_fast_open | type == "boolean"))' "$state_file" >/dev/null 2>&1 || die "节点状态校验失败：tcp_fast_open 必须为布尔值。"
   while IFS= read -r node; do
@@ -4091,6 +4154,9 @@ validate_nodes_state() {
         if [[ "$pad_type" != "null" ]]; then
           [[ "$pad_type" == "array" ]] || die "AnyTLS padding_scheme 必须为规则数组格式。"
         fi
+        ;;
+      vless)
+        validate_uuid "$(jq -r '.uuid // empty' <<<"$node")" || die "VLESS UUID 无效。"
         ;;
       vless-reality)
         validate_uuid "$(jq -r '.uuid // empty' <<<"$node")" || die "VLESS UUID 无效。"
@@ -4228,6 +4294,14 @@ generate_config_from_state() {
           password: $n.password,
           tcp_fast_open: ($n.tcp_fast_open // false)
         }
+      elif $n.protocol == "vless" then
+        {
+          type: "vless",
+          tag: ("in-" + (($i + 1)|tostring)),
+          listen: "::",
+          listen_port: $n.port,
+          users: [{name: $n.name, uuid: $n.uuid}]
+        }
       elif $n.protocol == "vless-reality" then
         {
           type: "vless",
@@ -4324,6 +4398,14 @@ generate_config_from_state() {
           server_port: $o.port,
           password: $o.password,
           tls: {enabled: true, server_name: $o.server_name}
+        }
+      elif $o.type == "vless" then
+        {
+          type: "vless",
+          tag: ($prefix + "-" + (($i + 1)|tostring)),
+          server: $o.server,
+          server_port: $o.port,
+          uuid: $o.uuid
         }
       elif $o.type == "vless-reality" then
         {
@@ -4520,7 +4602,7 @@ save_nodes_json() {
     [[ -n "$n_item" ]] || continue
     n_port=$(jq -r '.port' <<<"$n_item")
     n_proto=$(jq -r '.protocol // "anytls"' <<<"$n_item")
-    firewall_allow_port "$n_port" "$(case "$n_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
+    firewall_allow_port "$n_port" "$(case "$n_proto" in vless) echo "tcp";; hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
   done < <(jq -c '.[]?' <<<"$nodes")
   ensure_sbox_cli
 }
@@ -4965,6 +5047,7 @@ add_node_flow() {
   NODE_PORT=""
   NODE_PASSWORD=""
   NODE_USERNAME=""
+  NODE_UUID=""
   HTTP_TLS="false"
   SS_TFO=""
   echo
@@ -5024,6 +5107,7 @@ format_node_outbound_summary() {
     anytls) summary="AnyTLS 代理 (${o_server}:${o_port})" ;;
     trojan) summary="Trojan 代理 (${o_server}:${o_port})" ;;
     hysteria2) summary="Hysteria2 代理 (${o_server}:${o_port})" ;;
+    vless) summary="VLESS (TCP) 代理 (${o_server}:${o_port})" ;;
     vless-reality) summary="VLESS+REALITY 代理 (${o_server}:${o_port})" ;;
     *) summary="${o_type}" ;;
   esac
@@ -5051,6 +5135,11 @@ format_node_credential_summary() {
       local m
       m=$(jq -r '.method // empty' <<<"$node")
       echo "加密: ${m}, 密码: 已设置"
+      ;;
+    vless)
+      local u
+      u=$(jq -r '.uuid // empty' <<<"$node")
+      echo "UUID: ${u:0:8}..., TCP 无 TLS"
       ;;
     vless-reality)
       local u s
@@ -5242,6 +5331,11 @@ edit_node_protocol() {
       SS_TFO=""
       collect_ss_tfo_settings "$old" || return 0
       ;;
+    vless)
+      NODE_UUID=""
+      collect_vless_settings "$old" || return 0
+      new_uuid="$NODE_UUID"
+      ;;
     vless-reality)
       NODE_UUID=$(jq -r '.uuid // empty' <<<"$old")
       REALITY_PRIVATE_KEY=$(jq -r '.reality.private_key // empty' <<<"$old")
@@ -5291,6 +5385,11 @@ edit_node_protocol() {
   backup_outbounds=$(jq -c '.backup_outbounds // []' <<<"$old")
 
   case "$new_proto" in
+    vless)
+      new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
+        --arg uuid "$new_uuid" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,uuid:$uuid,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
+      ;;
     vless-reality)
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
         --arg uuid "$new_uuid" --arg private_key "$new_priv" --arg public_key "$new_pub" \
@@ -5338,9 +5437,9 @@ edit_node_protocol() {
 
   if [[ "$old_port" != "$new_port" ]]; then
     traffic_remove_port "$old_port"
-    firewall_remove_port "$old_port" "$(case "$old_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
+    firewall_remove_port "$old_port" "$(case "$old_proto" in vless) echo "tcp";; hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
   elif [[ "$old_proto" != "$new_proto" ]]; then
-    firewall_remove_port "$old_port" "$(case "$old_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
+    firewall_remove_port "$old_port" "$(case "$old_proto" in vless) echo "tcp";; hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
   fi
 
   nodes=$(current_nodes_json)
@@ -5378,7 +5477,7 @@ edit_node_port() {
     return 0
   fi
   traffic_remove_port "$old_port"
-  firewall_remove_port "$old_port" "$(case "$old_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
+  firewall_remove_port "$old_port" "$(case "$old_proto" in vless) echo "tcp";; hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
   nodes=$(current_nodes_json)
   save_nodes_json "$(jq -c --argjson index "$index" --argjson port "$new_port" '.[$index].port = $port' <<<"$nodes")"
   ok "节点 [${name}] 监听端口已成功修改为: ${new_port}！"
@@ -5450,6 +5549,14 @@ edit_node_credentials() {
         0|"") return 0 ;;
         *) warn "无效选择。"; return 0 ;;
       esac
+      ;;
+    vless)
+      local new_uuid
+      new_uuid=$(jq -r '.uuid // empty' <<<"$old")
+      prompt_value new_uuid "VLESS UUID (回车保留，输入 rand 随机生成)" "$new_uuid"
+      [[ "$new_uuid" != "rand" ]] || new_uuid=$(generate_uuid)
+      validate_uuid "$new_uuid" || { warn "VLESS UUID 格式无效。"; return 0; }
+      new_node=$(jq -c --arg uuid "$new_uuid" '.uuid = $uuid' <<<"$old")
       ;;
     vless-reality)
       local cur_uuid cur_priv cur_pub cur_sid cur_server cur_port r_sub_choice="1"
@@ -5788,6 +5895,7 @@ edit_node_wizard() {
   NODE_PORT=""
   NODE_PASSWORD=""
   NODE_USERNAME=$(jq -r '.username // empty' <<<"$old")
+  NODE_UUID=""
   HTTP_TLS=$(jq -r '.tls // false' <<<"$old")
   OUTBOUND=""
   SS_METHOD=""
@@ -5812,7 +5920,7 @@ edit_node_wizard() {
     local old_proto
     old_proto=$(jq -r '.protocol // "anytls"' <<<"$old")
     traffic_remove_port "$old_port"
-    firewall_remove_port "$old_port" "$(case "$old_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
+    firewall_remove_port "$old_port" "$(case "$old_proto" in vless) echo "tcp";; hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
   fi
   if ! ensure_node_certificate "$node"; then
     warn "已放弃证书申请，取消重新配置。"
@@ -5957,7 +6065,7 @@ delete_node_flow() {
   del_proto=$(jq -r ".[$index].protocol // empty" <<<"$nodes")
   del_domain=$(jq -r ".[$index].domain // empty" <<<"$nodes")
   traffic_remove_port "$port"
-  firewall_remove_port "$port" "$(case "$del_proto" in hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
+  firewall_remove_port "$port" "$(case "$del_proto" in vless) echo "tcp";; hysteria2) echo "udp";; shadowsocks) echo "both";; *) echo "both";; esac)"
   save_nodes_json "$(jq -c --argjson index "$index" 'del(.[$index])' <<<"$nodes")"
   ok "节点 [${name}] 已成功删除。"
 
@@ -6269,6 +6377,12 @@ generate_client_outbound_json() {
       jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg pw "$pass" \
         '{type:"hysteria2",tag:$tag,server:$s,server_port:$p,password:$pw,tls:{enabled:true,server_name:$s}}'
       ;;
+    vless)
+      local uuid
+      uuid=$(jq -r '.uuid' <<<"$node")
+      jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg u "$uuid" \
+        '{type:"vless",tag:$tag,server:$s,server_port:$p,uuid:$u}'
+      ;;
     vless-reality)
       local uuid pbk sid sni
       uuid=$(jq -r '.uuid' <<<"$node")
@@ -6359,6 +6473,15 @@ show_client() {
         local ss_b64
         ss_b64=$(printf "%s:%s" "$method" "$pass" | base64 | tr -d "\n")
         printf "  分享链接: ss://%s@%s:%s#%s\n" "$ss_b64" "$domain" "$port" "$(printf "%s" "$name" | jq -sRr @uri)"
+        ;;
+      vless)
+        uuid=$(jq -r '.uuid' <<<"$node")
+        local vless_host="$domain"
+        [[ "$vless_host" != *:* || "$vless_host" == \[*\] ]] || vless_host="[$vless_host]"
+        printf "  UUID: %s\n" "$uuid"
+        printf "  传输方式: TCP，无 TLS\n"
+        printf "  分享链接: vless://%s@%s:%s?encryption=none&security=none&type=tcp#%s\n" \
+          "$uuid" "$vless_host" "$port" "$(printf "%s" "$name" | jq -sRr @uri)"
         ;;
       vless-reality)
         uuid=$(jq -r '.uuid' <<<"$node")
@@ -8088,7 +8211,8 @@ usage() {
   sudo sbox --version               # 显示脚本版本
 
 常用参数：
-  --protocol PROTOCOL     协议类型 (anytls / shadowsocks / trojan / hysteria2 / vless-reality / socks5 / http)
+  --protocol PROTOCOL     协议类型 (anytls / shadowsocks / trojan / hysteria2 / vless / vless-reality / socks5 / http)
+  --uuid UUID             普通 VLESS 入站 UUID (省略时自动生成)
   --ss-tfo                Shadowsocks 入站开启 TCP Fast Open
   --no-ss-tfo             Shadowsocks 入站关闭 TCP Fast Open (默认)
   --ss-outbound-tfo       Shadowsocks 出站开启 TCP Fast Open
@@ -8101,7 +8225,7 @@ usage() {
   --cert-mode MODE        证书申请模式 (dnspod / cf / webroot / standalone)
   --email EMAIL           ACME 证书邮箱
   --webroot PATH          Web 根目录
-  --outbound TYPE         出口模式 (direct / socks5 / http / shadowsocks / anytls / vless-reality / trojan / hysteria2)
+  --outbound TYPE         出口协议或分享链接 (direct / socks5 / http / shadowsocks / anytls / vless / vless-reality / trojan / hysteria2)
   --dnspod-token TOKEN    DNSPod Token (格式: ID,Token)
   --dnspod-token-id ID    DNSPod Token ID
   --dnspod-token-key KEY  DNSPod Token Key
@@ -8124,6 +8248,7 @@ parse_options() {
       --email) [[ $# -ge 2 ]] || die "--email 缺少值"; EMAIL=$2; shift 2;;
       --port) [[ $# -ge 2 ]] || die "--port 缺少值"; PORT=$2; NODE_PORT=$2; shift 2;;
       --password) [[ $# -ge 2 ]] || die "--password 缺少值"; PASSWORD=$2; NODE_PASSWORD=$2; shift 2;;
+      --uuid) [[ $# -ge 2 ]] || die "--uuid 缺少值"; validate_uuid "$2" || die "VLESS UUID 格式无效。"; NODE_UUID=$2; shift 2;;
       --username) [[ $# -ge 2 ]] || die "--username 缺少值"; NODE_USERNAME=$2; shift 2;;
       --http-tls) HTTP_TLS="true"; shift;;
       --no-http-tls) HTTP_TLS="false"; shift;;
