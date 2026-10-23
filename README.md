@@ -4,8 +4,8 @@
 
 ## 主要特性
 
-- **多协议入站支持**：支持 AnyTLS、Shadowsocks（含 2022-blake3 与传统 AEAD）、Trojan、Hysteria2、普通 VLESS（TCP）、VLESS + REALITY、SOCKS5、HTTP / HTTPS。
-- **全能出站路由**：每个节点可独立指定出口方式，支持 Direct、AnyTLS、Shadowsocks、Trojan、Hysteria2、普通 VLESS（TCP）、VLESS + REALITY、SOCKS5 / SOCKS5H、HTTP / HTTPS。
+- **多协议入站支持**：支持 AnyTLS、Shadowsocks（含 2022-blake3 与传统 AEAD）、Trojan、Hysteria2、VLESS + TCP、VLESS + REALITY、SOCKS5、HTTP / HTTPS。
+- **全能出站路由**：每个节点可独立指定出口方式，支持 Direct、AnyTLS、Shadowsocks、Trojan、Hysteria2、VLESS + TCP、VLESS + REALITY、SOCKS5 / SOCKS5H、HTTP / HTTPS。
 - **主备出口健康切换与闭环管理**：支持每个节点独立配置主出口与多级备用出口，提供完整的路线查看、添加、删除指定项与一键清空管理；配置了备用出口的节点每轮检测主出口和所有备用代理，探测目标为 `http://www.gstatic.com/generate_204`，本轮完成后等待 5 秒。当前出口连续两次失败后按优先级切到可用备用出口；更高优先级的备用连续两次成功后主动切回，例如备用3切回恢复的备用2；主出口连续两次成功后优先切回主出口。未知检测结果会打断连续计数。只有显式添加 Direct 备用出口时才允许回退 Direct；未添加 Direct 时，代理出口全部不可用也会保持当前出口。清空备用出口后自动撤销选择器并停止监控服务。
 - **旧版配置自动迁移**：升级管理脚本后，首次运行面板、`status`、`start` 或 `restart` 会自动识别并补齐主备出口健康检测路由；没有备用出口的旧配置保持原有单出口行为。
 - **动态域名与证书联动与生命周期管理**：新增或修改节点时支持绑定不同域名。对于需要证书的协议（AnyTLS、Trojan、Hy2），系统会自动检测证书，未申请时可一键通过 Let's Encrypt（首选 DNSPod Token DNS-01 API、次选 Cloudflare DNS-01 API、Web 目录 Webroot 或独立 80 端口 Standalone）免开放端口签发证书；提供独立的证书管理菜单，支持一键扫描并清理废弃节点的无用证书与 Certbot 自动续签任务，避免无效续期与报错；Shadowsocks、普通 VLESS 与 VLESS REALITY 无需证书，开箱即用。
@@ -161,7 +161,7 @@ python3 -m unittest discover -s tests -p 'test_set_hostname.py' -v
 
 进入 **3. 节点管理**，支持：
 1. **新增节点**：
-   - 选择入站协议：AnyTLS、Shadowsocks、Trojan、Hysteria2、普通 VLESS（TCP）、VLESS + REALITY、SOCKS5、HTTP / HTTPS；
+   - 选择入站协议：AnyTLS、Shadowsocks、Trojan、Hysteria2、VLESS + TCP、VLESS + REALITY、SOCKS5、HTTP / HTTPS；
    - 设定节点域名或公网 IP、端口、认证信息；
    - 若所填域名无本地证书，脚本自动提示并调用 Let's Encrypt 快速签发；
    - 配置流量计费模式（单向/双向）、月度限额（如 100GB）以及每月重置日（如 1日）；
@@ -269,9 +269,9 @@ sudo sbox api serve [PORT]       # 临时前台启动测试 (按 Ctrl+C 停止)
 sudo sbox --api-json [PORT]      # 命令行直接输出流量 JSON 数据
 ```
 
-## 普通 VLESS（TCP）
+## VLESS + TCP
 
-入站与主、备用出站均支持普通 VLESS：选择 `VLESS (TCP，无 TLS)`，填写地址、端口和 UUID 即可。入站 UUID 可自动生成，修改认证凭据时输入 `rand` 可重新生成；不要求域名、证书或 REALITY 密钥。
+入站与主、备用出站均支持普通 VLESS：选择 `VLESS + TCP`，填写地址、端口和 UUID 即可。入站 UUID 可自动生成，修改认证凭据时输入 `rand` 可重新生成；不要求域名、证书或 REALITY 密钥。
 
 - 入站协议参数为 `--protocol vless`，可用 `--uuid UUID` 指定 UUID，省略时自动生成，重新配置时保留原 UUID。
 - 出站支持手动选择 `vless`，也可粘贴分享链接；命令行可通过 `--outbound 'vless://...'` 导入。

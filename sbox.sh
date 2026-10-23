@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.36"
+readonly SCRIPT_VERSION="0.0.37"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -1131,7 +1131,7 @@ protocol_label() {
     shadowsocks) printf "Shadowsocks" ;;
     trojan) printf "Trojan" ;;
     hysteria2) printf "Hysteria2" ;;
-    vless) printf "VLESS (TCP)" ;;
+    vless) printf "VLESS + TCP" ;;
     vless-reality) printf "VLESS + REALITY" ;;
     socks5|socks) printf "SOCKS5" ;;
     http) printf "HTTP / HTTPS" ;;
@@ -1148,10 +1148,10 @@ choose_protocol() {
     "shadowsocks|Shadowsocks" \
     "trojan|Trojan" \
     "hysteria2|Hysteria2" \
+    "vless|VLESS + TCP" \
     "vless-reality|VLESS + REALITY" \
     "socks5|SOCKS5" \
-    "http|HTTP / HTTPS" \
-    "vless|VLESS (TCP，无 TLS)"
+    "http|HTTP / HTTPS"
 }
 
 choose_outbound_protocol() {
@@ -1163,10 +1163,10 @@ choose_outbound_protocol() {
     "shadowsocks|Shadowsocks" \
     "trojan|Trojan" \
     "hysteria2|Hysteria2" \
+    "vless|VLESS + TCP" \
     "vless-reality|VLESS + REALITY" \
     "socks5|SOCKS5 / SOCKS5H" \
-    "http|HTTP / HTTPS" \
-    "vless|VLESS (TCP，无 TLS)"
+    "http|HTTP / HTTPS"
 }
 
 choose_ss_method() {
@@ -5107,7 +5107,7 @@ format_node_outbound_summary() {
     anytls) summary="AnyTLS 代理 (${o_server}:${o_port})" ;;
     trojan) summary="Trojan 代理 (${o_server}:${o_port})" ;;
     hysteria2) summary="Hysteria2 代理 (${o_server}:${o_port})" ;;
-    vless) summary="VLESS (TCP) 代理 (${o_server}:${o_port})" ;;
+    vless) summary="VLESS + TCP 代理 (${o_server}:${o_port})" ;;
     vless-reality) summary="VLESS+REALITY 代理 (${o_server}:${o_port})" ;;
     *) summary="${o_type}" ;;
   esac
