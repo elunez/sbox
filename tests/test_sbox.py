@@ -455,215 +455,71 @@ outbound_health_config_ready'''
                 result = bash(f"sing-box() {{ echo 'sing-box version {version}'; }}\noutbound_health_config_ready", env)
                 self.assertEqual(result.returncode, 1, result.stderr)
 
-    def vless_node(self, domain="192.0.2.1"):
-        node = self.dns_node(dns={"mode": "custom", "server": "1.1.1.1"})
-        node.update(name="普通 VLESS 测试", protocol="vless", domain=domain,
-                    uuid="bf000d23-0752-40b4-affe-68f7707a9661")
-        return node
-
-    def vless_outbound(self, server="proxy.example.com"):
-        return {"type": "vless", "server": server, "port": 443, "uuid": self.vless_node()["uuid"]}
-
-    def test_vless_creation_reconfiguration_and_cli_uuid(self):
-        node = self.vless_node()
-        setup = '''NON_INTERACTIVE=1
-SKIP_PROTOCOL_PROMPT=1
-PROTOCOL=vless
-NODE_DOMAIN=192.0.2.1
-NODE_PORT=8388
-generate_default_node_name() { echo VLESS; }
-collect_traffic_settings() { printf -v "$2" '%s' '{"monthly_limit":"unlimited"}'; }
-collect_outbound_settings() { printf -v "$2" '%s' '{"type":"direct"}'; }
-'''
-        replacement = "b831381d-6324-4d53-ad4f-8cda48b30811"
-        for old, option, expected in (({}, "", None), (node, "", node["uuid"]),
-                                      (node, f"parse_options --uuid {replacement}", replacement)):
-            with self.subTest(old=old, option=option):
-                result = bash(setup + option + f'''
-collect_node_json {shlex.quote(json.dumps(old))} result
-echo "$result"
-if node_requires_certificate vless; then exit 99; fi''')
-                self.assertEqual(result.returncode, 0, result.stderr)
-                saved = json.loads(result.stdout.splitlines()[-1])
-                self.assertEqual(saved["protocol"], "vless")
-                self.assertRegex(saved["uuid"], r"^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$")
-                if expected:
-                    self.assertEqual(saved["uuid"], expected)
-                self.assertEqual(saved["dns"], old.get("dns", {"mode": "system"}))
-                self.assertTrue({"reality", "tls", "flow", "password", "method"}.isdisjoint(saved))
-        for option in ("--uuid", "--uuid invalid"):
-            self.assertNotEqual(bash(f"parse_options {option}").returncode, 0)
-
-    def test_vless_protocol_switch_preserves_settings_and_removes_old_credentials(self):
-        for old_protocol, new_protocol in (("shadowsocks", "vless"), ("vless-reality", "vless"),
-                                            ("vless", "socks5"), ("vless", "vless-reality")):
-            with self.subTest(old=old_protocol, new=new_protocol):
-                node = self.vless_node()
-                node.update(protocol=old_protocol, password="old", method="aes-128-gcm", tcp_fast_open=True,
-                            reality={"private_key": "private", "public_key": "public", "short_id": "abcdef12",
-                                     "handshake_server": "www.example.com", "handshake_port": 443},
-                            outbound=self.vless_outbound(), backup_outbounds=[{"type": "direct"}])
-                result = bash(f'''NON_INTERACTIVE=1
-current_nodes_json() {{ echo {shlex.quote(json.dumps([node]))}; }}
-save_nodes_json() {{ echo "$1"; }}
-choose_protocol() {{ printf -v "$1" '%s' {new_protocol}; }}
-prompt_value() {{ printf -v "$1" '%s' "${{3:-}}"; }}
-ensure_node_certificate() {{ if node_requires_certificate {new_protocol}; then exit 99; fi; }}
-firewall_remove_port() {{ :; }}
-edit_node_protocol 0 <<< Y''')
-                self.assertEqual(result.returncode, 0, result.stderr)
-                saved = next(json.loads(line)[0] for line in result.stdout.splitlines() if line.startswith("[{"))
-                self.assertEqual(saved["protocol"], new_protocol)
-                for field in ("name", "domain", "port", "dns", "traffic", "outbound", "backup_outbounds"):
-                    self.assertEqual(saved[field], node[field])
-                if new_protocol == "vless":
-                    self.assertEqual(saved["uuid"], node["uuid"])
-                    self.assertTrue({"reality", "tls", "flow", "password", "method", "tcp_fast_open"}.isdisjoint(saved))
-                elif new_protocol == "vless-reality":
-                    self.assertEqual(saved["uuid"], node["uuid"])
-                    self.assertEqual(saved["reality"]["public_key"], "public")
-                else:
-                    self.assertNotIn("uuid", saved)
-
-    def test_vless_credentials_edit_preserves_other_fields_and_rejects_invalid_uuid(self):
-        node = self.vless_node()
-        replacement = "b831381d-6324-4d53-ad4f-8cda48b30811"
-        for value in ("", replacement, "rand", "invalid"):
-            with self.subTest(value=value):
-                result = bash(f'''NON_INTERACTIVE=1
-current_nodes_json() {{ echo {shlex.quote(json.dumps([node]))}; }}
-save_nodes_json() {{ echo "$1"; }}
-prompt_value() {{ printf -v "$1" '%s' {shlex.quote(value or node['uuid'])}; }}
-generate_uuid() {{ echo {replacement}; }}
-edit_node_credentials 0''')
-                self.assertEqual(result.returncode, 0, result.stderr)
-                saved = [json.loads(line)[0] for line in result.stdout.splitlines() if line.startswith("[{")]
-                if value == "invalid":
-                    self.assertEqual(saved, [])
-                else:
-                    self.assertEqual(saved, [dict(node, uuid=replacement if value else node["uuid"])])
-
-    def test_vless_manual_and_imported_primary_and_backup_outbounds(self):
-        primary, backup = self.vless_outbound(), self.vless_outbound("backup.example.com")
-        for field, expected in (("outbound", primary), ("backup", backup)):
-            for import_link in (False, True):
-                with self.subTest(field=field, import_link=import_link):
-                    link = f"vless://{expected['uuid']}@{expected['server']}:443?security=none&type=tcp"
-                    result = bash(f'''NON_INTERACTIVE=1
-ensure_python3() {{ :; }}
-OUTBOUND={shlex.quote(link) if import_link else "vless"}
-collect_outbound_settings {shlex.quote(json.dumps({'outbound': primary, 'backup': backup}))} imported {field}
-echo "$imported"''')
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(json.loads(result.stdout.splitlines()[-1]), expected)
-        result = bash(f'''NON_INTERACTIVE=1
-OUTBOUND=vless
-prompt_value() {{
-  case "$1" in server) printf -v "$1" '%s' proxy.example.com;;
-    port) printf -v "$1" '%s' 443;; uuid) printf -v "$1" '%s' {primary['uuid']};; esac
-}}
-collect_outbound_settings '{{}}' imported
-echo "$imported"''')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout), primary)
-
-    def test_vless_links_accept_minimal_and_legacy_reality_and_reject_unsupported_options(self):
-        uuid = self.vless_node()["uuid"]
+    def test_vless_links_require_reality_and_keep_legacy_reality_compatibility(self):
+        uuid = "bf000d23-0752-40b4-affe-68f7707a9661"
         base = f"vless://{uuid}@proxy.example.com:443"
-        for query in ("", "?security=none&type=tcp&encryption=none", "?type=tcp&flow=&headerType=none"):
+        for query in ("", "?security=none&type=tcp", "?security=none&pbk=public",
+                      "?security=tls", "?security=reality", "?security=reality&pbk=public&type=ws"):
+            with self.subTest(query=query):
+                result = bash(f'''ensure_python3() {{ :; }}
+imported=unchanged
+if parse_proxy_link {shlex.quote(base + query)} imported; then exit 99; fi
+echo "$imported"''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "unchanged")
+                self.assertIn("解析失败", result.stderr)
+        for query in ("?security=reality&pbk=public&sid=abcdef12&sni=www.example.com&flow=xtls-rprx-vision&type=tcp",
+                      "?pbk=public&sid=abcdef12&sni=www.example.com"):
             with self.subTest(query=query):
                 result = bash(f'''ensure_python3() {{ :; }}
 parse_proxy_link {shlex.quote(base + query)} imported >/dev/null
 echo "$imported"''')
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads(result.stdout), self.vless_outbound())
-        for query in ("?security=reality&pbk=public&sid=abcdef12&sni=www.example.com&flow=xtls-rprx-vision&type=tcp",
-                      "?pbk=public&sid=abcdef12&sni=www.example.com"):
-            result = bash(f'''ensure_python3() {{ :; }}
-parse_proxy_link {shlex.quote(base + query)} imported >/dev/null
-echo "$imported"''')
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), dict(self.vless_outbound(), type="vless-reality",
-                             public_key="public", short_id="abcdef12", server_name="www.example.com"))
-        invalid_links = [base + "?" + query for query in (
-            "security=tls", "security=reality", "type=ws", "type=grpc", "headerType=http",
-            "flow=xtls-rprx-vision", "encryption=auto", "security=none&pbk=public", "path=%2Fproxy",
-            "security=none&security=tls", "security=none&security=", "security=none&sni=example.com",
-            "security=reality&pbk=public&type=ws")]
-        invalid_links += ["vless://invalid@proxy.example.com:443", f"vless://{uuid}@proxy.example.com:65536",
-                          f"vless://{uuid}@:443"]
-        for link in invalid_links:
-            with self.subTest(link=link):
-                result = bash(f'''ensure_python3() {{ :; }}
-imported=unchanged
-if parse_proxy_link {shlex.quote(link)} imported; then exit 99; fi
-echo "$imported"''')
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(result.stdout.strip(), "unchanged")
-                self.assertIn("解析失败", result.stderr)
+                self.assertEqual(json.loads(result.stdout), {
+                    "type": "vless-reality", "server": "proxy.example.com", "port": 443,
+                    "uuid": uuid, "public_key": "public", "short_id": "abcdef12", "server_name": "www.example.com"})
 
-    def test_vless_config_generation_covers_primary_backup_health_routing_and_reality(self):
-        node = self.vless_node()
-        node.update(outbound=self.vless_outbound(), backup_outbounds=[self.vless_outbound("backup.example.com"),
-                                                                     {"type": "direct"}])
-        reality = dict(node, name="REALITY", protocol="vless-reality", port=8443,
-                       reality={"private_key": "private", "public_key": "public", "short_id": "abcdef12",
-                                "handshake_server": "www.example.com", "handshake_port": 443},
-                       outbound=dict(self.vless_outbound(), type="vless-reality", public_key="public",
-                                     short_id="abcdef12", server_name="www.example.com"), backup_outbounds=[])
+    def test_plain_vless_state_and_uuid_option_are_no_longer_supported(self):
         state, output = self.directory / "state.json", self.directory / "config.json"
-        state.write_text(json.dumps({"nodes": [node, reality]}))
-        result = bash(f'''sing-box() {{ echo 'sing-box version 1.14.3'; }}
-ensure_outbound_health_secret() {{ echo test; }}
-generate_config_from_state {shlex.quote(str(output))} {shlex.quote(str(state))}''')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        config = json.loads(output.read_text())
-        self.assertEqual(config["inbounds"][0], {"type": "vless", "tag": "in-1", "listen": "::",
-                         "listen_port": 8388, "users": [{"name": node["name"], "uuid": node["uuid"]}]})
-        outbounds = {item["tag"]: item for item in config["outbounds"]}
-        for tag, server in (("out-1", "proxy.example.com"), ("backup-1-1", "backup.example.com")):
-            self.assertEqual(outbounds[tag], {"type": "vless", "tag": tag, "server": server, "server_port": 443,
-                                             "uuid": node["uuid"], "domain_resolver": "dns-1"})
-        self.assertEqual(outbounds["health-1"]["outbounds"], ["out-1", "backup-1-1", "direct-1"])
-        self.assertTrue(any(rule.get("inbound") == ["in-1"] and rule.get("outbound") == "health-1"
-                            for rule in config["route"]["rules"]))
-        self.assertEqual(config["inbounds"][1]["users"][0]["flow"], "xtls-rprx-vision")
-        self.assertEqual(config["inbounds"][1]["tls"]["reality"]["private_key"], "private")
-        self.assertEqual(outbounds["out-2"]["flow"], "xtls-rprx-vision")
-        self.assertEqual(outbounds["out-2"]["tls"]["reality"]["public_key"], "public")
-
-    def test_vless_invalid_uuid_is_rejected_for_inbound_primary_and_backup(self):
-        state, output = self.directory / "state.json", self.directory / "config.json"
-        for field in ("uuid", "outbound", "backup_outbounds"):
+        plain = {"type": "vless", "server": "proxy.example.com", "port": 443,
+                 "uuid": "bf000d23-0752-40b4-affe-68f7707a9661"}
+        for field in ("protocol", "outbound", "backup_outbounds"):
             with self.subTest(field=field):
-                node = self.vless_node()
-                invalid = dict(self.vless_outbound(), uuid="invalid")
-                node[field] = "invalid" if field == "uuid" else invalid if field == "outbound" else [invalid]
+                node = self.dns_node()
+                node["uuid"] = plain["uuid"]
+                node[field] = "vless" if field == "protocol" else plain if field == "outbound" else [plain]
                 state.write_text(json.dumps({"nodes": [node]}))
                 result = bash(f'generate_config_from_state {shlex.quote(str(output))} {shlex.quote(str(state))}')
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("UUID 无效", result.stderr)
                 self.assertFalse(output.exists())
+        result = bash(f"parse_options --uuid {plain['uuid']}")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("未知参数：--uuid", result.stderr)
 
-    def test_vless_client_export_and_share_link_roundtrip_support_ipv4_ipv6_and_domain(self):
-        for host in ("192.0.2.1", "2001:db8::1", "proxy.example.com"):
-            with self.subTest(host=host):
-                node = self.vless_node(host)
-                result = bash(f'generate_client_outbound_json {shlex.quote(json.dumps(node))}')
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads(result.stdout), {"type": "vless", "tag": node["name"], "server": host,
-                                                             "server_port": 8388, "uuid": node["uuid"]})
-                result = bash(f'''current_nodes_json() {{ echo {shlex.quote(json.dumps([node]))}; }}
-show_client''')
-                self.assertEqual(result.returncode, 0, result.stderr)
-                link = re.search(r"分享链接: (vless://\S+)", result.stdout).group(1)
-                self.assertIn("security=none&type=tcp", link)
-                self.assertNotIn("REALITY", result.stdout)
-                result = bash(f'''ensure_python3() {{ :; }}
-parse_proxy_link {shlex.quote(link)} imported >/dev/null
-echo "$imported"''')
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(json.loads(result.stdout), dict(self.vless_outbound(host), port=8388))
+    def test_reality_config_generation_keeps_inbound_outbound_and_client_fields(self):
+        node = self.dns_node()
+        node.update(protocol="vless-reality", uuid="bf000d23-0752-40b4-affe-68f7707a9661",
+                    reality={"private_key": "private", "public_key": "public", "short_id": "abcdef12",
+                             "handshake_server": "www.example.com", "handshake_port": 443})
+        node["outbound"] = {"type": "vless-reality", "server": "proxy.example.com", "port": 443,
+                            "uuid": node["uuid"], "public_key": "public", "short_id": "abcdef12",
+                            "server_name": "www.example.com"}
+        state, output = self.directory / "state.json", self.directory / "config.json"
+        state.write_text(json.dumps({"nodes": [node]}))
+        result = bash(f'generate_config_from_state {shlex.quote(str(output))} {shlex.quote(str(state))}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(output.read_text())
+        inbound = config["inbounds"][0]
+        outbound = next(item for item in config["outbounds"] if item["tag"] == "out-1")
+        self.assertEqual(inbound["users"][0]["flow"], "xtls-rprx-vision")
+        self.assertEqual(inbound["tls"]["reality"]["private_key"], "private")
+        self.assertEqual(outbound["flow"], "xtls-rprx-vision")
+        self.assertEqual(outbound["tls"]["reality"]["public_key"], "public")
+        result = bash(f'generate_client_outbound_json {shlex.quote(json.dumps(node))}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        client = json.loads(result.stdout)
+        self.assertEqual(client["flow"], "xtls-rprx-vision")
+        self.assertEqual(client["tls"]["reality"]["public_key"], "public")
 
     def test_tfo_defaults_cli_generation_and_type_validation(self):
         node = {"name": "SS", "protocol": "shadowsocks", "domain": "example.com", "port": 8388,
