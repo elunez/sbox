@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.40"
+readonly SCRIPT_VERSION="0.0.41"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -5866,14 +5866,19 @@ edit_single_node_menu() {
 }
 
 edit_node_flow() {
-  local nodes index
+  local nodes count index
   nodes=$(current_nodes_json)
-  if (( $(node_count "$nodes") == 0 )); then
+  count=$(node_count "$nodes")
+  if (( count == 0 )); then
     warn "当前暂无任何节点配置，请先选择 [1) 新增节点]。"
     return 0
   fi
-  print_node_list "$nodes"
-  index=$(select_node_index "$nodes" "请选择要修改的节点") || return 0
+  if (( count == 1 )); then
+    index=0
+  else
+    print_node_list "$nodes"
+    index=$(select_node_index "$nodes" "请选择要修改的节点") || return 0
+  fi
   edit_single_node_menu "$index"
 }
 
