@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.41"
+readonly SCRIPT_VERSION="0.0.42"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -5600,19 +5600,14 @@ collect_and_apply_padding_scheme() {
   printf "说明：\n"
   printf "  1. 支持整段直接粘贴；若包含注释（如 # 美西、# 亚太）会自动过滤。\n"
   printf "  2. %s若未显式指定 stop=*，脚本将根据步骤自动推导并补全 stop=*。%s\n" "$C_YELLOW" "$C_RESET"
-  printf "  3. %s粘贴完成后，直接按一次 [回车] 即可确认提交！%s\n" "$C_GREEN" "$C_RESET"
-  printf "     • 也可使用快捷键立即提交：\n"
-  printf "       - %sMac 用户%s:      按快捷键 [ %scontrol + d%s ] 提交\n" "$C_CYAN" "$C_RESET" "$C_GREEN" "$C_RESET"
-  printf "       - %sWindows 用户%s:  按快捷键 [ %sCtrl + D%s ] 提交 (或 Ctrl+Z 回车)\n" "$C_CYAN" "$C_RESET" "$C_GREEN" "$C_RESET"
+  printf "  3. %s最后一行换行后，再输入一个空行提交；规则中间不要留空行。%s\n" "$C_GREEN" "$C_RESET"
+  printf "     • 也可按 %sCtrl+D%s 结束输入；末行未换行时可能需要按两次。\n" "$C_GREEN" "$C_RESET"
   printf "       - %s取消输入%s:      直接输入 [q] 并回车\n" "$C_CYAN" "$C_RESET"
   printf "%s----------------------------------------------------------------------%s\n" "$C_CYAN" "$C_RESET"
 
   local raw_lines=() line
-  while true; do
-    if ! IFS= read -r line; then
-      # 捕获 EOF (Mac: control + d, Windows: Ctrl + D)
-      break
-    fi
+  # read 遇到 EOF 时仍可能读到未换行的末行，先处理该行，避免漏存规则。
+  while IFS= read -r line || [[ -n "$line" ]]; do
     line=$(tr -d '\r' <<<"$line")
     local trimmed
     trimmed=$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$line")

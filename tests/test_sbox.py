@@ -289,6 +289,49 @@ class ShellTests(unittest.TestCase):
             node["dns"] = dns
         return node
 
+    def collect_padding(self, text, after=""):
+        nodes = [{"name": "other", "protocol": "anytls", "padding_scheme": ["stop=1", "0=30-30"]},
+                 {"name": "selected", "protocol": "anytls", "password": "fixture"}]
+        saved = self.directory / "padding-nodes.json"
+        if saved.exists():
+            saved.unlink()
+        code = f'''source {shlex.quote(str(SCRIPT))}
+current_nodes_json() {{ printf '%s' {shlex.quote(json.dumps(nodes))}; }}
+save_nodes_json() {{ printf '%s' "$1" > {shlex.quote(str(saved))}; }}
+pause_prompt() {{ :; }}
+collect_and_apply_padding_scheme 1
+{after}'''
+        result = subprocess.run(["bash", "-c", code], input=text, text=True,
+                                capture_output=True, timeout=5)
+        return result, saved, nodes
+
+    def test_padding_input_keeps_last_rule_with_or_without_final_newline(self):
+        expected = ["stop=2", "0=10-30", "1=10-30"]
+        for text in ("stop=2\n0=10-30\n1=10-30", "stop=2\n0=10-30\n1=10-30\n",
+                     "stop=2\n0=10-30\n1=10-30\n\n", "stop=2\r\n0=10-30\r\n1=10-30",
+                     "# custom\n stop=2 \n0=10-30\n1=10-30", "0=10-30\n1=10-30"):
+            with self.subTest(text=text):
+                result, saved, original = self.collect_padding(text)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                original[1]["padding_scheme"] = expected
+                self.assertEqual(json.loads(saved.read_text()), original)
+                self.assertIn("  1=10-30\n", result.stdout)
+
+    def test_padding_cancel_empty_and_invalid_input_do_not_save(self):
+        for text in ("", "\n\n", "q", "stop=2\n0=10-30\nq", "stop=2\n0=10-30\nquit\n",
+                     "stop=2\n0=10-30\n1=invalid!"):
+            with self.subTest(text=text):
+                result, saved, _ = self.collect_padding(text)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(saved.exists())
+
+    def test_padding_blank_line_submission_preserves_next_menu_input(self):
+        result, saved, _ = self.collect_padding("stop=2\n0=10-30\n1=10-30\n\n0\n",
+                                                'IFS= read -r next_choice\nprintf "NEXT:%s\\n" "$next_choice"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(saved.read_text())[1]["padding_scheme"], ["stop=2", "0=10-30", "1=10-30"])
+        self.assertTrue(result.stdout.endswith("NEXT:0\n"))
+
     def test_dns_validation_rejects_invalid_state_before_generation(self):
         state = self.directory / "state.json"
         output = self.directory / "config.json"

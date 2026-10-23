@@ -212,6 +212,7 @@ python3 -m unittest discover -s tests -p 'test_set_hostname.py' -v
 - **仓库配置文件**：项目 [`conf/anytls_padding.conf`](conf/anytls_padding.conf) 提供独立的规则配置文件。无需修改脚本代码，只需在此文件中调整各轮包长区间或 `stop=*`，提交后 VPS 执行 `sudo sbox update` 会自动检测变动、更新本地规则并平滑重载 sing-box 服务。
 - **VPS 本地自由编辑**：配置文件在 VPS 上安装于 `/etc/sbox/anytls_padding.conf`，你也可以直接用 `nano /etc/sbox/anytls_padding.conf` 进行本地调整，保存后脚本检测到内容变动会自动重新渲染配置并重载服务。
 - **单节点个性化隔离**：如果在节点管理菜单中为某个特定节点单独设置了自定义规则（例如美西专用规则），该节点将永久锁定自身专属规则，**绝不会被全局配置文件变动所影响**。
+- **粘贴提交**：自定义规则中间不要留空行，最后一行换行后再输入一个空行提交；也可用 `Ctrl+D` 结束输入（末行未换行时可能需按两次），未换行的最后一条规则同样会保存。输入 `q` 回车取消修改。
 
 ## 流量监控与重置日管理
 
