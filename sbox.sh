@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.43"
+readonly SCRIPT_VERSION="0.0.44"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -3741,10 +3741,16 @@ collect_dns_settings() {
     settings='{"mode":"system"}'
   fi
   if (( prompt_strategy )); then
-    prompt_choice selected_strategy "域名地址策略" "$selected_strategy" \
-      "default|默认（保持内核原有行为）" \
-      "ipv4_only|仅 IPv4" "prefer_ipv4|IPv4 优先" \
-      "ipv6_only|仅 IPv6" "prefer_ipv6|IPv6 优先" || return 1
+    local current_strategy strategy_index
+    local -a strategy_items=("default|默认"
+      "ipv4_only|仅 IPv4" "prefer_ipv4|IPv4 优先" "ipv6_only|仅 IPv6" "prefer_ipv6|IPv6 优先")
+    current_strategy=$(jq -r '.dns.strategy // "default"' <<<"$old")
+    for ((strategy_index=0; strategy_index<${#strategy_items[@]}; strategy_index++)); do
+      if [[ "${strategy_items[$strategy_index]%%|*}" == "$current_strategy" ]]; then
+        strategy_items[$strategy_index]+=" [当前]"
+      fi
+    done
+    prompt_choice selected_strategy "域名地址策略" "$selected_strategy" "${strategy_items[@]}" || return 1
   fi
   if [[ "$selected_strategy" != "default" ]]; then
     settings=$(jq -c --arg strategy "$selected_strategy" '.strategy = $strategy' <<<"$settings")
