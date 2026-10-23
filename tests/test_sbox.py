@@ -343,12 +343,80 @@ generate_default_node_name() { echo DNS; }
 collect_traffic_settings() { printf -v "$2" '%s' '{"monthly_limit":"unlimited"}'; }
 collect_outbound_settings() { printf -v "$2" '%s' '{"type":"direct"}'; }
 '''
-        for settings in (None, {"mode": "custom", "server": "8.8.8.8"}):
+        for settings in (None, {"mode": "custom", "server": "8.8.8.8"},
+                         {"mode": "system", "strategy": "ipv4_only"},
+                         {"mode": "custom", "server": "8.8.8.8", "strategy": "prefer_ipv6"}):
             with self.subTest(settings=settings):
                 old = self.dns_node(dns=settings)
                 result = bash(setup + f'collect_node_json {shlex.quote(json.dumps(old))} result\necho "$result"')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(json.loads(result.stdout.splitlines()[-1])["dns"], settings or {"mode": "system"})
+
+    def test_dns_strategy_cli_preserves_switches_and_resets(self):
+        old = {"dns": {"mode": "custom", "server": "8.8.8.8", "strategy": "ipv6_only"}}
+        for strategy in ("ipv4_only", "prefer_ipv4", "ipv6_only", "prefer_ipv6"):
+            with self.subTest(strategy=strategy):
+                result = bash(f'''NON_INTERACTIVE=1
+parse_options --dns-strategy {strategy}
+collect_dns_settings '{{}}' result
+echo "$result"''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {"mode": "system", "strategy": strategy})
+        result = bash(f'''NON_INTERACTIVE=1
+collect_dns_settings {shlex.quote(json.dumps(old))} result
+echo "$result"
+parse_options --dns-mode system
+collect_dns_settings {shlex.quote(json.dumps(old))} result
+echo "$result"
+parse_options --dns-strategy default
+collect_dns_settings {shlex.quote(json.dumps(old))} result
+echo "$result"''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([json.loads(line) for line in result.stdout.splitlines()],
+                         [old["dns"], {"mode": "system", "strategy": "ipv6_only"}, {"mode": "system"}])
+        for option in ("--dns-strategy bad", "--dns-strategy", "--dns-strategy ''"):
+            result = bash(f"parse_options {option}")
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+
+    def test_dns_strategy_validation_rejects_invalid_values_before_generation(self):
+        state = self.directory / "state.json"
+        output = self.directory / "config.json"
+        for strategy, valid in (("default", True), ("ipv4_only", True), ("prefer_ipv4", True),
+                                ("ipv6_only", True), ("prefer_ipv6", True), ("bad", False),
+                                ("", False), (None, False), (False, False), (123, False)):
+            with self.subTest(strategy=strategy):
+                state.write_text(json.dumps({"nodes": [self.dns_node(dns={"mode": "system", "strategy": strategy})]}))
+                output.write_text("unchanged")
+                result = bash(f'generate_config_from_state {shlex.quote(str(output))} {shlex.quote(str(state))}')
+                self.assertEqual(result.returncode, 0 if valid else 1, result.stderr)
+                if not valid:
+                    self.assertEqual(output.read_text(), "unchanged")
+
+    def test_dns_strategy_can_be_edited_and_cancelled_without_touching_other_nodes(self):
+        nodes = [self.dns_node(dns={"mode": "custom", "server": "8.8.8.8", "strategy": "prefer_ipv6"}),
+                 self.dns_node(8389, {"mode": "system", "strategy": "ipv4_only"})]
+        setup = f'''current_nodes_json() {{ echo {shlex.quote(json.dumps(nodes))}; }}
+save_nodes_json() {{ echo "$1"; }}
+'''
+        for choice, strategy in ((1, None), (2, "ipv4_only"), (3, "prefer_ipv4"),
+                                 (4, "ipv6_only"), (5, "prefer_ipv6")):
+            with self.subTest(strategy=strategy):
+                result = bash(setup + f"edit_node_dns 0 <<< $'\\n\\n{choice}\\n'")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                updated = next(json.loads(line) for line in result.stdout.splitlines() if line.startswith("[{"))
+                expected = {"mode": "custom", "server": "8.8.8.8"}
+                if strategy:
+                    expected["strategy"] = strategy
+                self.assertEqual(updated[0]["dns"], expected)
+                self.assertEqual(updated[1], nodes[1])
+        result = bash(setup + "save_nodes_json() { exit 99; }\nedit_node_dns 0 <<< $'\\n\\n0\\n'")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for strategy, label in (("ipv4_only", "仅 IPv4"), ("prefer_ipv4", "IPv4 优先"),
+                                ("ipv6_only", "仅 IPv6"), ("prefer_ipv6", "IPv6 优先")):
+            node = self.dns_node(dns={"mode": "system", "strategy": strategy})
+            result = bash(f'print_node_summary_card {shlex.quote(json.dumps(node))}')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"DNS 设置: 系统 DNS / {label}", result.stdout)
 
     def test_dns_edit_only_updates_selected_node_and_cancel_does_not_save(self):
         nodes = [self.dns_node(), self.dns_node(8389, {"mode": "custom", "server": "8.8.8.8"})]
@@ -454,6 +522,70 @@ outbound_health_config_ready'''
                 output.write_text(json.dumps(config))
                 result = bash(f"sing-box() {{ echo 'sing-box version {version}'; }}\noutbound_health_config_ready", env)
                 self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_dns_strategies_apply_per_node_to_all_outbounds_across_core_versions(self):
+        state = self.directory / "state.json"
+        output = self.directory / "config.json"
+        (self.directory / "outbound_health_api.secret").write_text("test-secret")
+        env = dict(os.environ, STATE_DIR=str(self.directory), STATE_FILE=str(state), CONFIG_FILE=str(output))
+        for version in ("1.11.4", "1.12.1", "1.13.14", "1.14.3"):
+            for strategy in ("ipv4_only", "prefer_ipv4", "ipv6_only", "prefer_ipv6"):
+                with self.subTest(version=version, strategy=strategy):
+                    nodes = [self.dns_node(),
+                             self.dns_node(8389, {"mode": "system", "strategy": strategy}),
+                             self.dns_node(8390, {"mode": "custom", "server": "1.1.1.1", "strategy": strategy}),
+                             self.dns_node(8391, {"mode": "system", "strategy": "default"})]
+                    nodes[2]["outbound"] = self.ss_outbound()
+                    nodes[2]["backup_outbounds"] = [self.ss_outbound(True), {"type": "direct"}]
+                    state.write_text(json.dumps({"nodes": nodes}))
+                    result = bash(f'''sing-box() {{ echo 'sing-box version {version}'; }}
+generate_config_from_state {shlex.quote(str(output))}
+outbound_health_config_ready''', env)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    config = json.loads(output.read_text())
+                    outbounds = {item["tag"]: item for item in config["outbounds"]}
+                    self.assertNotIn("strategy", config["dns"])
+                    if version.startswith("1.11."):
+                        for tag in ("out-2", "out-3", "backup-3-1", "direct-3"):
+                            self.assertEqual(outbounds[tag]["domain_strategy"], strategy)
+                            self.assertNotIn("domain_resolver", outbounds[tag])
+                        for tag in ("out-1", "out-4", "direct"):
+                            self.assertEqual(outbounds[tag]["domain_strategy"], "prefer_ipv4")
+                        outbounds["out-2"]["domain_strategy"] = "bad"
+                    else:
+                        self.assertEqual(outbounds["out-2"]["domain_resolver"],
+                                         {"server": "sbox-system", "strategy": strategy})
+                        for tag in ("out-3", "backup-3-1", "direct-3"):
+                            self.assertEqual(outbounds[tag]["domain_resolver"],
+                                             {"server": "dns-3", "strategy": strategy})
+                            self.assertNotIn("domain_strategy", outbounds[tag])
+                        for tag in ("out-1", "out-4", "direct"):
+                            self.assertEqual(outbounds[tag]["domain_resolver"], "sbox-system")
+                        outbounds["out-2"]["domain_resolver"] = "sbox-system"
+                    output.write_text(json.dumps(config))
+                    result = bash(f"sing-box() {{ echo 'sing-box version {version}'; }}\noutbound_health_config_ready", env)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_dns_strategy_state_change_migrates_existing_generated_config(self):
+        state = self.directory / "state.json"
+        output = self.directory / "config.json"
+        nodes = [self.dns_node(), self.dns_node(8389)]
+        state.write_text(json.dumps({"nodes": nodes}))
+        env = dict(os.environ, STATE_DIR=str(self.directory), STATE_FILE=str(state), CONFIG_FILE=str(output))
+        setup = "sing-box() { if [[ \"$1\" == version ]]; then echo 'sing-box version 1.14.3'; fi; }\n"
+        result = bash(setup + f'generate_config_from_state {shlex.quote(str(output))}', env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        nodes[1]["dns"] = {"mode": "system", "strategy": "ipv6_only"}
+        state.write_text(json.dumps({"nodes": nodes}))
+        result = bash(setup + '''apply_config() { cp "$1" "$CONFIG_FILE"; }
+if outbound_health_config_ready; then exit 99; fi
+migrate_outbound_health_config
+outbound_health_config_ready''', env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(output.read_text())
+        self.assertEqual(config["outbounds"][0]["domain_resolver"], "sbox-system")
+        self.assertEqual(config["outbounds"][1]["domain_resolver"],
+                         {"server": "sbox-system", "strategy": "ipv6_only"})
 
     def test_creation_keeps_password_prompt_and_skips_tfo_traffic_and_backup_questions(self):
         for outbound_input in ("", "ss://YWVzLTEyOC1nY206dGVzdA@example.com:8388"):

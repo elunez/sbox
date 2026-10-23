@@ -93,6 +93,10 @@ sudo env SBOX_DOWNLOAD_TIMEOUT=1200 sbox upgrade                 # 每个来源�
 
 sing-box 1.13 及以上的系统 DNS 使用 `prefer_go`，避免依赖不可用的 `systemd-resolved`；1.12 使用新版本地 DNS 字段，更早版本使用旧版字段。旧节点没有 DNS 字段时按系统 DNS 处理。非交互安装可使用 `--dns-mode custom --dns-server 1.1.1.1`，或 `--dns-mode system`。
 
+在「节点管理 → 修改配置 → DNS 设置」中，还可以选择域名地址策略：默认、仅 IPv4、IPv4 优先、仅 IPv6、IPv6 优先。创建节点和完整重配不增加策略提问，新节点使用默认值，已有节点保留原选择。默认保持内核原有行为（旧于 1.12 的兼容分支维持 IPv4 优先）。命令行可用 `--dns-strategy ipv4_only`、`prefer_ipv4`、`ipv6_only`、`prefer_ipv6` 指定，或用 `--dns-strategy default` 恢复默认。
+
+策略随节点保存，同时作用于主出口、备用出口和 Direct 回退；使用 [sing-box 的出站域名解析配置](https://sing-box.sagernet.org/configuration/shared/dial/#domain_resolver)。Direct 出口控制目标域名的解析，代理出口控制上游代理服务器域名的解析，最终网站若由远端解析则需在落地节点设置。仅 IPv4 / IPv6 表示域名只解析对应地址，优先模式仍可使用另一种地址；直接指定的 IP 不受此策略限制。DNS 服务器自身使用 IPv4 或 IPv6 地址，与目标地址策略分开设置。
+
 安装完成后，脚本会自动安装至系统 PATH，后续随时在任意终端输入快捷命令即可唤出管理面板：
 
 ```bash

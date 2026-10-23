@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.39"
+readonly SCRIPT_VERSION="0.0.40"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -70,6 +70,7 @@ HTTP_TLS="false"
 SS_TFO=""
 DNS_MODE=""
 DNS_SERVER=""
+DNS_STRATEGY=""
 SS_OUTBOUND_TFO=""
 CERT_MODE=""
 WEBROOT=""
@@ -633,6 +634,14 @@ outbound_health_config_ready() {
   [[ -r "$OUTBOUND_HEALTH_SECRET_FILE" ]] && health_secret=$(tr -d '\r\n' <"$OUTBOUND_HEALTH_SECRET_FILE")
   jq -e --arg addr "$OUTBOUND_HEALTH_API_ADDR" --arg secret "$health_secret" --argjson expected "$expected" \
     --argjson dns_level "$(singbox_dns_level)" --slurpfile state "$STATE_FILE" '
+    def dns_fields($n; $i):
+      (if ($n.dns.mode // "system") == "custom" then "dns-" + (($i + 1)|tostring) else "sbox-system" end) as $server |
+      ($n.dns.strategy // "default") as $strategy |
+      if $dns_level >= 1 then
+        {domain_resolver:(if $strategy == "default" then $server else {server:$server,strategy:$strategy} end),domain_strategy:null}
+      else
+        {domain_resolver:null,domain_strategy:(if $strategy == "default" then "prefer_ipv4" else $strategy end)}
+      end;
     ([.outbounds[]? | select((.tag // "") | startswith("health-")) | {
       type, tag, outbounds: (.outbounds // []), default: (.default // ""),
       interrupt_exist_connections: (.interrupt_exist_connections // false)
@@ -654,16 +663,15 @@ outbound_health_config_ready() {
       ([$state[0].nodes | to_entries[] | select((.value.dns.mode // "system") == "custom") |
         {tag:("dns-" + ((.key + 1)|tostring)),server:(if $dns_level >= 1 then .value.dns.server else
           (if (.value.dns.server | contains(":")) then "udp://[" + .value.dns.server + "]:53" else "udp://" + .value.dns.server + ":53" end) end)}] | sort_by(.tag)))
-    and (if $dns_level >= 1 then .route.default_domain_resolver == "sbox-system" and
-      (([.outbounds[]? | select(.type != "selector" and .type != "block") | {tag,domain_resolver}] | sort_by(.tag)) ==
-        ([{tag:"direct",domain_resolver:"sbox-system"}] + [$state[0].nodes | to_entries[] | .key as $i | .value as $n |
-          (if ($n.dns.mode // "system") == "custom" then "dns-" + (($i + 1)|tostring) else "sbox-system" end) as $resolver |
-          {tag:("out-" + (($i + 1)|tostring)),domain_resolver:$resolver},
+    and (if $dns_level >= 1 then .route.default_domain_resolver == "sbox-system" else true end)
+    and (([.outbounds[]? | select(.type != "selector" and .type != "block") | {tag,domain_resolver,domain_strategy}] | sort_by(.tag)) ==
+        ([({tag:"direct"} + dns_fields({}; 0))] + [$state[0].nodes | to_entries[] | .key as $i | .value as $n |
+          dns_fields($n; $i) as $fields |
+          ({tag:("out-" + (($i + 1)|tostring))} + $fields),
           (($n.backup_outbounds // []) | to_entries[] | select((.value.type // "direct") != "direct") |
-            {tag:("backup-" + (($i + 1)|tostring) + "-" + ((.key + 1)|tostring)),domain_resolver:$resolver}),
+            {tag:("backup-" + (($i + 1)|tostring) + "-" + ((.key + 1)|tostring))} + $fields),
           (if ($n.outbound.type // "direct") != "direct" and any(($n.backup_outbounds // [])[]?; (.type // "direct") == "direct") then
-            {tag:("direct-" + (($i + 1)|tostring)),domain_resolver:$resolver} else empty end)] | sort_by(.tag)))
-      else all(.outbounds[]?; .domain_resolver == null) end)
+            {tag:("direct-" + (($i + 1)|tostring))} + $fields else empty end)] | sort_by(.tag)))
   ' "$CONFIG_FILE" >/dev/null 2>&1
 }
 
@@ -3696,6 +3704,7 @@ normalize_backup_outbounds() {
 validate_dns_settings() {
   local settings=$1 server
   jq -e 'type == "object" and (.mode | IN("system", "custom")) and
+    (if has("strategy") then (.strategy | IN("default", "ipv4_only", "prefer_ipv4", "ipv6_only", "prefer_ipv6")) else true end) and
     (if .mode == "custom" then (.server | type == "string" and length > 0) else true end)' <<<"$settings" >/dev/null 2>&1 || return 1
   [[ "$(jq -r '.mode' <<<"$settings")" == "system" ]] && return 0
   server=$(jq -r '.server' <<<"$settings")
@@ -3712,9 +3721,10 @@ PY_DNS_IP
 }
 
 collect_dns_settings() {
-  local old=${1:-'{}'} target=$2 selected_mode selected_server settings
+  local old=${1:-'{}'} target=$2 prompt_strategy=${3:-0} selected_mode selected_server selected_strategy settings
   selected_mode=${DNS_MODE:-$(jq -r '.dns.mode // "system"' <<<"$old")}
   selected_server=${DNS_SERVER:-$(jq -r '.dns.server // empty' <<<"$old")}
+  selected_strategy=${DNS_STRATEGY:-$(jq -r '.dns.strategy // "default"' <<<"$old")}
   [[ "$selected_mode" == "system" || "$selected_mode" == "custom" ]] || die "DNS 模式仅支持 system 或 custom。"
   prompt_choice selected_mode "节点 DNS" "$selected_mode" \
     "system|系统 DNS (默认)" "custom|自定义 DNS" || return 1
@@ -3730,6 +3740,16 @@ collect_dns_settings() {
   else
     settings='{"mode":"system"}'
   fi
+  if (( prompt_strategy )); then
+    prompt_choice selected_strategy "域名地址策略" "$selected_strategy" \
+      "default|默认（保持内核原有行为）" \
+      "ipv4_only|仅 IPv4" "prefer_ipv4|IPv4 优先" \
+      "ipv6_only|仅 IPv6" "prefer_ipv6|IPv6 优先" || return 1
+  fi
+  if [[ "$selected_strategy" != "default" ]]; then
+    settings=$(jq -c --arg strategy "$selected_strategy" '.strategy = $strategy' <<<"$settings")
+  fi
+  validate_dns_settings "$settings" || { warn "节点 DNS 或地址策略无效。"; return 1; }
   printf -v "$target" '%s' "$settings"
 }
 
@@ -4010,7 +4030,7 @@ validate_nodes_state() {
   while IFS= read -r node; do
     [[ -n "$node" ]] || continue
     protocol=$(jq -r '.protocol' <<<"$node")
-    validate_dns_settings "$(jq -c 'if has("dns") then .dns else {mode:"system"} end' <<<"$node")" || die "节点 DNS 配置无效：请选择系统 DNS，或填写自定义 DNS 的 IPv4 / IPv6 地址。"
+    validate_dns_settings "$(jq -c 'if has("dns") then .dns else {mode:"system"} end' <<<"$node")" || die "节点 DNS 配置无效：请检查 DNS 模式、服务器 IP 与域名地址策略。"
     local rate_limit_value
     for rate_limit_value in "$(jq -r '.traffic.rate_limit.upload // empty' <<<"$node")" "$(jq -r '.traffic.rate_limit.download // empty' <<<"$node")"; do
       [[ -z "$rate_limit_value" ]] || validate_rate_limit "$rate_limit_value" || die "节点 [$(jq -r '.name' <<<"$node")] 端口限速格式无效：${rate_limit_value}。"
@@ -4299,7 +4319,11 @@ generate_config_from_state() {
     def dns_tag($n; $i):
       if ($n.dns.mode // "system") == "custom" then "dns-" + (($i + 1)|tostring) else "sbox-system" end;
     def with_dns($n; $i):
-      . + (if $dns_level >= 1 then {domain_resolver: dns_tag($n; $i)} else {domain_strategy:"prefer_ipv4"} end);
+      ($n.dns.strategy // "default") as $strategy |
+      . + (if $dns_level >= 1 then
+        {domain_resolver: (if $strategy == "default" then dns_tag($n; $i)
+          else {server:dns_tag($n; $i),strategy:$strategy} end)}
+      else {domain_strategy:(if $strategy == "default" then "prefer_ipv4" else $strategy end)} end);
     .nodes as $nodes | {
       log: {level: (.log_level // "warn"), timestamp: true},
       dns: ({
@@ -5067,7 +5091,11 @@ print_node_summary_card() {
     printf "  混淆策略: %s\n" "$pad_str"
   fi
   printf "  出口分流: %s\n" "$out_str"
-  printf "  DNS 设置: %s\n" "$(jq -r 'if (.dns.mode // "system") == "custom" then "自定义 (" + .dns.server + ", UDP 53)" else "系统 DNS" end' <<<"$node")"
+  printf "  DNS 设置: %s\n" "$(jq -r '
+    (if (.dns.mode // "system") == "custom" then "自定义 (" + .dns.server + ", UDP 53)" else "系统 DNS" end)
+    + " / " + ((.dns.strategy // "default") | {
+      default:"默认", ipv4_only:"仅 IPv4", prefer_ipv4:"IPv4 优先", ipv6_only:"仅 IPv6", prefer_ipv6:"IPv6 优先"
+    }[.])' <<<"$node")"
   printf "  流量策略: %s\n" "$traf_str"
   printf "%s====================================================================%s\n" "$C_CYAN" "$C_RESET"
 }
@@ -5756,7 +5784,7 @@ edit_node_dns() {
   local index=$1 nodes old node_dns
   nodes=$(current_nodes_json)
   old=$(jq -c ".[$index]" <<<"$nodes")
-  collect_dns_settings "$old" node_dns || return 0
+  collect_dns_settings "$old" node_dns 1 || return 0
   save_nodes_json "$(jq -c --argjson index "$index" --argjson dns "$node_dns" '.[$index].dns = $dns' <<<"$nodes")"
   ok "节点 DNS 设置已更新。"
 }
@@ -8003,6 +8031,7 @@ usage() {
   --no-ss-outbound-tfo    Shadowsocks 出站关闭 TCP Fast Open (默认)
   --dns-mode MODE         节点 DNS 模式 (system / custom，默认 system)
   --dns-server IP         自定义 DNS 服务器 IP (UDP 53)
+  --dns-strategy MODE     域名地址策略 (default / ipv4_only / prefer_ipv4 / ipv6_only / prefer_ipv6)
   --domain DOMAIN         节点域名或 IP
   --port PORT             监听端口
   --password PASS         密码或预共享密钥
@@ -8041,6 +8070,7 @@ parse_options() {
       --no-ss-outbound-tfo) SS_OUTBOUND_TFO="false"; shift;;
       --dns-mode) [[ $# -ge 2 ]] || die "--dns-mode 缺少值"; DNS_MODE=$2; [[ "$DNS_MODE" == "system" || "$DNS_MODE" == "custom" ]] || die "DNS 模式仅支持 system 或 custom。"; shift 2;;
       --dns-server) [[ $# -ge 2 ]] || die "--dns-server 缺少值"; DNS_SERVER=$2; shift 2;;
+      --dns-strategy) [[ $# -ge 2 ]] || die "--dns-strategy 缺少值"; DNS_STRATEGY=$2; [[ "$DNS_STRATEGY" =~ ^(default|ipv4_only|prefer_ipv4|ipv6_only|prefer_ipv6)$ ]] || die "域名地址策略仅支持 default、ipv4_only、prefer_ipv4、ipv6_only、prefer_ipv6。"; shift 2;;
       --cert-mode) [[ $# -ge 2 ]] || die "--cert-mode 缺少值"; CERT_MODE=$2; shift 2;;
       --webroot) [[ $# -ge 2 ]] || die "--webroot 缺少值"; WEBROOT=$2; shift 2;;
       --outbound) [[ $# -ge 2 ]] || die "--outbound 缺少值"; OUTBOUND=$2; shift 2;;
