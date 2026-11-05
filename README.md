@@ -105,6 +105,50 @@ sbox
 （支持直接输入 `sbox` 快速调出面板，普通用户运行时会自动调起 sudo）
 
 
+## Realm2 中转管理
+
+维护者：[@elunez](https://github.com/elunez)
+
+管理脚本版本从 `v1.0.1` 开始，按十进制三段递增，例如 `v1.0.9 → v1.1.0`、
+`v1.9.9 → v2.0.0`；Realm 核心版本独立采用官方 Release 版本号。
+
+独立脚本 [`realm.sh`](realm.sh) 用于安装和管理 Realm2 四层中转。脚本只从
+[`zhboner/realm` 官方 Releases](https://github.com/zhboner/realm/releases) 获取核心，根据
+`x86_64`、`aarch64`、`armv7` 等架构选择便携的 Linux musl 构建，并使用 GitHub Release
+API 提供的 SHA-256 校验下载内容。默认使用功能完整构建；如只需要精简 TCP/UDP 核心，可用
+`REALM_BUILD=slim` 运行安装命令。
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/elunez/sbox/main/realm.sh
+chmod +x realm.sh
+sudo ./realm.sh
+```
+
+也可以直接执行子命令：
+
+```bash
+sudo ./realm.sh install       # 安装或更新到官方最新版本
+sudo ./realm.sh add           # 添加 TCP + UDP 转发
+./realm.sh list               # 查看规则
+sudo ./realm.sh delete        # 删除规则
+sudo ./realm.sh status        # 查看服务状态
+sudo ./realm.sh backup        # 备份配置
+sudo ./realm.sh restore       # 恢复最近备份
+```
+
+规则直接保存在 `/etc/realm2/config.json`，增删时使用同目录临时文件原子替换，并在修改前自动
+备份；服务启动失败会恢复修改前的配置。删除最后一条规则后会停止服务，不会生成空规则后进入
+反复重启。systemd 使用 `Restart=on-failure`，不再设置无条件重启或定时重启任务。全部交互输入
+都在提示文字同一行完成。新脚本直接管理 JSON；升级后不要再混用旧 EasyRealM 菜单修改
+`rawconf`，否则旧脚本可能重新覆盖 `config.json`。
+
+隔离测试只操作临时目录，不安装核心、不访问网络，也不调用真实 systemd：
+
+```bash
+python3 -m unittest discover -s tests -p 'test_realm.py' -v
+```
+
+
 ## 系统 DNS 管理
 
 独立脚本 `dns-manager.sh` 支持 NetworkManager、systemd-resolved、resolvconf/openresolv、dhclient、SUSE netconfig，以及 Alpine 常用的 dhcpcd。需要 Bash；Alpine 上请使用 `bash` 运行。root 用户可去掉下面的 `sudo`。
