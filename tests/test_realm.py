@@ -17,6 +17,7 @@ SOURCE = SCRIPT.read_text()
 
 def bash(code, env=None):
     merged = os.environ.copy()
+    merged["REALM_SKIP_SUDO"] = "1"
     if env:
         merged.update(env)
     return subprocess.run(
@@ -29,8 +30,8 @@ def bash(code, env=None):
 
 
 class RealmScriptTests(unittest.TestCase):
-    def test_manager_version_starts_at_1_0_1(self):
-        self.assertIn('SCRIPT_VERSION="1.0.1"', SOURCE)
+    def test_manager_version_is_1_0_2(self):
+        self.assertIn('SCRIPT_VERSION="1.0.2"', SOURCE)
 
     def test_bash_syntax(self):
         result = subprocess.run(["bash", "-n", str(SCRIPT)], text=True, capture_output=True)
@@ -39,7 +40,65 @@ class RealmScriptTests(unittest.TestCase):
     def test_prompts_stay_on_the_same_line(self):
         self.assertNotRegex(SOURCE, r'read_input\s+\w+\s+"[^"]*\n[^"]*"')
         self.assertNotRegex(SOURCE, r'read\s+-[^\n]*-p\s+"[^"]*\n[^"]*"')
-        self.assertIn('read_input choice "请选择 [0-11]："', SOURCE)
+        self.assertIn('read_input choice "请选择 [0-12]："', SOURCE)
+
+    def test_pf_update_routes_to_manager_update_not_core_update(self):
+        result = bash(
+            "update_manager_script() { printf 'manager-update\\n'; }\n"
+            "install_latest() { printf 'core-update\\n'; }\n"
+            "main update\n"
+            "main install"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["manager-update", "core-update"])
+
+    def test_install_manager_command_creates_executable_pf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "bin" / "pf"
+            result = bash("install_manager_command", {"PF_COMMAND": str(target)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(target.exists())
+            self.assertTrue(os.access(target, os.X_OK))
+            self.assertEqual(target.read_text(), SOURCE)
+
+    def test_manager_version_comparison_uses_numeric_parts(self):
+        newer = bash("manager_version_is_newer 1.1.0 1.0.9")
+        older = bash("manager_version_is_newer 1.0.9 1.1.0")
+        equal = bash("manager_version_is_newer 1.0.2 1.0.2")
+        self.assertEqual(newer.returncode, 0, newer.stderr)
+        self.assertNotEqual(older.returncode, 0)
+        self.assertNotEqual(equal.returncode, 0)
+
+    def test_manager_update_validates_and_atomically_installs_newer_script(self):
+        with tempfile.TemporaryDirectory() as directory:
+            remote = Path(directory) / "remote-realm.sh"
+            target = Path(directory) / "bin" / "pf"
+            remote.write_text(SOURCE.replace(
+                'SCRIPT_VERSION="1.0.2"', 'SCRIPT_VERSION="1.0.3"', 1
+            ))
+            code = r'''
+require_root() { return 0; }
+curl() {
+    local output=''
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -o) output=$2; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    cp "$REMOTE_SCRIPT" "$output"
+}
+update_manager_script
+'''
+            result = bash(code, {
+                "REMOTE_SCRIPT": str(remote),
+                "PF_COMMAND": str(target),
+                "SCRIPT_UPDATE_URL": "https://example.invalid/realm.sh",
+            })
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("v1.0.2 -> v1.0.3", result.stdout)
+            self.assertIn('SCRIPT_VERSION="1.0.3"', target.read_text())
+            self.assertTrue(os.access(target, os.X_OK))
 
     def test_target_mapping_uses_portable_musl_assets(self):
         cases = {

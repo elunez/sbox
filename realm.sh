@@ -7,7 +7,7 @@
 set -uo pipefail
 
 # 管理脚本版本按十进制三段递增：1.0.9 -> 1.1.0，1.9.9 -> 2.0.0。
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 REALM_REPOSITORY="${REALM_REPOSITORY:-zhboner/realm}"
 REALM_API_URL="${REALM_API_URL:-https://api.github.com/repos/${REALM_REPOSITORY}/releases/latest}"
 REALM_DIR="${REALM_DIR:-/etc/realm2}"
@@ -18,6 +18,9 @@ REALM_SERVICE="${REALM_SERVICE:-realm2.service}"
 REALM_SERVICE_FILE="${REALM_SERVICE_FILE:-/etc/systemd/system/${REALM_SERVICE}}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 REALM_BUILD="${REALM_BUILD:-full}"
+PF_COMMAND="${PF_COMMAND:-/usr/local/bin/pf}"
+SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/elunez/sbox/main/realm.sh}"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     C_GREEN='\033[32m'
@@ -185,6 +188,90 @@ installed_version() {
     version=$("$REALM_BIN" --version 2>/dev/null | awk 'NR == 1 {print $2}')
     [[ "$version" =~ ^[0-9]+([.][0-9]+){1,3}([-+][0-9A-Za-z.-]+)?$ ]] || return 1
     printf '%s\n' "$version"
+}
+
+manager_version_is_newer() {
+    local candidate=$1
+    local current=$2
+
+    python3 - "$candidate" "$current" <<'PY'
+import re
+import sys
+
+candidate, current = sys.argv[1:]
+pattern = re.compile(r"^[0-9]+(?:\.[0-9]+){2}$")
+if not pattern.fullmatch(candidate) or not pattern.fullmatch(current):
+    raise SystemExit(2)
+candidate_parts = tuple(map(int, candidate.split(".")))
+current_parts = tuple(map(int, current.split(".")))
+raise SystemExit(0 if candidate_parts > current_parts else 1)
+PY
+}
+
+install_manager_command() {
+    local source_file=${1:-$SCRIPT_SOURCE}
+    local target_dir temp_target
+
+    [[ -r "$source_file" ]] || {
+        error "无法读取管理脚本：${source_file}"
+        return 1
+    }
+    target_dir=$(dirname "$PF_COMMAND")
+    mkdir -p "$target_dir" || return 1
+    temp_target="${PF_COMMAND}.new.$$"
+    if ! install -m 755 "$source_file" "$temp_target"; then
+        rm -f "$temp_target"
+        return 1
+    fi
+    if ! bash -n "$temp_target" || ! mv -f "$temp_target" "$PF_COMMAND"; then
+        rm -f "$temp_target"
+        return 1
+    fi
+}
+
+update_manager_script() {
+    local temp_file remote_version
+
+    require_root || return 1
+    command_exists curl || install_dependencies || return 1
+    command_exists python3 || install_dependencies || return 1
+    temp_file=$(mktemp) || return 1
+
+    info "正在检查管理脚本更新..."
+    if ! curl -fL --retry 3 --connect-timeout 15 --max-time 600 \
+        --speed-limit 1024 --speed-time 30 -o "$temp_file" "$SCRIPT_UPDATE_URL"; then
+        error "管理脚本下载失败。"
+        rm -f "$temp_file"
+        return 1
+    fi
+    if ! grep -q '^# Realm2 管理脚本$' "$temp_file" || ! bash -n "$temp_file"; then
+        error "下载内容不是有效的 Realm2 管理脚本。"
+        rm -f "$temp_file"
+        return 1
+    fi
+    remote_version=$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"$/\1/p' "$temp_file" | head -n 1)
+    if [[ -z "$remote_version" ]]; then
+        error "无法识别远端脚本版本。"
+        rm -f "$temp_file"
+        return 1
+    fi
+    if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
+        rm -f "$temp_file"
+        info "管理脚本已经是最新版本 v${SCRIPT_VERSION}。"
+        return 0
+    fi
+    if ! manager_version_is_newer "$remote_version" "$SCRIPT_VERSION"; then
+        error "远端版本 v${remote_version} 不高于当前版本 v${SCRIPT_VERSION}，已拒绝降级。"
+        rm -f "$temp_file"
+        return 1
+    fi
+    if ! install_manager_command "$temp_file"; then
+        error "管理脚本替换失败。"
+        rm -f "$temp_file"
+        return 1
+    fi
+    rm -f "$temp_file"
+    info "管理脚本已升级：v${SCRIPT_VERSION} -> v${remote_version}。"
 }
 
 config_action() {
@@ -516,7 +603,12 @@ install_latest() {
 
     rm -f "$metadata_file" "$archive"
     rm -rf "$extract_dir"
+    if ! install_manager_command "$SCRIPT_SOURCE"; then
+        error "Realm2 核心已安装，但 pf 命令安装失败。"
+        return 1
+    fi
     info "Realm2 ${latest_tag} 安装/更新完成。"
+    info "后续可使用 pf 打开菜单，使用 pf update 更新管理脚本。"
 }
 
 valid_port() {
@@ -706,7 +798,7 @@ uninstall_realm() {
     require_root || return 1
     confirm "确认卸载 Realm2 程序和服务？[y/N]：" 'n' || return 0
     "$SYSTEMCTL_BIN" disable --now "$REALM_SERVICE" >/dev/null 2>&1 || true
-    rm -f "$REALM_SERVICE_FILE" "$REALM_BIN" "${REALM_BIN}.previous"
+    rm -f "$REALM_SERVICE_FILE" "$REALM_BIN" "${REALM_BIN}.previous" "$PF_COMMAND"
     "$SYSTEMCTL_BIN" daemon-reload || true
     read_input purge "同时删除配置和备份？[y/N]：" 'n' || true
     if [[ "$purge" =~ ^[Yy]$ ]]; then
@@ -752,10 +844,11 @@ show_menu() {
         printf '%s\n' ' 9. 备份配置'
         printf '%s\n' '10. 恢复最近备份'
         printf '%s\n' '11. 卸载 Realm2'
+        printf '%s\n' '12. 更新管理脚本'
         printf '%s\n' '------------------------------------'
         printf '核心版本：%s | 服务：%s | 规则：%s\n' "$version" "$status" "$count"
         printf '%s\n' '------------------------------------'
-        read_input choice "请选择 [0-11]：" '' || return 0
+        read_input choice "请选择 [0-12]：" '' || return 0
 
         case "$choice" in
             0) return 0 ;;
@@ -770,7 +863,8 @@ show_menu() {
             9) backup_config ;;
             10) restore_config ;;
             11) uninstall_realm ;;
-            *) error "请输入 0-11。" ;;
+            12) update_manager_script ;;
+            *) error "请输入 0-12。" ;;
         esac
         pause_menu
     done
@@ -779,23 +873,42 @@ show_menu() {
 usage() {
     cat <<EOF
 用法：
-  realm.sh                 打开交互菜单
-  realm.sh install         安装或更新到官方最新版本
-  realm.sh add             添加转发规则
-  realm.sh list            查看转发规则
-  realm.sh delete          删除转发规则
-  realm.sh start|stop|restart|status
-  realm.sh backup|restore
-  realm.sh uninstall
-  realm.sh version         查看已安装核心版本
+  pf                       打开交互菜单
+  pf update                更新管理脚本
+  pf install               安装或更新 Realm2 官方核心
+  pf add                   添加转发规则
+  pf list                  查看转发规则
+  pf delete                删除转发规则
+  pf start|stop|restart|status
+  pf backup|restore
+  pf uninstall
+  pf version               查看已安装核心版本
 EOF
+}
+
+maybe_reexec_as_root() {
+    local command=$1
+    shift
+
+    [[ ${EUID:-$(id -u)} -eq 0 || -n "${REALM_SKIP_SUDO:-}" ]] && return 0
+    case "$command" in
+        list|version|-h|--help|help) return 0 ;;
+    esac
+    if command_exists sudo; then
+        exec sudo bash "$SCRIPT_SOURCE" "$command" "$@"
+    fi
+    error "此操作需要 root 权限，且系统没有 sudo。"
+    return 1
 }
 
 main() {
     local command=${1:-menu}
+    shift $(( $# > 0 ? 1 : 0 ))
+    maybe_reexec_as_root "$command" "$@" || return 1
     case "$command" in
         menu) show_menu ;;
-        install|update) install_latest ;;
+        install|core-update|update-core) install_latest ;;
+        update) update_manager_script ;;
         add) add_rule ;;
         list) list_rules ;;
         delete) delete_rule ;;

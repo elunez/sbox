@@ -119,22 +119,24 @@ API 提供的 SHA-256 校验下载内容。默认使用功能完整构建；如�
 `REALM_BUILD=slim` 运行安装命令。
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/elunez/sbox/main/realm.sh
-chmod +x realm.sh
-sudo ./realm.sh
+curl -fsSLO https://raw.githubusercontent.com/elunez/sbox/main/realm.sh && chmod +x realm.sh && sudo ./realm.sh install
 ```
 
-也可以直接执行子命令：
+安装成功后，脚本会注册 `/usr/local/bin/pf`，以后可直接执行：
 
 ```bash
-sudo ./realm.sh install       # 安装或更新到官方最新版本
-sudo ./realm.sh add           # 添加 TCP + UDP 转发
-./realm.sh list               # 查看规则
-sudo ./realm.sh delete        # 删除规则
-sudo ./realm.sh status        # 查看服务状态
-sudo ./realm.sh backup        # 备份配置
-sudo ./realm.sh restore       # 恢复最近备份
+pf                            # 打开管理菜单
+pf update                     # 更新管理脚本
+pf install                    # 安装或更新 Realm2 官方核心
+pf add                        # 添加 TCP + UDP 转发
+pf list                       # 查看规则
+pf delete                     # 删除规则
+pf status                     # 查看服务状态
+pf backup                     # 备份配置
+pf restore                    # 恢复最近备份
 ```
+
+非 root 用户执行需要权限的 `pf` 命令时会自动调用 `sudo`；查看规则、版本和帮助不需要提权。
 
 规则直接保存在 `/etc/realm2/config.json`，增删时使用同目录临时文件原子替换，并在修改前自动
 备份；服务启动失败会恢复修改前的配置。删除最后一条规则后会停止服务，不会生成空规则后进入
