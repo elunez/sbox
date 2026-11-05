@@ -7,7 +7,7 @@
 set -uo pipefail
 
 # 管理脚本版本按十进制三段递增：1.0.9 -> 1.1.0，1.9.9 -> 2.0.0。
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 REALM_REPOSITORY="${REALM_REPOSITORY:-zhboner/realm}"
 REALM_API_URL="${REALM_API_URL:-https://api.github.com/repos/${REALM_REPOSITORY}/releases/latest}"
 REALM_DIR="${REALM_DIR:-/etc/realm2}"
@@ -482,6 +482,15 @@ install_latest() {
 
     require_root || return 1
     install_dependencies || return 1
+    if ! install_manager_command "$SCRIPT_SOURCE"; then
+        error "pf 命令安装失败，已停止 Realm2 安装。"
+        return 1
+    fi
+    if [[ ! -x "$PF_COMMAND" ]] || ! bash -n "$PF_COMMAND"; then
+        error "pf 命令安装后校验失败。"
+        return 1
+    fi
+    info "管理命令已安装：${PF_COMMAND}"
     command_exists "$SYSTEMCTL_BIN" || {
         error "当前系统没有 systemd，暂不支持自动安装服务。"
         return 1
@@ -603,10 +612,10 @@ install_latest() {
 
     rm -f "$metadata_file" "$archive"
     rm -rf "$extract_dir"
-    if ! install_manager_command "$SCRIPT_SOURCE"; then
-        error "Realm2 核心已安装，但 pf 命令安装失败。"
+    [[ -x "$PF_COMMAND" ]] || {
+        error "Realm2 核心已安装，但 pf 命令校验失败。"
         return 1
-    fi
+    }
     info "Realm2 ${latest_tag} 安装/更新完成。"
     info "后续可使用 pf 打开菜单，使用 pf update 更新管理脚本。"
 }

@@ -30,8 +30,8 @@ def bash(code, env=None):
 
 
 class RealmScriptTests(unittest.TestCase):
-    def test_manager_version_is_1_0_2(self):
-        self.assertIn('SCRIPT_VERSION="1.0.2"', SOURCE)
+    def test_manager_version_is_1_0_3(self):
+        self.assertIn('SCRIPT_VERSION="1.0.3"', SOURCE)
 
     def test_bash_syntax(self):
         result = subprocess.run(["bash", "-n", str(SCRIPT)], text=True, capture_output=True)
@@ -61,10 +61,19 @@ class RealmScriptTests(unittest.TestCase):
             self.assertTrue(os.access(target, os.X_OK))
             self.assertEqual(target.read_text(), SOURCE)
 
+    def test_core_install_creates_pf_before_release_download(self):
+        start = SOURCE.index("install_latest() {")
+        end = SOURCE.index("\nvalid_port() {", start)
+        install_function = SOURCE[start:end]
+        self.assertLess(
+            install_function.index('install_manager_command "$SCRIPT_SOURCE"'),
+            install_function.index("target=$(detect_target)"),
+        )
+
     def test_manager_version_comparison_uses_numeric_parts(self):
         newer = bash("manager_version_is_newer 1.1.0 1.0.9")
         older = bash("manager_version_is_newer 1.0.9 1.1.0")
-        equal = bash("manager_version_is_newer 1.0.2 1.0.2")
+        equal = bash("manager_version_is_newer 1.0.3 1.0.3")
         self.assertEqual(newer.returncode, 0, newer.stderr)
         self.assertNotEqual(older.returncode, 0)
         self.assertNotEqual(equal.returncode, 0)
@@ -74,7 +83,7 @@ class RealmScriptTests(unittest.TestCase):
             remote = Path(directory) / "remote-realm.sh"
             target = Path(directory) / "bin" / "pf"
             remote.write_text(SOURCE.replace(
-                'SCRIPT_VERSION="1.0.2"', 'SCRIPT_VERSION="1.0.3"', 1
+                'SCRIPT_VERSION="1.0.3"', 'SCRIPT_VERSION="1.0.4"', 1
             ))
             code = r'''
 require_root() { return 0; }
@@ -96,8 +105,8 @@ update_manager_script
                 "SCRIPT_UPDATE_URL": "https://example.invalid/realm.sh",
             })
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("v1.0.2 -> v1.0.3", result.stdout)
-            self.assertIn('SCRIPT_VERSION="1.0.3"', target.read_text())
+            self.assertIn("v1.0.3 -> v1.0.4", result.stdout)
+            self.assertIn('SCRIPT_VERSION="1.0.4"', target.read_text())
             self.assertTrue(os.access(target, os.X_OK))
 
     def test_target_mapping_uses_portable_musl_assets(self):
