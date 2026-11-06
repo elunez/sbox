@@ -18,6 +18,7 @@ SOURCE = SCRIPT.read_text()
 def bash(code, env=None):
     merged = os.environ.copy()
     merged["REALM_SKIP_SUDO"] = "1"
+    merged["INIT_SYSTEM"] = "systemd"
     if env:
         merged.update(env)
     return subprocess.run(
@@ -30,8 +31,8 @@ def bash(code, env=None):
 
 
 class RealmScriptTests(unittest.TestCase):
-    def test_manager_version_is_1_0_3(self):
-        self.assertIn('SCRIPT_VERSION="1.0.3"', SOURCE)
+    def test_manager_version_is_1_0_4(self):
+        self.assertIn('SCRIPT_VERSION="1.0.4"', SOURCE)
 
     def test_bash_syntax(self):
         result = subprocess.run(["bash", "-n", str(SCRIPT)], text=True, capture_output=True)
@@ -73,7 +74,7 @@ class RealmScriptTests(unittest.TestCase):
     def test_manager_version_comparison_uses_numeric_parts(self):
         newer = bash("manager_version_is_newer 1.1.0 1.0.9")
         older = bash("manager_version_is_newer 1.0.9 1.1.0")
-        equal = bash("manager_version_is_newer 1.0.3 1.0.3")
+        equal = bash("manager_version_is_newer 1.0.4 1.0.4")
         self.assertEqual(newer.returncode, 0, newer.stderr)
         self.assertNotEqual(older.returncode, 0)
         self.assertNotEqual(equal.returncode, 0)
@@ -83,7 +84,7 @@ class RealmScriptTests(unittest.TestCase):
             remote = Path(directory) / "remote-realm.sh"
             target = Path(directory) / "bin" / "pf"
             remote.write_text(SOURCE.replace(
-                'SCRIPT_VERSION="1.0.3"', 'SCRIPT_VERSION="1.0.4"', 1
+                'SCRIPT_VERSION="1.0.4"', 'SCRIPT_VERSION="1.0.5"', 1
             ))
             code = r'''
 require_root() { return 0; }
@@ -105,8 +106,8 @@ update_manager_script
                 "SCRIPT_UPDATE_URL": "https://example.invalid/realm.sh",
             })
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("v1.0.3 -> v1.0.4", result.stdout)
-            self.assertIn('SCRIPT_VERSION="1.0.4"', target.read_text())
+            self.assertIn("v1.0.4 -> v1.0.5", result.stdout)
+            self.assertIn('SCRIPT_VERSION="1.0.5"', target.read_text())
             self.assertTrue(os.access(target, os.X_OK))
 
     def test_target_mapping_uses_portable_musl_assets(self):
@@ -233,6 +234,60 @@ update_manager_script
             self.assertNotIn("Restart=always", unit)
             self.assertNotIn("ExecStop=", unit)
             self.assertIn(str(realm_dir / "realm2"), unit)
+
+    def test_openrc_service_uses_supervise_daemon_and_is_executable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = Path(directory) / "init.d" / "realm2"
+            service.parent.mkdir()
+            realm_dir = Path(directory) / "realm2"
+            env = {
+                "INIT_SYSTEM": "openrc",
+                "REALM_DIR": str(realm_dir),
+                "REALM_BIN": str(realm_dir / "realm2"),
+                "REALM_CONFIG": str(realm_dir / "config.json"),
+                "REALM_SERVICE_FILE": str(service),
+            }
+            result = bash("write_service_unit", env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            unit = service.read_text()
+            self.assertTrue(unit.startswith("#!/sbin/openrc-run\n"))
+            self.assertIn('supervisor="supervise-daemon"', unit)
+            self.assertIn("respawn_max=5", unit)
+            self.assertTrue(os.access(service, os.X_OK))
+
+    def test_openrc_service_actions_use_rc_tools(self):
+        result = bash(
+            "RC_SERVICE_BIN=echo\n"
+            "RC_UPDATE_BIN=echo\n"
+            "service_enable\n"
+            "service_start\n"
+            "service_restart\n"
+            "service_stop",
+            {"INIT_SYSTEM": "openrc"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.splitlines(),
+            ["realm2 start", "realm2 restart", "realm2 stop"],
+        )
+
+    def test_alpine_dependency_install_includes_bash_and_openrc(self):
+        self.assertIn(
+            "apk add --no-cache bash curl ca-certificates tar python3 coreutils openrc",
+            SOURCE,
+        )
+
+    def test_empty_config_disables_service_instead_of_enabling_it(self):
+        result = bash(
+            "service_daemon_reload() { :; }\n"
+            "service_has_rules() { return 1; }\n"
+            "service_enable() { printf 'enable\\n'; }\n"
+            "service_disable() { printf 'disable\\n'; }\n"
+            "restart_for_config"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("disable", result.stdout)
+        self.assertNotIn("enable", result.stdout)
 
     def test_port_and_ipv6_format_validation(self):
         result = bash(

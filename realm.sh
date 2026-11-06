@@ -7,16 +7,20 @@
 set -uo pipefail
 
 # 管理脚本版本按十进制三段递增：1.0.9 -> 1.1.0，1.9.9 -> 2.0.0。
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 REALM_REPOSITORY="${REALM_REPOSITORY:-zhboner/realm}"
 REALM_API_URL="${REALM_API_URL:-https://api.github.com/repos/${REALM_REPOSITORY}/releases/latest}"
 REALM_DIR="${REALM_DIR:-/etc/realm2}"
 REALM_BIN="${REALM_BIN:-${REALM_DIR}/realm2}"
 REALM_CONFIG="${REALM_CONFIG:-${REALM_DIR}/config.json}"
 REALM_BACKUP_DIR="${REALM_BACKUP_DIR:-${REALM_DIR}/backups}"
-REALM_SERVICE="${REALM_SERVICE:-realm2.service}"
-REALM_SERVICE_FILE="${REALM_SERVICE_FILE:-/etc/systemd/system/${REALM_SERVICE}}"
+REALM_SERVICE_NAME="${REALM_SERVICE_NAME:-realm2}"
+REALM_SERVICE="${REALM_SERVICE:-${REALM_SERVICE_NAME}.service}"
+REALM_SERVICE_FILE="${REALM_SERVICE_FILE:-}"
 SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
+RC_SERVICE_BIN="${RC_SERVICE_BIN:-rc-service}"
+RC_UPDATE_BIN="${RC_UPDATE_BIN:-rc-update}"
+INIT_SYSTEM="${INIT_SYSTEM:-}"
 REALM_BUILD="${REALM_BUILD:-full}"
 PF_COMMAND="${PF_COMMAND:-/usr/local/bin/pf}"
 SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/elunez/sbox/main/realm.sh}"
@@ -49,6 +53,96 @@ require_root() {
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+init_service_runtime() {
+    if [[ -z "$INIT_SYSTEM" ]]; then
+        if command_exists "$SYSTEMCTL_BIN" && \
+            { [[ -d /run/systemd/system ]] || [[ $(cat /proc/1/comm 2>/dev/null) == 'systemd' ]]; }; then
+            INIT_SYSTEM='systemd'
+        elif command_exists "$RC_SERVICE_BIN" && command_exists "$RC_UPDATE_BIN"; then
+            INIT_SYSTEM='openrc'
+        elif command_exists "$SYSTEMCTL_BIN"; then
+            INIT_SYSTEM='systemd'
+        else
+            error "未检测到 systemd 或 OpenRC。"
+            return 1
+        fi
+    fi
+    case "$INIT_SYSTEM" in
+        systemd)
+            [[ -n "$REALM_SERVICE_FILE" ]] || REALM_SERVICE_FILE="/etc/systemd/system/${REALM_SERVICE}"
+            ;;
+        openrc)
+            [[ -n "$REALM_SERVICE_FILE" ]] || REALM_SERVICE_FILE="/etc/init.d/${REALM_SERVICE_NAME}"
+            ;;
+        *)
+            error "不支持的服务管理器：${INIT_SYSTEM}"
+            return 1
+            ;;
+    esac
+}
+
+service_daemon_reload() {
+    [[ "$INIT_SYSTEM" == 'systemd' ]] || return 0
+    "$SYSTEMCTL_BIN" daemon-reload
+}
+
+service_enable() {
+    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
+        "$SYSTEMCTL_BIN" enable "$REALM_SERVICE" >/dev/null
+    else
+        "$RC_UPDATE_BIN" add "$REALM_SERVICE_NAME" default >/dev/null
+    fi
+}
+
+service_is_running() {
+    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
+        "$SYSTEMCTL_BIN" is-active --quiet "$REALM_SERVICE"
+    else
+        "$RC_SERVICE_BIN" "$REALM_SERVICE_NAME" status >/dev/null 2>&1
+    fi
+}
+
+service_start() {
+    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
+        "$SYSTEMCTL_BIN" start "$REALM_SERVICE"
+    else
+        "$RC_SERVICE_BIN" "$REALM_SERVICE_NAME" start
+    fi
+}
+
+service_stop() {
+    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
+        "$SYSTEMCTL_BIN" stop "$REALM_SERVICE"
+    else
+        "$RC_SERVICE_BIN" "$REALM_SERVICE_NAME" stop
+    fi
+}
+
+service_restart() {
+    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
+        "$SYSTEMCTL_BIN" restart "$REALM_SERVICE"
+    else
+        "$RC_SERVICE_BIN" "$REALM_SERVICE_NAME" restart
+    fi
+}
+
+service_status() {
+    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
+        "$SYSTEMCTL_BIN" --no-pager --full status "$REALM_SERVICE"
+    else
+        "$RC_SERVICE_BIN" "$REALM_SERVICE_NAME" status
+    fi
+}
+
+service_disable() {
+    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
+        "$SYSTEMCTL_BIN" disable --now "$REALM_SERVICE" >/dev/null 2>&1 || true
+    else
+        "$RC_SERVICE_BIN" "$REALM_SERVICE_NAME" stop >/dev/null 2>&1 || true
+        "$RC_UPDATE_BIN" del "$REALM_SERVICE_NAME" default >/dev/null 2>&1 || true
+    fi
 }
 
 read_input() {
@@ -86,6 +180,9 @@ install_dependencies() {
     if ! command_exists sha256sum && ! command_exists shasum; then
         missing+=("sha256sum")
     fi
+    if command_exists apk && { ! command_exists "$RC_SERVICE_BIN" || ! command_exists "$RC_UPDATE_BIN"; }; then
+        missing+=("openrc")
+    fi
     ((${#missing[@]} == 0)) && return 0
 
     info "正在安装缺少的依赖：${missing[*]}"
@@ -97,7 +194,7 @@ install_dependencies() {
     elif command_exists yum; then
         yum install -y curl ca-certificates tar python3 coreutils
     elif command_exists apk; then
-        apk add --no-cache curl ca-certificates tar python3 coreutils
+        apk add --no-cache bash curl ca-certificates tar python3 coreutils openrc
     else
         error "无法识别包管理器，请手动安装 curl、tar、python3 和 sha256sum。"
         return 1
@@ -409,8 +506,10 @@ create_config_backup() {
 
 write_service_unit() {
     local temp_file
+    init_service_runtime || return 1
     temp_file=$(mktemp) || return 1
-    cat >"$temp_file" <<EOF
+    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
+        cat >"$temp_file" <<EOF
 [Unit]
 Description=Realm2 relay service
 After=network-online.target
@@ -427,7 +526,29 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-    if ! install -m 644 "$temp_file" "${REALM_SERVICE_FILE}.new"; then
+    else
+        cat >"$temp_file" <<EOF
+#!/sbin/openrc-run
+name="Realm2"
+description="Realm2 relay service"
+command="${REALM_BIN}"
+command_args="-c ${REALM_CONFIG}"
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=5
+respawn_period=60
+output_log="/var/log/realm2.log"
+error_log="/var/log/realm2.log"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+    fi
+    local service_mode='644'
+    [[ "$INIT_SYSTEM" == 'openrc' ]] && service_mode='755'
+    if ! install -m "$service_mode" "$temp_file" "${REALM_SERVICE_FILE}.new"; then
         rm -f "$temp_file" "${REALM_SERVICE_FILE}.new"
         return 1
     fi
@@ -450,11 +571,12 @@ rollback_install_files() {
     if [[ -n "$old_service" && -f "$old_service" ]]; then
         cp -p "$old_service" "$REALM_SERVICE_FILE"
     else
+        service_disable
         rm -f "$REALM_SERVICE_FILE"
     fi
-    "$SYSTEMCTL_BIN" daemon-reload || true
+    service_daemon_reload || true
     if service_has_rules && [[ -x "$REALM_BIN" && -f "$REALM_SERVICE_FILE" ]]; then
-        "$SYSTEMCTL_BIN" restart "$REALM_SERVICE" || true
+        service_restart || true
     fi
 }
 
@@ -465,13 +587,18 @@ service_has_rules() {
 }
 
 restart_for_config() {
-    "$SYSTEMCTL_BIN" daemon-reload || return 1
-    "$SYSTEMCTL_BIN" enable "$REALM_SERVICE" >/dev/null || return 1
+    init_service_runtime || return 1
+    service_daemon_reload || return 1
     if service_has_rules; then
-        "$SYSTEMCTL_BIN" restart "$REALM_SERVICE" || return 1
-        "$SYSTEMCTL_BIN" is-active --quiet "$REALM_SERVICE"
+        service_enable || return 1
+        if service_is_running; then
+            service_restart || return 1
+        else
+            service_start || return 1
+        fi
+        service_is_running
     else
-        "$SYSTEMCTL_BIN" stop "$REALM_SERVICE" >/dev/null 2>&1 || true
+        service_disable
         warn "当前没有转发规则，服务已停止；添加第一条规则后会自动启动。"
     fi
 }
@@ -482,6 +609,7 @@ install_latest() {
 
     require_root || return 1
     install_dependencies || return 1
+    init_service_runtime || return 1
     if ! install_manager_command "$SCRIPT_SOURCE"; then
         error "pf 命令安装失败，已停止 Realm2 安装。"
         return 1
@@ -491,11 +619,6 @@ install_latest() {
         return 1
     fi
     info "管理命令已安装：${PF_COMMAND}"
-    command_exists "$SYSTEMCTL_BIN" || {
-        error "当前系统没有 systemd，暂不支持自动安装服务。"
-        return 1
-    }
-
     target=$(detect_target) || return 1
     asset=$(release_asset_name "$target") || return 1
     metadata_file=$(mktemp) || return 1
@@ -595,7 +718,7 @@ install_latest() {
         fi
     fi
     if ! write_service_unit; then
-        error "写入 systemd 服务失败，正在回滚。"
+        error "写入 ${INIT_SYSTEM} 服务失败，正在回滚。"
         rollback_install_files "$old_binary" "$old_service"
         rm -f "$metadata_file" "$archive"
         rm -rf "$extract_dir"
@@ -769,6 +892,7 @@ restore_config() {
 service_action() {
     local action=$1
     require_root || return 1
+    init_service_runtime || return 1
     [[ -f "$REALM_SERVICE_FILE" ]] || {
         error "Realm2 服务尚未安装。"
         return 1
@@ -779,20 +903,20 @@ service_action() {
                 error "没有转发规则，拒绝启动空服务。"
                 return 1
             }
-            "$SYSTEMCTL_BIN" enable --now "$REALM_SERVICE"
+            service_enable && service_start
             ;;
         stop)
-            "$SYSTEMCTL_BIN" stop "$REALM_SERVICE"
+            service_stop
             ;;
         restart)
             service_has_rules || {
                 error "没有转发规则，拒绝重启空服务。"
                 return 1
             }
-            "$SYSTEMCTL_BIN" restart "$REALM_SERVICE"
+            service_restart
             ;;
         status)
-            "$SYSTEMCTL_BIN" --no-pager --full status "$REALM_SERVICE"
+            service_status
             ;;
         *)
             error "未知服务操作：${action}"
@@ -805,10 +929,11 @@ uninstall_realm() {
     local purge='n'
 
     require_root || return 1
+    init_service_runtime || return 1
     confirm "确认卸载 Realm2 程序和服务？[y/N]：" 'n' || return 0
-    "$SYSTEMCTL_BIN" disable --now "$REALM_SERVICE" >/dev/null 2>&1 || true
+    service_disable
     rm -f "$REALM_SERVICE_FILE" "$REALM_BIN" "${REALM_BIN}.previous" "$PF_COMMAND"
-    "$SYSTEMCTL_BIN" daemon-reload || true
+    service_daemon_reload || true
     read_input purge "同时删除配置和备份？[y/N]：" 'n' || true
     if [[ "$purge" =~ ^[Yy]$ ]]; then
         rm -f "$REALM_CONFIG"
@@ -827,7 +952,7 @@ show_menu() {
     while true; do
         [[ -t 1 ]] && clear
         version=$(installed_version 2>/dev/null || printf '未安装')
-        if "$SYSTEMCTL_BIN" is-active --quiet "$REALM_SERVICE" 2>/dev/null; then
+        if service_is_running; then
             status='运行中'
         elif [[ -f "$REALM_SERVICE_FILE" ]]; then
             status='已停止'
@@ -914,6 +1039,7 @@ main() {
     local command=${1:-menu}
     shift $(( $# > 0 ? 1 : 0 ))
     maybe_reexec_as_root "$command" "$@" || return 1
+    init_service_runtime || return 1
     case "$command" in
         menu) show_menu ;;
         install|core-update|update-core) install_latest ;;

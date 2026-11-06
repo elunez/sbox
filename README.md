@@ -112,7 +112,8 @@ sbox
 管理脚本版本从 `v1.0.1` 开始，按十进制三段递增，例如 `v1.0.9 → v1.1.0`、
 `v1.9.9 → v2.0.0`；Realm 核心版本独立采用官方 Release 版本号。
 
-独立脚本 [`realm.sh`](realm.sh) 用于安装和管理 Realm2 四层中转。脚本只从
+独立脚本 [`realm.sh`](realm.sh) 用于安装和管理 Realm2 四层中转，支持 systemd 与 Alpine
+OpenRC。脚本只从
 [`zhboner/realm` 官方 Releases](https://github.com/zhboner/realm/releases) 获取核心，根据
 `x86_64`、`aarch64`、`armv7` 等架构选择便携的 Linux musl 构建，并使用 GitHub Release
 API 提供的 SHA-256 校验下载内容。默认使用功能完整构建；如只需要精简 TCP/UDP 核心，可用
@@ -121,6 +122,15 @@ API 提供的 SHA-256 校验下载内容。默认使用功能完整构建；如�
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/elunez/sbox/main/realm.sh && chmod +x realm.sh && sudo ./realm.sh install
 ```
+
+Alpine Linux 以 root 用户执行：
+
+```bash
+apk add --no-cache bash curl ca-certificates tar python3 coreutils && curl -fsSLo realm.sh https://raw.githubusercontent.com/elunez/sbox/main/realm.sh && chmod +x realm.sh && bash realm.sh install && pf
+```
+
+不要再使用 `https://git.io/realm.sh`：该短链指向旧 EasyRealM 的 glibc ELF 程序，不是本仓库脚本，
+在 Alpine/musl 上会出现 `./realm.sh: not found`。
 
 安装成功后，脚本会注册 `/usr/local/bin/pf`，以后可直接执行：
 
@@ -140,11 +150,12 @@ pf restore                    # 恢复最近备份
 
 规则直接保存在 `/etc/realm2/config.json`，增删时使用同目录临时文件原子替换，并在修改前自动
 备份；服务启动失败会恢复修改前的配置。删除最后一条规则后会停止服务，不会生成空规则后进入
-反复重启。systemd 使用 `Restart=on-failure`，不再设置无条件重启或定时重启任务。全部交互输入
+反复重启。systemd 使用 `Restart=on-failure`，OpenRC 使用 `supervise-daemon` 限频拉起；两者都
+不设置定时重启任务。全部交互输入
 都在提示文字同一行完成。新脚本直接管理 JSON；升级后不要再混用旧 EasyRealM 菜单修改
 `rawconf`，否则旧脚本可能重新覆盖 `config.json`。
 
-隔离测试只操作临时目录，不安装核心、不访问网络，也不调用真实 systemd：
+隔离测试只操作临时目录，不安装核心、不访问网络，也不调用真实 systemd/OpenRC：
 
 ```bash
 python3 -m unittest discover -s tests -p 'test_realm.py' -v
