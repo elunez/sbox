@@ -31,8 +31,13 @@ def bash(code, env=None):
 
 
 class RealmScriptTests(unittest.TestCase):
-    def test_manager_version_is_1_0_4(self):
-        self.assertIn('SCRIPT_VERSION="1.0.4"', SOURCE)
+    def test_manager_version_is_1_0_5(self):
+        self.assertIn('SCRIPT_VERSION="1.0.5"', SOURCE)
+
+    def test_deployed_script_has_no_python_dependency(self):
+        self.assertNotIn("python3", SOURCE)
+        self.assertNotRegex(SOURCE, r"\bpython\b")
+        self.assertIn("jq", SOURCE)
 
     def test_bash_syntax(self):
         result = subprocess.run(["bash", "-n", str(SCRIPT)], text=True, capture_output=True)
@@ -74,7 +79,7 @@ class RealmScriptTests(unittest.TestCase):
     def test_manager_version_comparison_uses_numeric_parts(self):
         newer = bash("manager_version_is_newer 1.1.0 1.0.9")
         older = bash("manager_version_is_newer 1.0.9 1.1.0")
-        equal = bash("manager_version_is_newer 1.0.4 1.0.4")
+        equal = bash("manager_version_is_newer 1.0.5 1.0.5")
         self.assertEqual(newer.returncode, 0, newer.stderr)
         self.assertNotEqual(older.returncode, 0)
         self.assertNotEqual(equal.returncode, 0)
@@ -84,7 +89,7 @@ class RealmScriptTests(unittest.TestCase):
             remote = Path(directory) / "remote-realm.sh"
             target = Path(directory) / "bin" / "pf"
             remote.write_text(SOURCE.replace(
-                'SCRIPT_VERSION="1.0.4"', 'SCRIPT_VERSION="1.0.5"', 1
+                'SCRIPT_VERSION="1.0.5"', 'SCRIPT_VERSION="1.0.6"', 1
             ))
             code = r'''
 require_root() { return 0; }
@@ -106,8 +111,8 @@ update_manager_script
                 "SCRIPT_UPDATE_URL": "https://example.invalid/realm.sh",
             })
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("v1.0.4 -> v1.0.5", result.stdout)
-            self.assertIn('SCRIPT_VERSION="1.0.5"', target.read_text())
+            self.assertIn("v1.0.5 -> v1.0.6", result.stdout)
+            self.assertIn('SCRIPT_VERSION="1.0.6"', target.read_text())
             self.assertTrue(os.access(target, os.X_OK))
 
     def test_target_mapping_uses_portable_musl_assets(self):
@@ -273,7 +278,7 @@ update_manager_script
 
     def test_alpine_dependency_install_includes_bash_and_openrc(self):
         self.assertIn(
-            "apk add --no-cache bash curl ca-certificates tar python3 coreutils openrc",
+            "apk add --no-cache bash curl ca-certificates tar jq coreutils openrc",
             SOURCE,
         )
 

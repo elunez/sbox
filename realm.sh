@@ -7,7 +7,7 @@
 set -uo pipefail
 
 # 管理脚本版本按十进制三段递增：1.0.9 -> 1.1.0，1.9.9 -> 2.0.0。
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.0.5"
 REALM_REPOSITORY="${REALM_REPOSITORY:-zhboner/realm}"
 REALM_API_URL="${REALM_API_URL:-https://api.github.com/repos/${REALM_REPOSITORY}/releases/latest}"
 REALM_DIR="${REALM_DIR:-/etc/realm2}"
@@ -174,7 +174,7 @@ install_dependencies() {
     local missing=()
     local name
 
-    for name in curl tar python3; do
+    for name in curl tar jq; do
         command_exists "$name" || missing+=("$name")
     done
     if ! command_exists sha256sum && ! command_exists shasum; then
@@ -188,15 +188,15 @@ install_dependencies() {
     info "正在安装缺少的依赖：${missing[*]}"
     if command_exists apt-get; then
         apt-get update || return 1
-        DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates tar python3 coreutils
+        DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates tar jq coreutils
     elif command_exists dnf; then
-        dnf install -y curl ca-certificates tar python3 coreutils
+        dnf install -y curl ca-certificates tar jq coreutils
     elif command_exists yum; then
-        yum install -y curl ca-certificates tar python3 coreutils
+        yum install -y curl ca-certificates tar jq coreutils
     elif command_exists apk; then
-        apk add --no-cache bash curl ca-certificates tar python3 coreutils openrc
+        apk add --no-cache bash curl ca-certificates tar jq coreutils openrc
     else
-        error "无法识别包管理器，请手动安装 curl、tar、python3 和 sha256sum。"
+        error "无法识别包管理器，请手动安装 curl、tar、jq 和 sha256sum。"
         return 1
     fi
 }
@@ -239,35 +239,35 @@ release_asset_name() {
 select_release_info() {
     local metadata_file=$1
     local asset_name=$2
+    local tag asset_json download_url digest
 
-    python3 - "$metadata_file" "$asset_name" <<'PY'
-import json
-import re
-import sys
-
-metadata_file, asset_name = sys.argv[1:]
-with open(metadata_file, encoding="utf-8") as stream:
-    release = json.load(stream)
-
-tag = release.get("tag_name", "")
-if not re.fullmatch(r"v[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]+)?", tag):
-    raise SystemExit("GitHub API 返回了无效版本号")
-
-for asset in release.get("assets", []):
-    if asset.get("name") != asset_name:
-        continue
-    url = asset.get("browser_download_url", "")
-    digest = asset.get("digest", "")
-    expected_prefix = "https://github.com/zhboner/realm/releases/download/"
-    if not url.startswith(expected_prefix):
-        raise SystemExit("下载地址不是 zhboner/realm 官方 Release")
-    if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
-        raise SystemExit("官方 Release 未提供有效 SHA-256")
-    print("|".join((tag, url, digest.split(":", 1)[1].lower())))
-    break
-else:
-    raise SystemExit(f"最新 Release 中没有资产：{asset_name}")
-PY
+    tag=$(jq -er '
+        .tag_name
+        | select(type == "string")
+        | select(test("^v[0-9]+(\\.[0-9]+){1,3}([-+][0-9A-Za-z.-]+)?$"))
+    ' "$metadata_file") || {
+        error "GitHub API 返回了无效版本号。"
+        return 1
+    }
+    asset_json=$(jq -ec --arg asset_name "$asset_name" '
+        (.assets // [] | map(select(.name == $asset_name)) | first)
+        | select(. != null)
+    ' "$metadata_file") || {
+        error "最新 Release 中没有资产：${asset_name}"
+        return 1
+    }
+    download_url=$(jq -er '.browser_download_url | select(type == "string")' <<<"$asset_json") || return 1
+    digest=$(jq -er '.digest | select(type == "string")' <<<"$asset_json") || return 1
+    [[ "$download_url" == https://github.com/zhboner/realm/releases/download/* ]] || {
+        error "下载地址不是 zhboner/realm 官方 Release。"
+        return 1
+    }
+    [[ "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]] || {
+        error "官方 Release 未提供有效 SHA-256。"
+        return 1
+    }
+    digest=$(printf '%s' "${digest#sha256:}" | tr 'A-F' 'a-f')
+    printf '%s|%s|%s\n' "$tag" "$download_url" "$digest"
 }
 
 sha256_file() {
@@ -290,19 +290,18 @@ installed_version() {
 manager_version_is_newer() {
     local candidate=$1
     local current=$2
+    local candidate_major candidate_minor candidate_patch
+    local current_major current_minor current_patch
 
-    python3 - "$candidate" "$current" <<'PY'
-import re
-import sys
-
-candidate, current = sys.argv[1:]
-pattern = re.compile(r"^[0-9]+(?:\.[0-9]+){2}$")
-if not pattern.fullmatch(candidate) or not pattern.fullmatch(current):
-    raise SystemExit(2)
-candidate_parts = tuple(map(int, candidate.split(".")))
-current_parts = tuple(map(int, current.split(".")))
-raise SystemExit(0 if candidate_parts > current_parts else 1)
-PY
+    [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 2
+    [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 2
+    IFS='.' read -r candidate_major candidate_minor candidate_patch <<<"$candidate"
+    IFS='.' read -r current_major current_minor current_patch <<<"$current"
+    ((10#$candidate_major > 10#$current_major)) && return 0
+    ((10#$candidate_major < 10#$current_major)) && return 1
+    ((10#$candidate_minor > 10#$current_minor)) && return 0
+    ((10#$candidate_minor < 10#$current_minor)) && return 1
+    ((10#$candidate_patch > 10#$current_patch))
 }
 
 install_manager_command() {
@@ -331,7 +330,7 @@ update_manager_script() {
 
     require_root || return 1
     command_exists curl || install_dependencies || return 1
-    command_exists python3 || install_dependencies || return 1
+    command_exists jq || install_dependencies || return 1
     temp_file=$(mktemp) || return 1
 
     info "正在检查管理脚本更新..."
@@ -371,111 +370,146 @@ update_manager_script() {
     info "管理脚本已升级：v${SCRIPT_VERSION} -> v${remote_version}。"
 }
 
+config_validate() {
+    [[ -f "$REALM_CONFIG" ]] || return 1
+    jq -e '
+        type == "object"
+        and ((.endpoints // []) | type == "array")
+        and all((.endpoints // [])[];
+            type == "object"
+            and (.listen | type == "string")
+            and (.remote | type == "string")
+        )
+    ' "$REALM_CONFIG" >/dev/null
+}
+
+config_atomic_update() {
+    local filter=$1
+    shift
+    local directory temp_file
+
+    directory=$(dirname "$REALM_CONFIG")
+    mkdir -p "$directory" || return 1
+    temp_file=$(mktemp "${directory}/.config.XXXXXX") || return 1
+    if ! jq "$@" "$filter" "$REALM_CONFIG" >"$temp_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+    if ! chmod 644 "$temp_file" || ! mv -f "$temp_file" "$REALM_CONFIG"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+}
+
 config_action() {
     local action=$1
     shift
+    local directory temp_file count index removed listen remote
 
-    command_exists python3 || {
-        error "缺少 python3，请先执行安装/更新。"
+    command_exists jq || {
+        error "缺少 jq，请先执行安装/更新。"
         return 1
     }
 
-    python3 - "$REALM_CONFIG" "$action" "$@" <<'PY'
-import json
-import os
-import re
-import sys
-import tempfile
+    if [[ ! -f "$REALM_CONFIG" ]]; then
+        case "$action" in
+            init)
+                directory=$(dirname "$REALM_CONFIG")
+                mkdir -p "$directory" || return 1
+                temp_file=$(mktemp "${directory}/.config.XXXXXX") || return 1
+                cat >"$temp_file" <<'JSON'
+{
+  "log": {
+    "level": "warn",
+    "output": "stdout"
+  },
+  "dns": {
+    "mode": "ipv4_and_ipv6",
+    "protocol": "tcp_and_udp",
+    "min_ttl": 0,
+    "max_ttl": 60,
+    "cache_size": 32
+  },
+  "network": {
+    "use_udp": true,
+    "tcp_timeout": 300,
+    "udp_timeout": 30
+  },
+  "endpoints": []
+}
+JSON
+                if ! jq -e . "$temp_file" >/dev/null || \
+                    ! chmod 644 "$temp_file" || ! mv -f "$temp_file" "$REALM_CONFIG"; then
+                    rm -f "$temp_file"
+                    return 1
+                fi
+                return 0
+                ;;
+            validate|count)
+                printf '0\n'
+                return 0
+                ;;
+            list)
+                return 0
+                ;;
+            *)
+                error "配置文件不存在：${REALM_CONFIG}"
+                return 1
+                ;;
+        esac
+    fi
 
-path, action, *args = sys.argv[1:]
+    if ! config_validate; then
+        error "Realm2 配置不是有效的 JSON，或 endpoints 结构无效。"
+        return 1
+    fi
 
-
-def default_config():
-    return {
-        "log": {"level": "warn", "output": "stdout"},
-        "dns": {
-            "mode": "ipv4_and_ipv6",
-            "protocol": "tcp_and_udp",
-            "min_ttl": 0,
-            "max_ttl": 60,
-            "cache_size": 32,
-        },
-        "network": {
-            "use_udp": True,
-            "tcp_timeout": 300,
-            "udp_timeout": 30,
-        },
-        "endpoints": [],
-    }
-
-
-def load():
-    if not os.path.exists(path):
-        return default_config()
-    with open(path, encoding="utf-8") as stream:
-        data = json.load(stream)
-    if not isinstance(data, dict):
-        raise SystemExit("配置根节点必须是 JSON 对象")
-    endpoints = data.setdefault("endpoints", [])
-    if not isinstance(endpoints, list):
-        raise SystemExit("endpoints 必须是数组")
-    for index, endpoint in enumerate(endpoints, 1):
-        if not isinstance(endpoint, dict):
-            raise SystemExit(f"第 {index} 条 endpoint 不是对象")
-        if not isinstance(endpoint.get("listen"), str) or not isinstance(endpoint.get("remote"), str):
-            raise SystemExit(f"第 {index} 条 endpoint 缺少 listen 或 remote")
-    return data
-
-
-def atomic_write(data):
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, mode=0o755, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix=".config.", suffix=".tmp", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-            json.dump(data, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temp_path, 0o644)
-        os.replace(temp_path, path)
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-
-
-data = load()
-endpoints = data["endpoints"]
-
-if action == "init":
-    if not os.path.exists(path):
-        atomic_write(data)
-elif action == "validate":
-    print(len(endpoints))
-elif action == "count":
-    print(len(endpoints))
-elif action == "list":
-    for index, endpoint in enumerate(endpoints, 1):
-        print(f"{index}\t{endpoint['listen']}\t{endpoint['remote']}")
-elif action == "add":
-    listen, remote = args
-    if any(item.get("listen") == listen for item in endpoints):
-        raise SystemExit(f"监听地址已存在：{listen}")
-    endpoints.append({"listen": listen, "remote": remote})
-    atomic_write(data)
-    print(len(endpoints))
-elif action == "delete":
-    if not args or not re.fullmatch(r"[1-9][0-9]*", args[0]):
-        raise SystemExit("规则编号无效")
-    index = int(args[0])
-    if index > len(endpoints):
-        raise SystemExit("规则编号超出范围")
-    removed = endpoints.pop(index - 1)
-    atomic_write(data)
-    print(f"{removed['listen']} -> {removed['remote']}")
-else:
-    raise SystemExit(f"未知配置操作：{action}")
-PY
+    case "$action" in
+        init)
+            ;;
+        validate|count)
+            jq -r '(.endpoints // []) | length' "$REALM_CONFIG"
+            ;;
+        list)
+            jq -r '(.endpoints // []) | to_entries[] | [(.key + 1), .value.listen, .value.remote] | @tsv' "$REALM_CONFIG"
+            ;;
+        add)
+            listen=${1-}
+            remote=${2-}
+            [[ -n "$listen" && -n "$remote" ]] || {
+                error "添加规则缺少监听地址或落地地址。"
+                return 1
+            }
+            if jq -e --arg listen "$listen" 'any((.endpoints // [])[]; .listen == $listen)' "$REALM_CONFIG" >/dev/null; then
+                error "监听地址已存在：${listen}"
+                return 1
+            fi
+            config_atomic_update \
+                '(.endpoints //= []) | .endpoints += [{"listen": $listen, "remote": $remote}]' \
+                --arg listen "$listen" --arg remote "$remote" || return 1
+            jq -r '.endpoints | length' "$REALM_CONFIG"
+            ;;
+        delete)
+            index=${1-}
+            [[ "$index" =~ ^[1-9][0-9]*$ ]] || {
+                error "规则编号无效。"
+                return 1
+            }
+            count=$(jq -r '(.endpoints // []) | length' "$REALM_CONFIG") || return 1
+            ((10#$index <= count)) || {
+                error "规则编号超出范围。"
+                return 1
+            }
+            removed=$(jq -r --argjson index "$((10#$index - 1))" \
+                '.endpoints[$index] | "\(.listen) -> \(.remote)"' "$REALM_CONFIG") || return 1
+            config_atomic_update 'del(.endpoints[$index])' --argjson index "$((10#$index - 1))" || return 1
+            printf '%s\n' "$removed"
+            ;;
+        *)
+            error "未知配置操作：${action}"
+            return 1
+            ;;
+    esac
 }
 
 config_count() {

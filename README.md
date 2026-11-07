@@ -126,7 +126,7 @@ curl -fsSLO https://raw.githubusercontent.com/elunez/sbox/main/realm.sh && chmod
 Alpine Linux 以 root 用户执行：
 
 ```bash
-apk add --no-cache bash curl ca-certificates tar python3 coreutils && curl -fsSLo realm.sh https://raw.githubusercontent.com/elunez/sbox/main/realm.sh && chmod +x realm.sh && bash realm.sh install && pf
+apk add --no-cache bash curl ca-certificates tar jq coreutils openrc && curl -fsSLo realm.sh https://raw.githubusercontent.com/elunez/sbox/main/realm.sh && chmod +x realm.sh && bash realm.sh install && pf
 ```
 
 不要再使用 `https://git.io/realm.sh`：该短链指向旧 EasyRealM 的 glibc ELF 程序，不是本仓库脚本，
@@ -154,6 +154,8 @@ pf restore                    # 恢复最近备份
 不设置定时重启任务。全部交互输入
 都在提示文字同一行完成。新脚本直接管理 JSON；升级后不要再混用旧 EasyRealM 菜单修改
 `rawconf`，否则旧脚本可能重新覆盖 `config.json`。
+
+VPS 端不依赖 Python；JSON 配置与 GitHub Release 元数据统一使用 `jq` 处理，版本比较使用纯 Bash。
 
 隔离测试只操作临时目录，不安装核心、不访问网络，也不调用真实 systemd/OpenRC：
 
