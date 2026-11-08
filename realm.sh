@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
 
-# Realm2 管理脚本
+# Realm2 极简安装脚本
 # 作者：elunez（https://github.com/elunez）
-# 仅从 zhboner/realm 官方 GitHub Releases 获取二进制。
+# Realm 核心仅从 zhboner/realm 官方 Releases 获取。
 
 set -uo pipefail
 
-# 管理脚本版本按十进制三段递增：1.0.9 -> 1.1.0，1.9.9 -> 2.0.0。
-SCRIPT_VERSION="1.0.5"
-REALM_REPOSITORY="${REALM_REPOSITORY:-zhboner/realm}"
-REALM_API_URL="${REALM_API_URL:-https://api.github.com/repos/${REALM_REPOSITORY}/releases/latest}"
+SCRIPT_VERSION="1.0.6"
+REALM_VERSION="v2.9.6"
 REALM_DIR="${REALM_DIR:-/etc/realm2}"
 REALM_BIN="${REALM_BIN:-${REALM_DIR}/realm2}"
-REALM_CONFIG="${REALM_CONFIG:-${REALM_DIR}/config.json}"
-REALM_BACKUP_DIR="${REALM_BACKUP_DIR:-${REALM_DIR}/backups}"
+REALM_CONFIG_DIR="${REALM_CONFIG_DIR:-${REALM_DIR}/config}"
+REALM_RULE_DIR="${REALM_RULE_DIR:-${REALM_CONFIG_DIR}/rules}"
+REALM_LEGACY_CONFIG="${REALM_LEGACY_CONFIG:-${REALM_DIR}/config.json}"
 REALM_SERVICE_NAME="${REALM_SERVICE_NAME:-realm2}"
 REALM_SERVICE="${REALM_SERVICE:-${REALM_SERVICE_NAME}.service}"
 REALM_SERVICE_FILE="${REALM_SERVICE_FILE:-}"
@@ -21,22 +20,17 @@ SYSTEMCTL_BIN="${SYSTEMCTL_BIN:-systemctl}"
 RC_SERVICE_BIN="${RC_SERVICE_BIN:-rc-service}"
 RC_UPDATE_BIN="${RC_UPDATE_BIN:-rc-update}"
 INIT_SYSTEM="${INIT_SYSTEM:-}"
-REALM_BUILD="${REALM_BUILD:-full}"
-PF_COMMAND="${PF_COMMAND:-/usr/local/bin/pf}"
-SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/elunez/sbox/main/realm.sh}"
-SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+OLD_PF_COMMAND="${OLD_PF_COMMAND:-/usr/local/bin/pf}"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     C_GREEN='\033[32m'
     C_RED='\033[31m'
     C_YELLOW='\033[33m'
-    C_CYAN='\033[36m'
     C_RESET='\033[0m'
 else
     C_GREEN=''
     C_RED=''
     C_YELLOW=''
-    C_CYAN=''
     C_RESET=''
 fi
 
@@ -44,15 +38,60 @@ info() { printf '%b\n' "${C_GREEN}[信息]${C_RESET} $*"; }
 warn() { printf '%b\n' "${C_YELLOW}[注意]${C_RESET} $*"; }
 error() { printf '%b\n' "${C_RED}[错误]${C_RESET} $*" >&2; }
 
-require_root() {
-    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-        error "此操作需要 root 权限，请使用 sudo 运行。"
-        return 1
-    fi
-}
-
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+require_root() {
+    [[ ${EUID:-$(id -u)} -eq 0 ]] && return 0
+    if command_exists sudo; then
+        exec sudo bash "$0" "$@"
+    fi
+    error "请使用 root 权限运行。"
+    return 1
+}
+
+read_input() {
+    local variable_name=$1
+    local prompt_text=$2
+    local default_value=${3-}
+    local input_value=''
+    IFS= read -r -p "$prompt_text" input_value || return 1
+    [[ -n "$input_value" ]] || input_value=$default_value
+    printf -v "$variable_name" '%s' "$input_value"
+}
+
+confirm() {
+    local answer=''
+    read_input answer "$1" "${2:-n}" || return 1
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+install_dependencies() {
+    local missing=()
+    local name
+    for name in curl tar timeout sha256sum install; do
+        command_exists "$name" || missing+=("$name")
+    done
+    if command_exists apk && { ! command_exists "$RC_SERVICE_BIN" || ! command_exists "$RC_UPDATE_BIN"; }; then
+        missing+=("openrc")
+    fi
+    ((${#missing[@]} == 0)) && return 0
+
+    info "正在安装缺少的依赖：${missing[*]}"
+    if command_exists apt-get; then
+        apt-get update || return 1
+        DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates tar coreutils
+    elif command_exists dnf; then
+        dnf install -y curl ca-certificates tar coreutils
+    elif command_exists yum; then
+        yum install -y curl ca-certificates tar coreutils
+    elif command_exists apk; then
+        apk add --no-cache bash curl ca-certificates tar coreutils openrc
+    else
+        error "无法识别包管理器，请手动安装 curl、tar 和 sha256sum。"
+        return 1
+    fi
 }
 
 init_service_runtime() {
@@ -83,16 +122,20 @@ init_service_runtime() {
     esac
 }
 
-service_daemon_reload() {
-    [[ "$INIT_SYSTEM" == 'systemd' ]] || return 0
-    "$SYSTEMCTL_BIN" daemon-reload
-}
-
 service_enable() {
     if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
         "$SYSTEMCTL_BIN" enable "$REALM_SERVICE" >/dev/null
     else
         "$RC_UPDATE_BIN" add "$REALM_SERVICE_NAME" default >/dev/null
+    fi
+}
+
+service_disable() {
+    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
+        "$SYSTEMCTL_BIN" disable --now "$REALM_SERVICE" >/dev/null 2>&1 || true
+    else
+        "$RC_SERVICE_BIN" "$REALM_SERVICE_NAME" stop >/dev/null 2>&1 || true
+        "$RC_UPDATE_BIN" del "$REALM_SERVICE_NAME" default >/dev/null 2>&1 || true
     fi
 }
 
@@ -112,14 +155,6 @@ service_start() {
     fi
 }
 
-service_stop() {
-    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
-        "$SYSTEMCTL_BIN" stop "$REALM_SERVICE"
-    else
-        "$RC_SERVICE_BIN" "$REALM_SERVICE_NAME" stop
-    fi
-}
-
 service_restart() {
     if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
         "$SYSTEMCTL_BIN" restart "$REALM_SERVICE"
@@ -136,147 +171,31 @@ service_status() {
     fi
 }
 
-service_disable() {
-    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
-        "$SYSTEMCTL_BIN" disable --now "$REALM_SERVICE" >/dev/null 2>&1 || true
-    else
-        "$RC_SERVICE_BIN" "$REALM_SERVICE_NAME" stop >/dev/null 2>&1 || true
-        "$RC_UPDATE_BIN" del "$REALM_SERVICE_NAME" default >/dev/null 2>&1 || true
-    fi
-}
-
-read_input() {
-    local variable_name=$1
-    local prompt_text=$2
-    local default_value=${3-}
-    local input_value=''
-
-    IFS= read -r -p "$prompt_text" input_value || return 1
-    [[ -n "$input_value" ]] || input_value=$default_value
-    printf -v "$variable_name" '%s' "$input_value"
-}
-
-confirm() {
-    local prompt_text=$1
-    local default_value=${2:-n}
-    local answer=''
-
-    read_input answer "$prompt_text" "$default_value" || return 1
-    [[ "$answer" =~ ^[Yy]$ ]]
-}
-
-pause_menu() {
-    local unused=''
-    IFS= read -r -p "按回车键继续..." unused || true
-}
-
-install_dependencies() {
-    local missing=()
-    local name
-
-    for name in curl tar jq; do
-        command_exists "$name" || missing+=("$name")
-    done
-    if ! command_exists sha256sum && ! command_exists shasum; then
-        missing+=("sha256sum")
-    fi
-    if command_exists apk && { ! command_exists "$RC_SERVICE_BIN" || ! command_exists "$RC_UPDATE_BIN"; }; then
-        missing+=("openrc")
-    fi
-    ((${#missing[@]} == 0)) && return 0
-
-    info "正在安装缺少的依赖：${missing[*]}"
-    if command_exists apt-get; then
-        apt-get update || return 1
-        DEBIAN_FRONTEND=noninteractive apt-get install -y curl ca-certificates tar jq coreutils
-    elif command_exists dnf; then
-        dnf install -y curl ca-certificates tar jq coreutils
-    elif command_exists yum; then
-        yum install -y curl ca-certificates tar jq coreutils
-    elif command_exists apk; then
-        apk add --no-cache bash curl ca-certificates tar jq coreutils openrc
-    else
-        error "无法识别包管理器，请手动安装 curl、tar、jq 和 sha256sum。"
-        return 1
-    fi
-}
-
-detect_target() {
+detect_release_asset() {
     local machine=${REALM_MACHINE_OVERRIDE:-$(uname -m)}
-
     case "$machine" in
         x86_64|amd64)
-            printf '%s\n' 'x86_64-unknown-linux-musl'
+            REALM_ASSET='realm-x86_64-unknown-linux-musl.tar.gz'
+            REALM_SHA256='b1cc335547bea8bb2a88178bef12ec7f2363e36200e7ea1d4e1e67627929bf65'
             ;;
         aarch64|arm64)
-            printf '%s\n' 'aarch64-unknown-linux-musl'
+            REALM_ASSET='realm-aarch64-unknown-linux-musl.tar.gz'
+            REALM_SHA256='f4c0318dd86854da483dcb7645b4f39cae2cc3f91c688fef969d53220b949488'
             ;;
         armv7l|armv7)
-            printf '%s\n' 'armv7-unknown-linux-musleabihf'
+            REALM_ASSET='realm-armv7-unknown-linux-musleabihf.tar.gz'
+            REALM_SHA256='ceedaf367c78f911eac227b2b88b3132f964d05a8b71f7a6a7e429dc78ec1862'
             ;;
         armv6l|arm)
-            printf '%s\n' 'arm-unknown-linux-musleabihf'
+            REALM_ASSET='realm-arm-unknown-linux-musleabihf.tar.gz'
+            REALM_SHA256='2e83ca031a96aa171df45f9d929807cd8d2671384698ae2ab54a62d6c347c48c'
             ;;
         *)
             error "暂不支持当前架构：${machine}"
             return 1
             ;;
     esac
-}
-
-release_asset_name() {
-    local target=$1
-    case "$REALM_BUILD" in
-        slim) printf 'realm-slim-%s.tar.gz\n' "$target" ;;
-        full) printf 'realm-%s.tar.gz\n' "$target" ;;
-        *)
-            error "REALM_BUILD 仅支持 full 或 slim：${REALM_BUILD}"
-            return 1
-            ;;
-    esac
-}
-
-select_release_info() {
-    local metadata_file=$1
-    local asset_name=$2
-    local tag asset_json download_url digest
-
-    tag=$(jq -er '
-        .tag_name
-        | select(type == "string")
-        | select(test("^v[0-9]+(\\.[0-9]+){1,3}([-+][0-9A-Za-z.-]+)?$"))
-    ' "$metadata_file") || {
-        error "GitHub API 返回了无效版本号。"
-        return 1
-    }
-    asset_json=$(jq -ec --arg asset_name "$asset_name" '
-        (.assets // [] | map(select(.name == $asset_name)) | first)
-        | select(. != null)
-    ' "$metadata_file") || {
-        error "最新 Release 中没有资产：${asset_name}"
-        return 1
-    }
-    download_url=$(jq -er '.browser_download_url | select(type == "string")' <<<"$asset_json") || return 1
-    digest=$(jq -er '.digest | select(type == "string")' <<<"$asset_json") || return 1
-    [[ "$download_url" == https://github.com/zhboner/realm/releases/download/* ]] || {
-        error "下载地址不是 zhboner/realm 官方 Release。"
-        return 1
-    }
-    [[ "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]] || {
-        error "官方 Release 未提供有效 SHA-256。"
-        return 1
-    }
-    digest=$(printf '%s' "${digest#sha256:}" | tr 'A-F' 'a-f')
-    printf '%s|%s|%s\n' "$tag" "$download_url" "$digest"
-}
-
-sha256_file() {
-    local file=$1
-    if command_exists sha256sum; then
-        sha256sum "$file" | awk '{print $1}'
-    else
-        shasum -a 256 "$file" | awk '{print $1}'
-    fi
+    REALM_DOWNLOAD_URL="https://github.com/zhboner/realm/releases/download/${REALM_VERSION}/${REALM_ASSET}"
 }
 
 installed_version() {
@@ -287,494 +206,77 @@ installed_version() {
     printf '%s\n' "$version"
 }
 
-manager_version_is_newer() {
+version_is_newer() {
     local candidate=$1
-    local current=$2
+    local baseline=$2
     local candidate_major candidate_minor candidate_patch
-    local current_major current_minor current_patch
+    local baseline_major baseline_minor baseline_patch
 
-    [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 2
-    [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 2
+    [[ "$candidate" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    [[ "$baseline" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
     IFS='.' read -r candidate_major candidate_minor candidate_patch <<<"$candidate"
-    IFS='.' read -r current_major current_minor current_patch <<<"$current"
-    ((10#$candidate_major > 10#$current_major)) && return 0
-    ((10#$candidate_major < 10#$current_major)) && return 1
-    ((10#$candidate_minor > 10#$current_minor)) && return 0
-    ((10#$candidate_minor < 10#$current_minor)) && return 1
-    ((10#$candidate_patch > 10#$current_patch))
+    IFS='.' read -r baseline_major baseline_minor baseline_patch <<<"$baseline"
+    ((10#$candidate_major > 10#$baseline_major)) && return 0
+    ((10#$candidate_major < 10#$baseline_major)) && return 1
+    ((10#$candidate_minor > 10#$baseline_minor)) && return 0
+    ((10#$candidate_minor < 10#$baseline_minor)) && return 1
+    ((10#$candidate_patch > 10#$baseline_patch))
 }
 
-install_manager_command() {
-    local source_file=${1:-$SCRIPT_SOURCE}
-    local target_dir temp_target
-
-    [[ -r "$source_file" ]] || {
-        error "无法读取管理脚本：${source_file}"
-        return 1
-    }
-    target_dir=$(dirname "$PF_COMMAND")
-    mkdir -p "$target_dir" || return 1
-    temp_target="${PF_COMMAND}.new.$$"
-    if ! install -m 755 "$source_file" "$temp_target"; then
-        rm -f "$temp_target"
-        return 1
-    fi
-    if ! bash -n "$temp_target" || ! mv -f "$temp_target" "$PF_COMMAND"; then
-        rm -f "$temp_target"
-        return 1
-    fi
-}
-
-update_manager_script() {
-    local temp_file remote_version
-
-    require_root || return 1
-    command_exists curl || install_dependencies || return 1
-    command_exists jq || install_dependencies || return 1
-    temp_file=$(mktemp) || return 1
-
-    info "正在检查管理脚本更新..."
-    if ! curl -fL --retry 3 --connect-timeout 15 --max-time 600 \
-        --speed-limit 1024 --speed-time 30 -o "$temp_file" "$SCRIPT_UPDATE_URL"; then
-        error "管理脚本下载失败。"
-        rm -f "$temp_file"
-        return 1
-    fi
-    if ! grep -q '^# Realm2 管理脚本$' "$temp_file" || ! bash -n "$temp_file"; then
-        error "下载内容不是有效的 Realm2 管理脚本。"
-        rm -f "$temp_file"
-        return 1
-    fi
-    remote_version=$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"$/\1/p' "$temp_file" | head -n 1)
-    if [[ -z "$remote_version" ]]; then
-        error "无法识别远端脚本版本。"
-        rm -f "$temp_file"
-        return 1
-    fi
-    if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
-        rm -f "$temp_file"
-        info "管理脚本已经是最新版本 v${SCRIPT_VERSION}。"
-        return 0
-    fi
-    if ! manager_version_is_newer "$remote_version" "$SCRIPT_VERSION"; then
-        error "远端版本 v${remote_version} 不高于当前版本 v${SCRIPT_VERSION}，已拒绝降级。"
-        rm -f "$temp_file"
-        return 1
-    fi
-    if ! install_manager_command "$temp_file"; then
-        error "管理脚本替换失败。"
-        rm -f "$temp_file"
-        return 1
-    fi
-    rm -f "$temp_file"
-    info "管理脚本已升级：v${SCRIPT_VERSION} -> v${remote_version}。"
-}
-
-config_validate() {
-    [[ -f "$REALM_CONFIG" ]] || return 1
-    jq -e '
-        type == "object"
-        and ((.endpoints // []) | type == "array")
-        and all((.endpoints // [])[];
-            type == "object"
-            and (.listen | type == "string")
-            and (.remote | type == "string")
-        )
-    ' "$REALM_CONFIG" >/dev/null
-}
-
-config_atomic_update() {
-    local filter=$1
-    shift
-    local directory temp_file
-
-    directory=$(dirname "$REALM_CONFIG")
-    mkdir -p "$directory" || return 1
-    temp_file=$(mktemp "${directory}/.config.XXXXXX") || return 1
-    if ! jq "$@" "$filter" "$REALM_CONFIG" >"$temp_file"; then
-        rm -f "$temp_file"
-        return 1
-    fi
-    if ! chmod 644 "$temp_file" || ! mv -f "$temp_file" "$REALM_CONFIG"; then
-        rm -f "$temp_file"
-        return 1
-    fi
-}
-
-config_action() {
-    local action=$1
-    shift
-    local directory temp_file count index removed listen remote
-
-    command_exists jq || {
-        error "缺少 jq，请先执行安装/更新。"
-        return 1
-    }
-
-    if [[ ! -f "$REALM_CONFIG" ]]; then
-        case "$action" in
-            init)
-                directory=$(dirname "$REALM_CONFIG")
-                mkdir -p "$directory" || return 1
-                temp_file=$(mktemp "${directory}/.config.XXXXXX") || return 1
-                cat >"$temp_file" <<'JSON'
-{
-  "log": {
-    "level": "warn",
-    "output": "stdout"
-  },
-  "dns": {
-    "mode": "ipv4_and_ipv6",
-    "protocol": "tcp_and_udp",
-    "min_ttl": 0,
-    "max_ttl": 60,
-    "cache_size": 32
-  },
-  "network": {
-    "use_udp": true,
-    "tcp_timeout": 300,
-    "udp_timeout": 30
-  },
-  "endpoints": []
-}
-JSON
-                if ! jq -e . "$temp_file" >/dev/null || \
-                    ! chmod 644 "$temp_file" || ! mv -f "$temp_file" "$REALM_CONFIG"; then
-                    rm -f "$temp_file"
-                    return 1
-                fi
-                return 0
-                ;;
-            validate|count)
-                printf '0\n'
-                return 0
-                ;;
-            list)
-                return 0
-                ;;
-            *)
-                error "配置文件不存在：${REALM_CONFIG}"
-                return 1
-                ;;
-        esac
-    fi
-
-    if ! config_validate; then
-        error "Realm2 配置不是有效的 JSON，或 endpoints 结构无效。"
-        return 1
-    fi
-
-    case "$action" in
-        init)
-            ;;
-        validate|count)
-            jq -r '(.endpoints // []) | length' "$REALM_CONFIG"
-            ;;
-        list)
-            jq -r '(.endpoints // []) | to_entries[] | [(.key + 1), .value.listen, .value.remote] | @tsv' "$REALM_CONFIG"
-            ;;
-        add)
-            listen=${1-}
-            remote=${2-}
-            [[ -n "$listen" && -n "$remote" ]] || {
-                error "添加规则缺少监听地址或落地地址。"
-                return 1
-            }
-            if jq -e --arg listen "$listen" 'any((.endpoints // [])[]; .listen == $listen)' "$REALM_CONFIG" >/dev/null; then
-                error "监听地址已存在：${listen}"
-                return 1
-            fi
-            config_atomic_update \
-                '(.endpoints //= []) | .endpoints += [{"listen": $listen, "remote": $remote}]' \
-                --arg listen "$listen" --arg remote "$remote" || return 1
-            jq -r '.endpoints | length' "$REALM_CONFIG"
-            ;;
-        delete)
-            index=${1-}
-            [[ "$index" =~ ^[1-9][0-9]*$ ]] || {
-                error "规则编号无效。"
-                return 1
-            }
-            count=$(jq -r '(.endpoints // []) | length' "$REALM_CONFIG") || return 1
-            ((10#$index <= count)) || {
-                error "规则编号超出范围。"
-                return 1
-            }
-            removed=$(jq -r --argjson index "$((10#$index - 1))" \
-                '.endpoints[$index] | "\(.listen) -> \(.remote)"' "$REALM_CONFIG") || return 1
-            config_atomic_update 'del(.endpoints[$index])' --argjson index "$((10#$index - 1))" || return 1
-            printf '%s\n' "$removed"
-            ;;
-        *)
-            error "未知配置操作：${action}"
-            return 1
-            ;;
-    esac
-}
-
-config_count() {
-    config_action count
-}
-
-create_default_config() {
-    mkdir -p "$REALM_DIR"
-    chmod 755 "$REALM_DIR"
-    config_action init
-    config_action validate >/dev/null
-}
-
-create_config_backup() {
-    local reason=${1:-manual}
-    local timestamp
-
-    [[ -f "$REALM_CONFIG" ]] || {
-        error "配置文件不存在：${REALM_CONFIG}"
-        return 1
-    }
-    timestamp=$(date '+%Y%m%d-%H%M%S')
-    mkdir -p "$REALM_BACKUP_DIR"
-    LAST_CONFIG_BACKUP="${REALM_BACKUP_DIR}/config-${timestamp}-${reason}-$$.json"
-    cp -p "$REALM_CONFIG" "$LAST_CONFIG_BACKUP"
-    info "配置已备份：${LAST_CONFIG_BACKUP}"
-}
-
-write_service_unit() {
-    local temp_file
-    init_service_runtime || return 1
-    temp_file=$(mktemp) || return 1
-    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
-        cat >"$temp_file" <<EOF
-[Unit]
-Description=Realm2 relay service
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${REALM_BIN} -c ${REALM_CONFIG}
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
+active_config_path() {
+    if [[ -s "$REALM_LEGACY_CONFIG" ]]; then
+        printf '%s\n' "$REALM_LEGACY_CONFIG"
     else
-        cat >"$temp_file" <<EOF
-#!/sbin/openrc-run
-name="Realm2"
-description="Realm2 relay service"
-command="${REALM_BIN}"
-command_args="-c ${REALM_CONFIG}"
-supervisor="supervise-daemon"
-respawn_delay=3
-respawn_max=5
-respawn_period=60
-output_log="/var/log/realm2.log"
-error_log="/var/log/realm2.log"
-
-depend() {
-    need net
-    after firewall
-}
-EOF
-    fi
-    local service_mode='644'
-    [[ "$INIT_SYSTEM" == 'openrc' ]] && service_mode='755'
-    if ! install -m "$service_mode" "$temp_file" "${REALM_SERVICE_FILE}.new"; then
-        rm -f "$temp_file" "${REALM_SERVICE_FILE}.new"
-        return 1
-    fi
-    if ! mv -f "${REALM_SERVICE_FILE}.new" "$REALM_SERVICE_FILE"; then
-        rm -f "$temp_file" "${REALM_SERVICE_FILE}.new"
-        return 1
-    fi
-    rm -f "$temp_file"
-}
-
-rollback_install_files() {
-    local old_binary=$1
-    local old_service=$2
-
-    if [[ -n "$old_binary" && -f "$old_binary" ]]; then
-        cp -p "$old_binary" "$REALM_BIN"
-    else
-        rm -f "$REALM_BIN"
-    fi
-    if [[ -n "$old_service" && -f "$old_service" ]]; then
-        cp -p "$old_service" "$REALM_SERVICE_FILE"
-    else
-        service_disable
-        rm -f "$REALM_SERVICE_FILE"
-    fi
-    service_daemon_reload || true
-    if service_has_rules && [[ -x "$REALM_BIN" && -f "$REALM_SERVICE_FILE" ]]; then
-        service_restart || true
+        printf '%s\n' "$REALM_CONFIG_DIR"
     fi
 }
 
-service_has_rules() {
-    local count
-    count=$(config_count) || return 1
-    [[ "$count" -gt 0 ]]
+has_rules() {
+    if [[ -s "$REALM_LEGACY_CONFIG" ]]; then
+        grep -Eq '"listen"[[:space:]]*:' "$REALM_LEGACY_CONFIG"
+        return
+    fi
+    find "$REALM_RULE_DIR" -maxdepth 1 -type f -name '*.toml' ! -name '.*' -print -quit 2>/dev/null | grep -q .
 }
 
-restart_for_config() {
-    init_service_runtime || return 1
-    service_daemon_reload || return 1
-    if service_has_rules; then
-        service_enable || return 1
-        if service_is_running; then
-            service_restart || return 1
-        else
-            service_start || return 1
-        fi
-        service_is_running
-    else
-        service_disable
-        warn "当前没有转发规则，服务已停止；添加第一条规则后会自动启动。"
-    fi
-}
+write_default_config() {
+    local global_file example_file temp_file
+    mkdir -p "$REALM_RULE_DIR" || return 1
+    chmod 755 "$REALM_DIR" "$REALM_CONFIG_DIR" "$REALM_RULE_DIR"
+    global_file="${REALM_CONFIG_DIR}/00-global.toml"
+    if [[ ! -f "$global_file" ]]; then
+        temp_file=$(mktemp "${REALM_CONFIG_DIR}/.global.XXXXXX") || return 1
+        cat >"$temp_file" <<'TOML'
+[log]
+level = "warn"
+output = "stdout"
 
-install_latest() {
-    local target asset metadata_file release_info latest_tag download_url expected_sha
-    local archive extract_dir candidate actual_sha current_version old_binary old_service
+[dns]
+mode = "ipv4_and_ipv6"
+protocol = "tcp_and_udp"
+min_ttl = 0
+max_ttl = 60
+cache_size = 32
 
-    require_root || return 1
-    install_dependencies || return 1
-    init_service_runtime || return 1
-    if ! install_manager_command "$SCRIPT_SOURCE"; then
-        error "pf 命令安装失败，已停止 Realm2 安装。"
-        return 1
-    fi
-    if [[ ! -x "$PF_COMMAND" ]] || ! bash -n "$PF_COMMAND"; then
-        error "pf 命令安装后校验失败。"
-        return 1
-    fi
-    info "管理命令已安装：${PF_COMMAND}"
-    target=$(detect_target) || return 1
-    asset=$(release_asset_name "$target") || return 1
-    metadata_file=$(mktemp) || return 1
-    archive=$(mktemp) || {
-        rm -f "$metadata_file"
-        return 1
-    }
-    extract_dir=$(mktemp -d) || {
-        rm -f "$metadata_file" "$archive"
-        return 1
-    }
-
-    if ! curl -fL --retry 3 --connect-timeout 15 \
-        -H 'Accept: application/vnd.github+json' \
-        -H 'X-GitHub-Api-Version: 2022-11-28' \
-        -H 'User-Agent: realm2-manager' \
-        -o "$metadata_file" "$REALM_API_URL"; then
-        error "无法获取 Realm 最新 Release 信息。"
-        rm -f "$metadata_file" "$archive"
-        rm -rf "$extract_dir"
-        return 1
-    fi
-
-    release_info=$(select_release_info "$metadata_file" "$asset") || {
-        error "无法解析 Realm 最新 Release。"
-        rm -f "$metadata_file" "$archive"
-        rm -rf "$extract_dir"
-        return 1
-    }
-    IFS='|' read -r latest_tag download_url expected_sha <<<"$release_info"
-    current_version=$(installed_version 2>/dev/null || true)
-    info "已安装版本：${current_version:-未安装}；官方最新版本：${latest_tag}"
-
-    if [[ "v${current_version:-}" != "$latest_tag" ]]; then
-        info "正在下载官方资产：${asset}"
-        if ! curl -fL --retry 3 --connect-timeout 15 -o "$archive" "$download_url"; then
-            error "Realm 下载失败。"
-            rm -f "$metadata_file" "$archive"
-            rm -rf "$extract_dir"
-            return 1
-        fi
-        actual_sha=$(sha256_file "$archive") || actual_sha=''
-        if [[ "$actual_sha" != "$expected_sha" ]]; then
-            error "SHA-256 校验失败，已停止安装。"
-            rm -f "$metadata_file" "$archive"
-            rm -rf "$extract_dir"
-            return 1
-        fi
-        tar -xzf "$archive" -C "$extract_dir" || {
-            error "Realm 压缩包解压失败。"
-            rm -f "$metadata_file" "$archive"
-            rm -rf "$extract_dir"
+[network]
+use_udp = true
+tcp_timeout = 10
+udp_timeout = 30
+TOML
+        chmod 644 "$temp_file" && mv -f "$temp_file" "$global_file" || {
+            rm -f "$temp_file"
             return 1
         }
-        candidate=$(find "$extract_dir" -type f -name realm -print -quit)
-        if [[ -z "$candidate" || ! -f "$candidate" ]]; then
-            error "压缩包中未找到 realm 二进制。"
-            rm -f "$metadata_file" "$archive"
-            rm -rf "$extract_dir"
-            return 1
-        fi
-        chmod 755 "$candidate"
-        if ! timeout 5 "$candidate" --version 2>/dev/null | grep -q '^Realm '; then
-            error "下载的 Realm 二进制无法执行。"
-            rm -f "$metadata_file" "$archive"
-            rm -rf "$extract_dir"
-            return 1
-        fi
-    else
-        candidate=''
-        info "Realm 核心已经是最新版本。"
     fi
-
-    mkdir -p "$REALM_DIR"
-    chmod 755 "$REALM_DIR"
-    create_default_config || return 1
-
-    old_binary=''
-    old_service=''
-    if [[ -f "$REALM_BIN" ]]; then
-        old_binary="${REALM_BIN}.previous"
-        cp -p "$REALM_BIN" "$old_binary"
+    example_file="${REALM_RULE_DIR}/.rule.example.toml"
+    if [[ ! -f "$example_file" ]]; then
+        cat >"$example_file" <<'TOML'
+[[endpoints]]
+listen = "0.0.0.0:15608"
+remote = "sg1.example.com:15606"
+TOML
+        chmod 644 "$example_file"
     fi
-    if [[ -f "$REALM_SERVICE_FILE" ]]; then
-        old_service="${REALM_SERVICE_FILE}.previous"
-        cp -p "$REALM_SERVICE_FILE" "$old_service"
-    fi
-
-    if [[ -n "$candidate" ]]; then
-        if ! install -m 755 "$candidate" "${REALM_BIN}.new" || ! mv -f "${REALM_BIN}.new" "$REALM_BIN"; then
-            error "替换 Realm 二进制失败，正在回滚。"
-            rm -f "${REALM_BIN}.new"
-            rollback_install_files "$old_binary" "$old_service"
-            rm -f "$metadata_file" "$archive"
-            rm -rf "$extract_dir"
-            return 1
-        fi
-    fi
-    if ! write_service_unit; then
-        error "写入 ${INIT_SYSTEM} 服务失败，正在回滚。"
-        rollback_install_files "$old_binary" "$old_service"
-        rm -f "$metadata_file" "$archive"
-        rm -rf "$extract_dir"
-        return 1
-    fi
-
-    if ! restart_for_config; then
-        error "新版本启动失败，正在回滚。"
-        rollback_install_files "$old_binary" "$old_service"
-        rm -f "$metadata_file" "$archive"
-        rm -rf "$extract_dir"
-        return 1
-    fi
-
-    rm -f "$metadata_file" "$archive"
-    rm -rf "$extract_dir"
-    [[ -x "$PF_COMMAND" ]] || {
-        error "Realm2 核心已安装，但 pf 命令校验失败。"
-        return 1
-    }
-    info "Realm2 ${latest_tag} 安装/更新完成。"
-    info "后续可使用 pf 打开菜单，使用 pf update 更新管理脚本。"
 }
 
 valid_port() {
@@ -782,7 +284,7 @@ valid_port() {
 }
 
 valid_host() {
-    [[ -n "$1" && "$1" != *[[:space:]]* && "$1" != */* && "$1" != *'#'* ]]
+    [[ -n "$1" && "$1" != *[[:space:]]* && "$1" != *'"'* && "$1" != *'#'* && "$1" != */* ]]
 }
 
 format_host_port() {
@@ -797,298 +299,247 @@ format_host_port() {
     fi
 }
 
-add_rule() {
-    local listen_port remote_host remote_port listen remote backup
-
-    require_root || return 1
-    [[ -x "$REALM_BIN" ]] || {
-        error "Realm2 尚未安装，请先执行安装/更新。"
-        return 1
-    }
-    create_default_config || return 1
-
+create_rule_interactive() {
+    local listen_port remote_host remote_port remote rule_file temp_file
+    [[ -t 0 ]] || return 0
+    confirm "当前没有转发规则，是否立即添加一条？[Y/n]：" 'y' || return 0
     read_input listen_port "本地监听端口 [1-65535]：" '' || return 1
-    valid_port "$listen_port" || {
-        error "监听端口无效。"
-        return 1
-    }
+    valid_port "$listen_port" || { error "监听端口无效。"; return 1; }
     read_input remote_host "落地域名或 IP：" '' || return 1
-    valid_host "$remote_host" || {
-        error "落地域名或 IP 无效。"
-        return 1
-    }
+    valid_host "$remote_host" || { error "落地域名或 IP 无效。"; return 1; }
     read_input remote_port "落地端口 [默认 ${listen_port}]：" "$listen_port" || return 1
-    valid_port "$remote_port" || {
-        error "落地端口无效。"
-        return 1
-    }
-
-    listen="0.0.0.0:${listen_port}"
+    valid_port "$remote_port" || { error "落地端口无效。"; return 1; }
+    rule_file="${REALM_RULE_DIR}/${listen_port}.toml"
+    [[ ! -e "$rule_file" ]] || { error "规则文件已存在：${rule_file}"; return 1; }
     remote=$(format_host_port "$remote_host" "$remote_port")
-    printf '即将添加：%s -> %s（TCP + UDP）\n' "$listen" "$remote"
-    confirm "确认添加？[Y/n]：" 'y' || {
-        warn "已取消。"
-        return 0
-    }
-
-    create_config_backup add || return 1
-    backup=$LAST_CONFIG_BACKUP
-    if ! config_action add "$listen" "$remote" >/dev/null; then
-        error "规则写入失败。"
-        return 1
-    fi
-    if ! restart_for_config; then
-        error "新配置启动失败，正在恢复修改前配置。"
-        cp -p "$backup" "$REALM_CONFIG"
-        restart_for_config || true
-        return 1
-    fi
-    info "规则添加成功。"
-}
-
-list_rules() {
-    local rows
-    [[ -f "$REALM_CONFIG" ]] || {
-        warn "尚未生成 Realm2 配置。"
-        return 0
-    }
-    rows=$(config_action list) || return 1
-    if [[ -z "$rows" ]]; then
-        warn "当前没有转发规则。"
-        return 0
-    fi
-    printf '%-6s %-24s %s\n' '序号' '监听地址' '落地地址'
-    printf '%s\n' '------------------------------------------------------------'
-    while IFS=$'\t' read -r index listen remote; do
-        printf '%-6s %-24s %s\n' "$index" "$listen" "$remote"
-    done <<<"$rows"
-}
-
-delete_rule() {
-    local index backup
-
-    require_root || return 1
-    list_rules || return 1
-    [[ $(config_count) -gt 0 ]] || return 0
-    read_input index "请输入要删除的规则编号：" '' || return 1
-    [[ "$index" =~ ^[1-9][0-9]*$ ]] || {
-        error "规则编号无效。"
+    temp_file=$(mktemp "${REALM_RULE_DIR}/.rule.XXXXXX") || return 1
+    cat >"$temp_file" <<EOF
+[[endpoints]]
+listen = "0.0.0.0:${listen_port}"
+remote = "${remote}"
+EOF
+    chmod 644 "$temp_file" && mv -f "$temp_file" "$rule_file" || {
+        rm -f "$temp_file"
         return 1
     }
-    confirm "确认删除第 ${index} 条规则？[y/N]：" 'n' || {
-        warn "已取消。"
-        return 0
-    }
-
-    create_config_backup delete || return 1
-    backup=$LAST_CONFIG_BACKUP
-    if ! config_action delete "$index"; then
-        error "规则删除失败。"
-        return 1
-    fi
-    if ! restart_for_config; then
-        error "删除后的配置启动失败，正在恢复修改前配置。"
-        cp -p "$backup" "$REALM_CONFIG"
-        restart_for_config || true
-        return 1
-    fi
-    info "规则删除成功。"
+    info "规则已保存：${rule_file}"
 }
 
-backup_config() {
-    require_root || return 1
-    create_config_backup manual
-}
-
-restore_config() {
-    local latest current_backup
-
-    require_root || return 1
-    latest=$(find "$REALM_BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.json' -print 2>/dev/null | sort | tail -n 1)
-    [[ -n "$latest" ]] || {
-        error "没有可恢复的配置备份。"
-        return 1
-    }
-    info "即将恢复：${latest}"
-    confirm "确认恢复最近备份？[y/N]：" 'n' || return 0
-    create_config_backup before-restore || return 1
-    current_backup=$LAST_CONFIG_BACKUP
-    cp -p "$latest" "$REALM_CONFIG"
-    if ! config_action validate >/dev/null || ! restart_for_config; then
-        error "备份恢复失败，正在还原当前配置。"
-        cp -p "$current_backup" "$REALM_CONFIG"
-        restart_for_config || true
-        return 1
-    fi
-    info "配置恢复成功。"
-}
-
-service_action() {
-    local action=$1
-    require_root || return 1
+write_service_file() {
+    local config_path temp_file service_mode='644'
     init_service_runtime || return 1
-    [[ -f "$REALM_SERVICE_FILE" ]] || {
-        error "Realm2 服务尚未安装。"
+    config_path=$(active_config_path)
+    temp_file=$(mktemp) || return 1
+    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
+        cat >"$temp_file" <<EOF
+[Unit]
+Description=Realm2 relay service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${REALM_BIN} -c ${config_path}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    else
+        service_mode='755'
+        cat >"$temp_file" <<EOF
+#!/sbin/openrc-run
+name="Realm2"
+description="Realm2 relay service"
+command="${REALM_BIN}"
+command_args="-c ${config_path}"
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=5
+respawn_period=60
+output_log="/var/log/realm2.log"
+error_log="/var/log/realm2.log"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+    fi
+    install -m "$service_mode" "$temp_file" "${REALM_SERVICE_FILE}.new" && \
+        mv -f "${REALM_SERVICE_FILE}.new" "$REALM_SERVICE_FILE" || {
+        rm -f "$temp_file" "${REALM_SERVICE_FILE}.new"
         return 1
     }
-    case "$action" in
-        start)
-            service_has_rules || {
-                error "没有转发规则，拒绝启动空服务。"
-                return 1
-            }
-            service_enable && service_start
-            ;;
-        stop)
-            service_stop
-            ;;
-        restart)
-            service_has_rules || {
-                error "没有转发规则，拒绝重启空服务。"
-                return 1
-            }
-            service_restart
-            ;;
-        status)
-            service_status
-            ;;
-        *)
-            error "未知服务操作：${action}"
+    rm -f "$temp_file"
+}
+
+download_core() {
+    local temp_dir archive candidate actual_sha
+    detect_release_asset || return 1
+    temp_dir=$(mktemp -d) || return 1
+    archive="${temp_dir}/${REALM_ASSET}"
+    if ! curl -fL --retry 3 --connect-timeout 15 --max-time 600 \
+        --speed-limit 1024 --speed-time 30 -o "$archive" "$REALM_DOWNLOAD_URL"; then
+        rm -rf "$temp_dir"
+        error "Realm 下载失败。"
+        return 1
+    fi
+    actual_sha=$(sha256sum "$archive" | awk '{print $1}')
+    if [[ "$actual_sha" != "$REALM_SHA256" ]]; then
+        rm -rf "$temp_dir"
+        error "Realm SHA-256 校验失败。"
+        return 1
+    fi
+    tar -xzf "$archive" -C "$temp_dir" || { rm -rf "$temp_dir"; return 1; }
+    candidate=$(find "$temp_dir" -type f -name realm -print -quit)
+    if [[ -z "$candidate" ]] || ! timeout 5 "$candidate" --version 2>/dev/null | grep -q '^Realm '; then
+        rm -rf "$temp_dir"
+        error "下载的 Realm 二进制无法执行。"
+        return 1
+    fi
+    mkdir -p "$REALM_DIR"
+    install -m 755 "$candidate" "${REALM_BIN}.new" && mv -f "${REALM_BIN}.new" "$REALM_BIN" || {
+        rm -rf "$temp_dir"
+        return 1
+    }
+    rm -rf "$temp_dir"
+}
+
+install_realm() {
+    local current_version old_binary='' old_service=''
+    require_root install || return 1
+    install_dependencies || return 1
+    init_service_runtime || return 1
+    current_version=$(installed_version 2>/dev/null || true)
+    info "已安装核心：${current_version:-未安装}；脚本内置核心：${REALM_VERSION}"
+
+    if [[ -f "$REALM_BIN" ]]; then
+        old_binary="${REALM_BIN}.previous"
+        cp -p "$REALM_BIN" "$old_binary" || return 1
+    fi
+    if [[ -f "$REALM_SERVICE_FILE" ]]; then
+        old_service="${REALM_SERVICE_FILE}.previous"
+        cp -p "$REALM_SERVICE_FILE" "$old_service" || return 1
+    fi
+    if [[ "v${current_version:-}" == "$REALM_VERSION" ]]; then
+        info "Realm 核心已经是脚本内置版本。"
+    elif version_is_newer "$current_version" "${REALM_VERSION#v}"; then
+        warn "已安装核心 ${current_version} 高于脚本内置版本 ${REALM_VERSION#v}，不执行降级。"
+    else
+        download_core || return 1
+    fi
+
+    mkdir -p "$REALM_DIR"
+    write_default_config || return 1
+    if [[ -s "$REALM_LEGACY_CONFIG" ]]; then
+        warn "检测到旧配置，将继续使用：${REALM_LEGACY_CONFIG}"
+    elif ! has_rules; then
+        create_rule_interactive || return 1
+    fi
+    if ! write_service_file; then
+        if [[ -n "$old_binary" && -f "$old_binary" ]]; then
+            cp -p "$old_binary" "$REALM_BIN"
+        else
+            rm -f "$REALM_BIN"
+        fi
+        if [[ -n "$old_service" && -f "$old_service" ]]; then
+            cp -p "$old_service" "$REALM_SERVICE_FILE"
+        else
+            rm -f "$REALM_SERVICE_FILE"
+        fi
+        [[ "$INIT_SYSTEM" == 'systemd' ]] && "$SYSTEMCTL_BIN" daemon-reload || true
+        return 1
+    fi
+    [[ "$INIT_SYSTEM" == 'systemd' ]] && "$SYSTEMCTL_BIN" daemon-reload
+
+    # 清理由旧版管理脚本安装的快捷命令。
+    rm -f "$OLD_PF_COMMAND"
+
+    if has_rules; then
+        service_enable || return 1
+        if service_is_running; then
+            service_restart || return 1
+        else
+            service_start || return 1
+        fi
+        if ! service_is_running; then
+            error "Realm2 服务启动失败，正在恢复安装前文件。"
+            service_disable
+            if [[ -n "$old_binary" && -f "$old_binary" ]]; then
+                cp -p "$old_binary" "$REALM_BIN"
+            else
+                rm -f "$REALM_BIN"
+            fi
+            if [[ -n "$old_service" && -f "$old_service" ]]; then
+                cp -p "$old_service" "$REALM_SERVICE_FILE"
+                [[ "$INIT_SYSTEM" == 'systemd' ]] && "$SYSTEMCTL_BIN" daemon-reload || true
+                service_enable || true
+                service_start || true
+            else
+                rm -f "$REALM_SERVICE_FILE"
+                [[ "$INIT_SYSTEM" == 'systemd' ]] && "$SYSTEMCTL_BIN" daemon-reload || true
+            fi
             return 1
-            ;;
-    esac
+        fi
+        info "Realm2 ${REALM_VERSION} 已安装并运行。"
+    else
+        service_disable
+        warn "尚未配置规则，服务未启动。"
+        warn "复制 ${REALM_RULE_DIR}/.rule.example.toml 为新的 .toml 文件，修改后重启服务。"
+    fi
 }
 
 uninstall_realm() {
-    local purge='n'
-
-    require_root || return 1
+    require_root uninstall || return 1
     init_service_runtime || return 1
     confirm "确认卸载 Realm2 程序和服务？[y/N]：" 'n' || return 0
     service_disable
-    rm -f "$REALM_SERVICE_FILE" "$REALM_BIN" "${REALM_BIN}.previous" "$PF_COMMAND"
-    service_daemon_reload || true
-    read_input purge "同时删除配置和备份？[y/N]：" 'n' || true
-    if [[ "$purge" =~ ^[Yy]$ ]]; then
-        rm -f "$REALM_CONFIG"
-        if [[ -d "$REALM_BACKUP_DIR" ]]; then
-            find "$REALM_BACKUP_DIR" -maxdepth 1 -type f -name 'config-*.json' -delete
-            rmdir "$REALM_BACKUP_DIR" 2>/dev/null || true
-        fi
-        rmdir "$REALM_DIR" 2>/dev/null || true
-    fi
-    info "Realm2 已卸载。"
+    rm -f "$REALM_SERVICE_FILE" "$REALM_BIN" "${REALM_BIN}.previous" "$OLD_PF_COMMAND"
+    [[ "$INIT_SYSTEM" == 'systemd' ]] && "$SYSTEMCTL_BIN" daemon-reload || true
+    warn "配置保留在 ${REALM_DIR}，未自动删除。"
 }
 
-show_menu() {
-    local version status count choice
-
-    while true; do
-        [[ -t 1 ]] && clear
-        version=$(installed_version 2>/dev/null || printf '未安装')
-        if service_is_running; then
-            status='运行中'
-        elif [[ -f "$REALM_SERVICE_FILE" ]]; then
-            status='已停止'
-        else
-            status='未安装'
-        fi
-        count=$(config_count 2>/dev/null || printf '0')
-
-        printf '%b\n' "${C_CYAN}Realm2 中转管理 v${SCRIPT_VERSION} · elunez${C_RESET}"
-        printf '%s\n' '------------------------------------'
-        printf '%s\n' ' 0. 退出脚本'
-        printf '%s\n' ' 1. 安装/更新 Realm2'
-        printf '%s\n' '------------------------------------'
-        printf '%s\n' ' 2. 添加转发规则'
-        printf '%s\n' ' 3. 查看转发规则'
-        printf '%s\n' ' 4. 删除转发规则'
-        printf '%s\n' '------------------------------------'
-        printf '%s\n' ' 5. 启动服务'
-        printf '%s\n' ' 6. 停止服务'
-        printf '%s\n' ' 7. 重启服务'
-        printf '%s\n' ' 8. 查看状态'
-        printf '%s\n' '------------------------------------'
-        printf '%s\n' ' 9. 备份配置'
-        printf '%s\n' '10. 恢复最近备份'
-        printf '%s\n' '11. 卸载 Realm2'
-        printf '%s\n' '12. 更新管理脚本'
-        printf '%s\n' '------------------------------------'
-        printf '核心版本：%s | 服务：%s | 规则：%s\n' "$version" "$status" "$count"
-        printf '%s\n' '------------------------------------'
-        read_input choice "请选择 [0-12]：" '' || return 0
-
-        case "$choice" in
-            0) return 0 ;;
-            1) install_latest ;;
-            2) add_rule ;;
-            3) list_rules ;;
-            4) delete_rule ;;
-            5) service_action start ;;
-            6) service_action stop ;;
-            7) service_action restart ;;
-            8) service_action status ;;
-            9) backup_config ;;
-            10) restore_config ;;
-            11) uninstall_realm ;;
-            12) update_manager_script ;;
-            *) error "请输入 0-12。" ;;
-        esac
-        pause_menu
-    done
+show_status() {
+    init_service_runtime || return 1
+    printf '安装脚本版本：v%s\n' "$SCRIPT_VERSION"
+    printf '内置核心版本：%s\n' "$REALM_VERSION"
+    printf '已安装核心：%s\n' "$(installed_version 2>/dev/null || printf '未安装')"
+    printf '配置路径：%s\n' "$(active_config_path)"
+    if [[ -f "$REALM_SERVICE_FILE" ]]; then
+        service_status
+    else
+        printf '服务状态：未安装\n'
+    fi
 }
 
 usage() {
     cat <<EOF
+Realm2 极简安装脚本 v${SCRIPT_VERSION}
+
 用法：
-  pf                       打开交互菜单
-  pf update                更新管理脚本
-  pf install               安装或更新 Realm2 官方核心
-  pf add                   添加转发规则
-  pf list                  查看转发规则
-  pf delete                删除转发规则
-  pf start|stop|restart|status
-  pf backup|restore
-  pf uninstall
-  pf version               查看已安装核心版本
+  bash realm.sh install      安装或更新内置 Realm 核心
+  bash realm.sh status       查看安装与服务状态
+  bash realm.sh uninstall    卸载程序和服务（保留配置）
+  bash realm.sh version      查看脚本与内置核心版本
+
+新安装配置目录：${REALM_CONFIG_DIR}
+每条规则保存为 ${REALM_RULE_DIR}/端口.toml
 EOF
 }
 
-maybe_reexec_as_root() {
-    local command=$1
-    shift
-
-    [[ ${EUID:-$(id -u)} -eq 0 || -n "${REALM_SKIP_SUDO:-}" ]] && return 0
-    case "$command" in
-        list|version|-h|--help|help) return 0 ;;
-    esac
-    if command_exists sudo; then
-        exec sudo bash "$SCRIPT_SOURCE" "$command" "$@"
-    fi
-    error "此操作需要 root 权限，且系统没有 sudo。"
-    return 1
-}
-
 main() {
-    local command=${1:-menu}
-    shift $(( $# > 0 ? 1 : 0 ))
-    maybe_reexec_as_root "$command" "$@" || return 1
-    init_service_runtime || return 1
-    case "$command" in
-        menu) show_menu ;;
-        install|core-update|update-core) install_latest ;;
-        update) update_manager_script ;;
-        add) add_rule ;;
-        list) list_rules ;;
-        delete) delete_rule ;;
-        start|stop|restart|status) service_action "$command" ;;
-        backup) backup_config ;;
-        restore) restore_config ;;
+    case "${1:-install}" in
+        install|update) install_realm ;;
+        status) show_status ;;
         uninstall) uninstall_realm ;;
-        version) installed_version || printf '未安装\n' ;;
+        version) printf 'script=v%s realm=%s\n' "$SCRIPT_VERSION" "$REALM_VERSION" ;;
         -h|--help|help) usage ;;
         *)
-            error "未知命令：${command}"
+            error "未知命令：$1"
             usage
             return 1
             ;;
