@@ -6,7 +6,7 @@
 
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.6"
+SCRIPT_VERSION="1.0.7"
 REALM_VERSION="v2.9.6"
 REALM_DIR="${REALM_DIR:-/etc/realm2}"
 REALM_BIN="${REALM_BIN:-${REALM_DIR}/realm2}"
@@ -239,44 +239,50 @@ has_rules() {
     find "$REALM_RULE_DIR" -maxdepth 1 -type f -name '*.toml' ! -name '.*' -print -quit 2>/dev/null | grep -q .
 }
 
-write_default_config() {
-    local global_file example_file temp_file
+prepare_config_dir() {
+    local global_file example_file temp_file rule_file disabled_global
     mkdir -p "$REALM_RULE_DIR" || return 1
     chmod 755 "$REALM_DIR" "$REALM_CONFIG_DIR" "$REALM_RULE_DIR"
+
+    # v1.0.6 生成的全局文件缺少 endpoints，Realm 会拒绝解析；隐藏后 Realm 会自动忽略。
     global_file="${REALM_CONFIG_DIR}/00-global.toml"
-    if [[ ! -f "$global_file" ]]; then
-        temp_file=$(mktemp "${REALM_CONFIG_DIR}/.global.XXXXXX") || return 1
+    if [[ -f "$global_file" ]]; then
+        disabled_global="${REALM_CONFIG_DIR}/.00-global.toml.v1.0.6.disabled.$(date +%s)"
+        mv -f "$global_file" "$disabled_global" || return 1
+        warn "已停用不兼容配置：${disabled_global}"
+    fi
+
+    # v1.0.6 规则文件只有 endpoints；补充网络设置以继续启用 TCP + UDP。
+    while IFS= read -r rule_file; do
+        grep -Eq '^\[network\][[:space:]]*$' "$rule_file" && continue
+        grep -Eq '^\[\[endpoints\]\][[:space:]]*$' "$rule_file" || continue
+        temp_file=$(mktemp "${REALM_RULE_DIR}/.migrate.XXXXXX") || return 1
         cat >"$temp_file" <<'TOML'
-[log]
-level = "warn"
-output = "stdout"
-
-[dns]
-mode = "ipv4_and_ipv6"
-protocol = "tcp_and_udp"
-min_ttl = 0
-max_ttl = 60
-cache_size = 32
-
 [network]
 use_udp = true
 tcp_timeout = 10
 udp_timeout = 30
+
 TOML
-        chmod 644 "$temp_file" && mv -f "$temp_file" "$global_file" || {
+        cat "$rule_file" >>"$temp_file" || { rm -f "$temp_file"; return 1; }
+        chmod 644 "$temp_file" && mv -f "$temp_file" "$rule_file" || {
             rm -f "$temp_file"
             return 1
         }
-    fi
+    done < <(find "$REALM_RULE_DIR" -maxdepth 1 -type f -name '*.toml' ! -name '.*' -print 2>/dev/null)
+
     example_file="${REALM_RULE_DIR}/.rule.example.toml"
-    if [[ ! -f "$example_file" ]]; then
-        cat >"$example_file" <<'TOML'
+    cat >"$example_file" <<'TOML'
+[network]
+use_udp = true
+tcp_timeout = 10
+udp_timeout = 30
+
 [[endpoints]]
 listen = "0.0.0.0:15608"
 remote = "sg1.example.com:15606"
 TOML
-        chmod 644 "$example_file"
-    fi
+    chmod 644 "$example_file"
 }
 
 valid_port() {
@@ -314,6 +320,11 @@ create_rule_interactive() {
     remote=$(format_host_port "$remote_host" "$remote_port")
     temp_file=$(mktemp "${REALM_RULE_DIR}/.rule.XXXXXX") || return 1
     cat >"$temp_file" <<EOF
+[network]
+use_udp = true
+tcp_timeout = 10
+udp_timeout = 30
+
 [[endpoints]]
 listen = "0.0.0.0:${listen_port}"
 remote = "${remote}"
@@ -336,6 +347,8 @@ write_service_file() {
 Description=Realm2 relay service
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -434,7 +447,7 @@ install_realm() {
     fi
 
     mkdir -p "$REALM_DIR"
-    write_default_config || return 1
+    prepare_config_dir || return 1
     if [[ -s "$REALM_LEGACY_CONFIG" ]]; then
         warn "检测到旧配置，将继续使用：${REALM_LEGACY_CONFIG}"
     elif ! has_rules; then
@@ -466,6 +479,7 @@ install_realm() {
         else
             service_start || return 1
         fi
+        sleep 2
         if ! service_is_running; then
             error "Realm2 服务启动失败，正在恢复安装前文件。"
             service_disable

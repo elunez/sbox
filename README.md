@@ -138,14 +138,16 @@ sudo bash realm.sh uninstall    # 卸载程序和服务，保留配置
 bash realm.sh version           # 查看脚本与内置核心版本
 ```
 
-新安装使用 `/etc/realm2/config/` TOML 配置目录，通用设置保存在 `00-global.toml`，每条规则
+新安装使用 `/etc/realm2/config/` TOML 配置目录，每条规则（包含自身的 TCP/UDP 网络设置）
 单独保存为 `rules/端口.toml`。首次安装会询问是否添加第一条规则；以后可复制隐藏的
-`.rule.example.toml`，修改后重启 `realm2` 服务。每条规则相互独立，不会因删除某条规则破坏
-其他配置。
+`.rule.example.toml`，修改后重启 `realm2` 服务。每个 TOML 都是 Realm 可独立解析的完整配置，
+不会因删除某条规则破坏其他配置。
 
 升级时如果检测到旧 `/etc/realm2/config.json`，会原样保留并继续使用，不自动转换或覆盖。
 安装新版时会删除旧版生成的 `/usr/local/bin/pf`。systemd 使用 `Restart=on-failure`，OpenRC
 使用 `supervise-daemon` 限频拉起，两者均不设置定时重启。
+
+`v1.0.7` 会自动停用 `v1.0.6` 生成的不兼容 `00-global.toml`，并为已有独立规则补齐网络设置。
 
 隔离测试只操作临时目录，不安装核心、不访问网络，也不调用真实 systemd/OpenRC：
 

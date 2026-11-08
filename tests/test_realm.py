@@ -32,8 +32,8 @@ class RealmMinimalInstallerTests(unittest.TestCase):
         result = subprocess.run(["bash", "-n", str(SCRIPT)], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_version_is_1_0_6(self):
-        self.assertIn('SCRIPT_VERSION="1.0.6"', SOURCE)
+    def test_version_is_1_0_7(self):
+        self.assertIn('SCRIPT_VERSION="1.0.7"', SOURCE)
         self.assertIn('REALM_VERSION="v2.9.6"', SOURCE)
 
     def test_no_pf_jq_or_python_dependency(self):
@@ -90,7 +90,7 @@ class RealmMinimalInstallerTests(unittest.TestCase):
         self.assertNotEqual(older.returncode, 0)
         self.assertNotEqual(equal.returncode, 0)
 
-    def test_default_config_uses_toml_files_without_json_parser(self):
+    def test_config_template_is_a_complete_rule(self):
         with tempfile.TemporaryDirectory() as directory:
             realm_dir = Path(directory) / "realm2"
             env = {
@@ -99,15 +99,44 @@ class RealmMinimalInstallerTests(unittest.TestCase):
                 "REALM_RULE_DIR": str(realm_dir / "config" / "rules"),
                 "REALM_LEGACY_CONFIG": str(realm_dir / "config.json"),
             }
-            result = bash("write_default_config", env)
+            result = bash("prepare_config_dir", env)
             self.assertEqual(result.returncode, 0, result.stderr)
-            global_config = (realm_dir / "config" / "00-global.toml").read_text()
             example = (realm_dir / "config" / "rules" / ".rule.example.toml").read_text()
-            self.assertIn("use_udp = true", global_config)
-            self.assertIn("tcp_timeout = 10", global_config)
+            self.assertFalse((realm_dir / "config" / "00-global.toml").exists())
+            self.assertIn("use_udp = true", example)
+            self.assertIn("tcp_timeout = 10", example)
             self.assertIn("[[endpoints]]", example)
-            has_rules = bash("write_default_config && has_rules", env)
+            has_rules = bash("prepare_config_dir && has_rules", env)
             self.assertNotEqual(has_rules.returncode, 0)
+
+    def test_v1_0_6_config_is_migrated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            realm_dir = Path(directory) / "realm2"
+            rule_dir = realm_dir / "config" / "rules"
+            rule_dir.mkdir(parents=True)
+            global_file = realm_dir / "config" / "00-global.toml"
+            global_file.write_text('[network]\nuse_udp = true\n')
+            rule_file = rule_dir / "15608.toml"
+            rule_file.write_text(
+                '[[endpoints]]\nlisten = "0.0.0.0:15608"\nremote = "sg.example:15606"\n'
+            )
+            env = {
+                "REALM_DIR": str(realm_dir),
+                "REALM_CONFIG_DIR": str(realm_dir / "config"),
+                "REALM_RULE_DIR": str(rule_dir),
+                "REALM_LEGACY_CONFIG": str(realm_dir / "config.json"),
+            }
+            result = bash("prepare_config_dir", env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(global_file.exists())
+            self.assertEqual(
+                len(list((realm_dir / "config").glob(".00-global.toml.v1.0.6.disabled.*"))),
+                1,
+            )
+            migrated = rule_file.read_text()
+            self.assertIn("[network]", migrated)
+            self.assertIn("use_udp = true", migrated)
+            self.assertIn("[[endpoints]]", migrated)
 
     def test_visible_toml_rule_is_detected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -176,6 +205,7 @@ class RealmMinimalInstallerTests(unittest.TestCase):
             unit = service.read_text()
             self.assertIn(f"ExecStart={root / 'realm2'} -c {config_dir}", unit)
             self.assertIn("Restart=on-failure", unit)
+            self.assertIn("StartLimitBurst=5", unit)
             self.assertNotIn("ExecStop=", unit)
 
     def test_openrc_service_uses_supervise_daemon(self):
