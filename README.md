@@ -105,16 +105,16 @@ sbox
 （支持直接输入 `sbox` 快速调出面板，普通用户运行时会自动调起 sudo）
 
 
-## Realm2 极简安装器
+## Realm2 中转管理
 
 维护者：[@elunez](https://github.com/elunez)
 
 管理脚本版本从 `v1.0.1` 开始，按十进制三段递增，例如 `v1.0.9 → v1.1.0`、
 `v1.9.9 → v2.0.0`；Realm 核心版本独立采用官方 Release 版本号。
 
-独立脚本 [`realm.sh`](realm.sh) 用于安装 Realm2 四层中转，支持 systemd 与 Alpine OpenRC。
-不安装 `pf`，也不依赖 Python 或 `jq`。脚本内固定 Realm 官方版本、各架构下载地址和 SHA-256；
-更新 Realm 核心时同步发布新版安装脚本。
+独立脚本 [`realm.sh`](realm.sh) 用于安装和管理 Realm2 四层中转，支持 systemd 与 Alpine
+OpenRC。不安装 `pf`，也不依赖 Python 或 `jq`。脚本内固定 Realm 官方版本、各架构下载地址
+和 SHA-256；更新 Realm 核心时同步发布新版管理脚本。
 
 ```bash
 curl -fsSLo realm.sh https://raw.githubusercontent.com/elunez/sbox/main/realm.sh && chmod +x realm.sh && sudo bash realm.sh install
@@ -129,11 +129,19 @@ apk add --no-cache bash curl ca-certificates tar coreutils openrc && curl -fsSLo
 不要再使用 `https://git.io/realm.sh`：该短链指向旧 EasyRealM 的 glibc ELF 程序，不是本仓库脚本，
 在 Alpine/musl 上会出现 `./realm.sh: not found`。
 
-脚本仅保留安装、状态和卸载命令：
+直接运行 `./realm.sh` 会打开管理菜单，支持安装更新、规则增删查、服务控制、备份恢复、卸载和
+更新当前脚本。也可直接执行子命令：
 
 ```bash
+./realm.sh                       # 打开管理菜单
 sudo bash realm.sh install      # 安装或更新脚本内置核心
+bash realm.sh list              # 查看 TOML 规则
+sudo bash realm.sh add          # 添加规则
+sudo bash realm.sh delete       # 删除规则
 bash realm.sh status            # 查看版本、配置路径和服务状态
+sudo bash realm.sh backup       # 备份配置
+sudo bash realm.sh restore      # 恢复最近备份
+sudo bash realm.sh update-script # 更新当前脚本
 sudo bash realm.sh uninstall    # 卸载程序和服务，保留配置
 bash realm.sh version           # 查看脚本与内置核心版本
 ```

@@ -6,7 +6,7 @@
 
 set -uo pipefail
 
-SCRIPT_VERSION="1.0.7"
+SCRIPT_VERSION="1.0.8"
 REALM_VERSION="v2.9.6"
 REALM_DIR="${REALM_DIR:-/etc/realm2}"
 REALM_BIN="${REALM_BIN:-${REALM_DIR}/realm2}"
@@ -21,6 +21,10 @@ RC_SERVICE_BIN="${RC_SERVICE_BIN:-rc-service}"
 RC_UPDATE_BIN="${RC_UPDATE_BIN:-rc-update}"
 INIT_SYSTEM="${INIT_SYSTEM:-}"
 OLD_PF_COMMAND="${OLD_PF_COMMAND:-/usr/local/bin/pf}"
+REALM_BACKUP_DIR="${REALM_BACKUP_DIR:-${REALM_DIR}/backups}"
+SCRIPT_UPDATE_URL="${SCRIPT_UPDATE_URL:-https://raw.githubusercontent.com/elunez/sbox/main/realm.sh}"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+[[ "$SCRIPT_SOURCE" == /* ]] || SCRIPT_SOURCE="$(pwd)/${SCRIPT_SOURCE}"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     C_GREEN='\033[32m'
@@ -155,6 +159,14 @@ service_start() {
     fi
 }
 
+service_stop() {
+    if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
+        "$SYSTEMCTL_BIN" stop "$REALM_SERVICE"
+    else
+        "$RC_SERVICE_BIN" "$REALM_SERVICE_NAME" stop
+    fi
+}
+
 service_restart() {
     if [[ "$INIT_SYSTEM" == 'systemd' ]]; then
         "$SYSTEMCTL_BIN" restart "$REALM_SERVICE"
@@ -217,7 +229,6 @@ version_is_newer() {
     IFS='.' read -r candidate_major candidate_minor candidate_patch <<<"$candidate"
     IFS='.' read -r baseline_major baseline_minor baseline_patch <<<"$baseline"
     ((10#$candidate_major > 10#$baseline_major)) && return 0
-    ((10#$candidate_major < 10#$baseline_major)) && return 1
     ((10#$candidate_minor > 10#$baseline_minor)) && return 0
     ((10#$candidate_minor < 10#$baseline_minor)) && return 1
     ((10#$candidate_patch > 10#$baseline_patch))
@@ -305,10 +316,14 @@ format_host_port() {
     fi
 }
 
-create_rule_interactive() {
+validate_config_paths() {
+    [[ -n "$REALM_DIR" && "$REALM_DIR" != '/' ]] || return 1
+    [[ "$REALM_CONFIG_DIR" == "$REALM_DIR"/* && "$REALM_CONFIG_DIR" != "$REALM_DIR" ]] || return 1
+    [[ "$REALM_RULE_DIR" == "$REALM_CONFIG_DIR"/* && "$REALM_RULE_DIR" != "$REALM_CONFIG_DIR" ]] || return 1
+}
+
+create_rule() {
     local listen_port remote_host remote_port remote rule_file temp_file
-    [[ -t 0 ]] || return 0
-    confirm "当前没有转发规则，是否立即添加一条？[Y/n]：" 'y' || return 0
     read_input listen_port "本地监听端口 [1-65535]：" '' || return 1
     valid_port "$listen_port" || { error "监听端口无效。"; return 1; }
     read_input remote_host "落地域名或 IP：" '' || return 1
@@ -333,7 +348,14 @@ EOF
         rm -f "$temp_file"
         return 1
     }
+    LAST_RULE_FILE=$rule_file
     info "规则已保存：${rule_file}"
+}
+
+create_rule_interactive() {
+    [[ -t 0 ]] || return 0
+    confirm "当前没有转发规则，是否立即添加一条？[Y/n]：" 'y' || return 0
+    create_rule
 }
 
 write_service_file() {
@@ -507,6 +529,184 @@ install_realm() {
     fi
 }
 
+ensure_toml_management() {
+    [[ ! -s "$REALM_LEGACY_CONFIG" ]] || {
+        error "当前仍使用旧 JSON 配置，菜单不会自动改写：${REALM_LEGACY_CONFIG}"
+        return 1
+    }
+    [[ -d "$REALM_RULE_DIR" ]] || {
+        error "TOML 配置目录不存在，请先安装 Realm2。"
+        return 1
+    }
+}
+
+apply_current_config() {
+    init_service_runtime || return 1
+    [[ -x "$REALM_BIN" ]] || { error "Realm2 尚未安装。"; return 1; }
+    write_service_file || return 1
+    [[ "$INIT_SYSTEM" == 'systemd' ]] && "$SYSTEMCTL_BIN" daemon-reload
+    if has_rules; then
+        service_enable || return 1
+        if service_is_running; then
+            service_restart || return 1
+        else
+            service_start || return 1
+        fi
+        sleep 2
+        service_is_running || { error "Realm2 服务启动失败。"; return 1; }
+    else
+        service_disable
+        warn "当前没有转发规则，服务已停止。"
+    fi
+}
+
+add_rule() {
+    require_root add || return 1
+    ensure_toml_management || return 1
+    prepare_config_dir || return 1
+    create_config_backup before-add >/dev/null || return 1
+    create_rule || return 1
+    if ! apply_current_config; then
+        rm -f "${LAST_RULE_FILE:-}"
+        apply_current_config || true
+        error "规则应用失败，已撤销新增规则。"
+        return 1
+    fi
+    info "规则添加成功。"
+}
+
+list_rules() {
+    local file listen remote index=0
+    RULE_FILES=()
+    printf '%-6s %-24s %s\n' '序号' '监听地址' '落地地址'
+    printf '%s\n' '------------------------------------------------------------'
+    while IFS= read -r file; do
+        listen=$(sed -n 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$file" | head -n 1)
+        remote=$(sed -n 's/^[[:space:]]*remote[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$file" | head -n 1)
+        ((index += 1))
+        RULE_FILES+=("$file")
+        printf '%-6s %-24s %s\n' "$index" "${listen:-未知}" "${remote:-未知}"
+    done < <(find "$REALM_RULE_DIR" -maxdepth 1 -type f -name '*.toml' ! -name '.*' -print 2>/dev/null | sort)
+    if ((index == 0)); then
+        warn "当前没有转发规则。"
+    fi
+}
+
+delete_rule() {
+    local index target deleted_copy
+    require_root delete || return 1
+    ensure_toml_management || return 1
+    prepare_config_dir || return 1
+    list_rules
+    ((${#RULE_FILES[@]} > 0)) || return 0
+    read_input index "请输入要删除的规则编号：" '' || return 1
+    [[ "$index" =~ ^[1-9][0-9]*$ ]] && ((10#$index <= ${#RULE_FILES[@]})) || {
+        error "规则编号无效。"
+        return 1
+    }
+    target=${RULE_FILES[$((10#$index - 1))]}
+    confirm "确认删除 ${target}？[y/N]：" 'n' || return 0
+    create_config_backup before-delete >/dev/null || return 1
+    deleted_copy=$(mktemp) || return 1
+    cp -p "$target" "$deleted_copy" || { rm -f "$deleted_copy"; return 1; }
+    rm -f "$target"
+    if ! apply_current_config; then
+        cp -p "$deleted_copy" "$target"
+        rm -f "$deleted_copy"
+        apply_current_config || true
+        error "规则应用失败，已恢复删除的规则。"
+        return 1
+    fi
+    rm -f "$deleted_copy"
+    info "规则已删除。"
+}
+
+create_config_backup() {
+    local reason=${1:-manual}
+    local destination
+    mkdir -p "$REALM_BACKUP_DIR" || return 1
+    destination=$(mktemp -d "${REALM_BACKUP_DIR}/config-$(date +%Y%m%d-%H%M%S)-${reason}.XXXXXX") || return 1
+    [[ -d "$REALM_CONFIG_DIR" ]] && cp -a "$REALM_CONFIG_DIR" "$destination/config"
+    [[ -f "$REALM_LEGACY_CONFIG" ]] && cp -p "$REALM_LEGACY_CONFIG" "$destination/config.json"
+    [[ -f "$REALM_SERVICE_FILE" ]] && cp -p "$REALM_SERVICE_FILE" "$destination/service"
+    LAST_CONFIG_BACKUP=$destination
+    info "配置已备份：${destination}"
+}
+
+backup_config() {
+    require_root backup || return 1
+    init_service_runtime || return 1
+    create_config_backup manual
+}
+
+restore_config() {
+    local latest stage old
+    require_root restore || return 1
+    init_service_runtime || return 1
+    validate_config_paths || { error "配置路径不安全，拒绝恢复。"; return 1; }
+    latest=$(find "$REALM_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -name 'config-*' -print 2>/dev/null | sort | tail -n 1)
+    [[ -n "$latest" ]] || { error "没有可恢复的配置备份。"; return 1; }
+    info "即将恢复：${latest}"
+    confirm "确认恢复最近备份？[y/N]：" 'n' || return 0
+    create_config_backup before-restore >/dev/null || return 1
+    stage=$(mktemp -d "${REALM_DIR}/.restore.XXXXXX") || return 1
+    old=$(mktemp -d "${REALM_DIR}/.restore-old.XXXXXX") || { rm -rf "$stage"; return 1; }
+    [[ -d "$latest/config" ]] && cp -a "$latest/config" "$stage/config"
+    [[ -f "$latest/config.json" ]] && cp -p "$latest/config.json" "$stage/config.json"
+    service_disable
+    [[ -d "$REALM_CONFIG_DIR" ]] && mv "$REALM_CONFIG_DIR" "$old/config"
+    [[ -f "$REALM_LEGACY_CONFIG" ]] && mv "$REALM_LEGACY_CONFIG" "$old/config.json"
+    [[ -d "$stage/config" ]] && mv "$stage/config" "$REALM_CONFIG_DIR"
+    [[ -f "$stage/config.json" ]] && mv "$stage/config.json" "$REALM_LEGACY_CONFIG"
+    if ! apply_current_config; then
+        rm -rf "$REALM_CONFIG_DIR"
+        rm -f "$REALM_LEGACY_CONFIG"
+        [[ -d "$old/config" ]] && mv "$old/config" "$REALM_CONFIG_DIR"
+        [[ -f "$old/config.json" ]] && mv "$old/config.json" "$REALM_LEGACY_CONFIG"
+        apply_current_config || true
+        rm -rf "$stage" "$old"
+        error "恢复失败，已回滚。"
+        return 1
+    fi
+    rm -rf "$stage" "$old"
+    info "配置恢复成功。"
+}
+
+update_script() {
+    local temp_file remote_version
+    require_root update-script || return 1
+    temp_file=$(mktemp) || return 1
+    if ! curl -fL --retry 3 --connect-timeout 15 --max-time 600 \
+        --speed-limit 1024 --speed-time 30 -o "$temp_file" "$SCRIPT_UPDATE_URL"; then
+        rm -f "$temp_file"
+        error "脚本下载失败。"
+        return 1
+    fi
+    if ! grep -q '^# Realm2 极简安装脚本$' "$temp_file" || ! bash -n "$temp_file"; then
+        rm -f "$temp_file"
+        error "下载内容不是有效的 Realm2 脚本。"
+        return 1
+    fi
+    remote_version=$(sed -n 's/^SCRIPT_VERSION="\([0-9][0-9.]*\)"$/\1/p' "$temp_file" | head -n 1)
+    [[ -n "$remote_version" ]] || { rm -f "$temp_file"; error "无法识别远端版本。"; return 1; }
+    if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
+        rm -f "$temp_file"
+        info "脚本已经是最新版本 v${SCRIPT_VERSION}。"
+        return 0
+    fi
+    version_is_newer "$remote_version" "$SCRIPT_VERSION" || {
+        rm -f "$temp_file"
+        error "拒绝降级到 v${remote_version}。"
+        return 1
+    }
+    install -m 755 "$temp_file" "${SCRIPT_SOURCE}.new" && mv -f "${SCRIPT_SOURCE}.new" "$SCRIPT_SOURCE" || {
+        rm -f "$temp_file" "${SCRIPT_SOURCE}.new"
+        return 1
+    }
+    rm -f "$temp_file"
+    info "脚本已升级到 v${remote_version}。"
+}
+
 uninstall_realm() {
     require_root uninstall || return 1
     init_service_runtime || return 1
@@ -530,13 +730,109 @@ show_status() {
     fi
 }
 
+service_control() {
+    local action=$1
+    require_root "$action" || return 1
+    init_service_runtime || return 1
+    [[ -f "$REALM_SERVICE_FILE" ]] || { error "Realm2 服务尚未安装。"; return 1; }
+    case "$action" in
+        start)
+            has_rules || { error "当前没有转发规则。"; return 1; }
+            service_enable && service_start
+            ;;
+        stop)
+            service_stop
+            ;;
+        restart)
+            has_rules || { error "当前没有转发规则。"; return 1; }
+            service_restart
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+pause_menu() {
+    local unused=''
+    IFS= read -r -p "按回车键继续..." unused || true
+}
+
+show_menu() {
+    local choice core_version service_state rule_count
+    require_root menu || return 1
+    init_service_runtime || return 1
+    while true; do
+        [[ -t 1 ]] && clear
+        core_version=$(installed_version 2>/dev/null || printf '未安装')
+        if service_is_running; then
+            service_state='运行中'
+        elif [[ -f "$REALM_SERVICE_FILE" ]]; then
+            service_state='已停止'
+        else
+            service_state='未安装'
+        fi
+        if [[ -s "$REALM_LEGACY_CONFIG" ]]; then
+            rule_count='旧JSON'
+        else
+            rule_count=$(find "$REALM_RULE_DIR" -maxdepth 1 -type f -name '*.toml' ! -name '.*' 2>/dev/null | wc -l | tr -d ' ')
+        fi
+
+        printf 'Realm2 中转管理 v%s · elunez\n' "$SCRIPT_VERSION"
+        printf '%s\n' '------------------------------------'
+        printf '%s\n' ' 0. 退出脚本'
+        printf '%s\n' ' 1. 安装/更新 Realm2'
+        printf '%s\n' '------------------------------------'
+        printf '%s\n' ' 2. 添加转发规则'
+        printf '%s\n' ' 3. 查看转发规则'
+        printf '%s\n' ' 4. 删除转发规则'
+        printf '%s\n' '------------------------------------'
+        printf '%s\n' ' 5. 启动服务'
+        printf '%s\n' ' 6. 停止服务'
+        printf '%s\n' ' 7. 重启服务'
+        printf '%s\n' ' 8. 查看状态'
+        printf '%s\n' '------------------------------------'
+        printf '%s\n' ' 9. 备份配置'
+        printf '%s\n' '10. 恢复最近备份'
+        printf '%s\n' '11. 卸载 Realm2'
+        printf '%s\n' '12. 更新管理脚本'
+        printf '%s\n' '------------------------------------'
+        printf '核心版本：%s | 服务：%s | 规则：%s\n' "$core_version" "$service_state" "$rule_count"
+        printf '%s\n' '------------------------------------'
+        read_input choice "请选择 [0-12]：" '' || return 0
+        case "$choice" in
+            0) return 0 ;;
+            1) install_realm ;;
+            2) add_rule ;;
+            3) ensure_toml_management && list_rules ;;
+            4) delete_rule ;;
+            5) service_control start ;;
+            6) service_control stop ;;
+            7) service_control restart ;;
+            8) show_status ;;
+            9) backup_config ;;
+            10) restore_config ;;
+            11) uninstall_realm ;;
+            12) update_script ;;
+            *) error "请输入 0-12。" ;;
+        esac
+        pause_menu
+    done
+}
+
 usage() {
     cat <<EOF
-Realm2 极简安装脚本 v${SCRIPT_VERSION}
+Realm2 中转管理脚本 v${SCRIPT_VERSION}
 
 用法：
+  ./realm.sh                  打开交互菜单
   bash realm.sh install      安装或更新内置 Realm 核心
+  bash realm.sh add          添加 TOML 转发规则
+  bash realm.sh list         查看 TOML 转发规则
+  bash realm.sh delete       删除 TOML 转发规则
+  bash realm.sh start|stop|restart
   bash realm.sh status       查看安装与服务状态
+  bash realm.sh backup       备份配置
+  bash realm.sh restore      恢复最近备份
+  bash realm.sh update-script 更新当前 realm.sh
   bash realm.sh uninstall    卸载程序和服务（保留配置）
   bash realm.sh version      查看脚本与内置核心版本
 
@@ -546,9 +842,17 @@ EOF
 }
 
 main() {
-    case "${1:-install}" in
+    case "${1:-menu}" in
+        menu) show_menu ;;
         install|update) install_realm ;;
+        add) add_rule ;;
+        list) ensure_toml_management && list_rules ;;
+        delete) delete_rule ;;
+        start|stop|restart) service_control "$1" ;;
         status) show_status ;;
+        backup) backup_config ;;
+        restore) restore_config ;;
+        update-script) update_script ;;
         uninstall) uninstall_realm ;;
         version) printf 'script=v%s realm=%s\n' "$SCRIPT_VERSION" "$REALM_VERSION" ;;
         -h|--help|help) usage ;;

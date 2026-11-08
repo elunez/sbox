@@ -32,8 +32,8 @@ class RealmMinimalInstallerTests(unittest.TestCase):
         result = subprocess.run(["bash", "-n", str(SCRIPT)], text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_version_is_1_0_7(self):
-        self.assertIn('SCRIPT_VERSION="1.0.7"', SOURCE)
+    def test_version_is_1_0_8(self):
+        self.assertIn('SCRIPT_VERSION="1.0.8"', SOURCE)
         self.assertIn('REALM_VERSION="v2.9.6"', SOURCE)
 
     def test_no_pf_jq_or_python_dependency(self):
@@ -236,14 +236,52 @@ class RealmMinimalInstallerTests(unittest.TestCase):
         self.assertIn('read_input remote_host "落地域名或 IP："', SOURCE)
         self.assertNotRegex(SOURCE, r'read_input\s+\w+\s+"[^"]*\n[^"]*"')
 
-    def test_help_exposes_only_minimal_commands(self):
+    def test_help_exposes_menu_and_rule_commands(self):
         result = subprocess.run(
             ["bash", str(SCRIPT), "--help"], text=True, capture_output=True, timeout=15
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("./realm.sh", result.stdout)
         self.assertIn("bash realm.sh install", result.stdout)
         self.assertNotIn("pf update", result.stdout)
-        self.assertNotIn("添加转发规则", result.stdout)
+        self.assertIn("添加 TOML 转发规则", result.stdout)
+
+    def test_no_argument_opens_menu(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = bash(
+                "require_root() { :; }\nmain menu <<< '0'",
+                {
+                    "REALM_DIR": str(root),
+                    "REALM_CONFIG_DIR": str(root / "config"),
+                    "REALM_RULE_DIR": str(root / "config" / "rules"),
+                    "REALM_LEGACY_CONFIG": str(root / "config.json"),
+                    "REALM_SERVICE_FILE": str(root / "realm2.service"),
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Realm2 中转管理 v1.0.8", result.stdout)
+            self.assertIn("12. 更新管理脚本", result.stdout)
+
+    def test_rule_listing_reads_independent_toml_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rule_dir = Path(directory) / "rules"
+            rule_dir.mkdir()
+            (rule_dir / "15608.toml").write_text(
+                '[network]\nuse_udp = true\n\n[[endpoints]]\n'
+                'listen = "0.0.0.0:15608"\nremote = "sg.example:15606"\n'
+            )
+            result = bash("list_rules", {"REALM_RULE_DIR": str(rule_dir)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("0.0.0.0:15608", result.stdout)
+            self.assertIn("sg.example:15606", result.stdout)
+
+    def test_restore_rejects_broad_config_paths(self):
+        result = bash(
+            "REALM_DIR=/\nREALM_CONFIG_DIR=/etc\nREALM_RULE_DIR=/etc/rules\n"
+            "validate_config_paths"
+        )
+        self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":
