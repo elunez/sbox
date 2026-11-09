@@ -791,6 +791,77 @@ echo "$imported"''')
         self.assertEqual(client["flow"], "xtls-rprx-vision")
         self.assertEqual(client["tls"]["reality"]["public_key"], "public")
 
+    def test_shadowsocks_2022_shadowtls_inbound_outbound_and_clients(self):
+        key = "MDEyMzQ1Njc4OWFiY2RlZg=="
+        shadow = {"version": 3, "password": "shadow-secret", "server_name": "www.microsoft.com",
+                  "handshake_server": "www.microsoft.com", "handshake_port": 443, "strict_mode": True}
+        node = {"name": "SS-ST", "protocol": "shadowsocks-shadowtls", "domain": "proxy.example.com",
+                "port": 443, "method": "2022-blake3-aes-128-gcm", "password": key,
+                "tcp_fast_open": False, "shadowtls": shadow,
+                "traffic": {"monthly_limit": "unlimited", "reset_day": None},
+                "dns": {"mode": "system"},
+                "outbound": {"type": "shadowsocks-shadowtls", "server": "upstream.example.com",
+                             "port": 8443, "method": "2022-blake3-aes-128-gcm", "password": key,
+                             "tcp_fast_open": False,
+                             "shadowtls": {"version": 3, "password": "upstream-secret",
+                                           "server_name": "www.microsoft.com", "strict_mode": True}},
+                "backup_outbounds": []}
+        state, output = self.directory / "state.json", self.directory / "config.json"
+        state.write_text(json.dumps({"nodes": [node]}))
+        result = bash(f'generate_config_from_state {shlex.quote(str(output))} {shlex.quote(str(state))}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads(output.read_text())
+        self.assertEqual([item["tag"] for item in config["inbounds"]],
+                         ["shadowtls-in-1", "in-1", "in-udp-1"])
+        public, inner, udp = config["inbounds"]
+        self.assertEqual((public["type"], public["version"], public["detour"]),
+                         ("shadowtls", 3, "in-1"))
+        self.assertTrue(public["strict_mode"])
+        self.assertEqual(public["handshake"], {"server": "www.microsoft.com", "server_port": 443})
+        self.assertNotIn("listen", inner)
+        self.assertEqual((udp["network"], udp["listen_port"]), ("udp", 443))
+        self.assertEqual(config["route"]["rules"][0]["inbound"], ["in-1", "in-udp-1"])
+
+        logical = next(item for item in config["outbounds"] if item["tag"] == "out-1")
+        outer = next(item for item in config["outbounds"] if item["tag"] == "out-1-shadowtls")
+        self.assertEqual(logical["detour"], "out-1-shadowtls")
+        self.assertEqual(logical["udp_over_tcp"], {"enabled": True, "version": 2})
+        self.assertEqual((outer["type"], outer["version"], outer["tls"]["server_name"]),
+                         ("shadowtls", 3, "www.microsoft.com"))
+
+        result = bash(f'generate_client_outbound_json {shlex.quote(json.dumps(node))}')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        client = json.loads(result.stdout)
+        self.assertEqual([item["type"] for item in client], ["shadowsocks", "shadowtls"])
+        self.assertEqual(client[0]["detour"], "SS-ST-shadowtls")
+        self.assertEqual(client[1]["password"], "shadow-secret")
+
+        result = bash(f'''current_nodes_json() {{ echo {shlex.quote(json.dumps([node]))}; }}
+show_client''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Surge 配置:", result.stdout)
+        self.assertIn("Loon 配置:", result.stdout)
+
+    def test_shadowtls_combo_rejects_non_2022_and_missing_shadow_password(self):
+        base = {"name": "bad", "protocol": "shadowsocks-shadowtls", "domain": "example.com", "port": 443,
+                "method": "aes-128-gcm", "password": "test", "tcp_fast_open": False,
+                "shadowtls": {"version": 3, "password": "", "server_name": "www.microsoft.com",
+                              "handshake_server": "www.microsoft.com", "handshake_port": 443},
+                "traffic": {"monthly_limit": "unlimited", "reset_day": None},
+                "outbound": {"type": "direct"}, "backup_outbounds": []}
+        state, output = self.directory / "state.json", self.directory / "config.json"
+        state.write_text(json.dumps({"nodes": [base]}))
+        result = bash(f'generate_config_from_state {shlex.quote(str(output))} {shlex.quote(str(state))}')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(output.exists())
+        base["method"] = "2022-blake3-chacha20-poly1305"
+        base["password"] = base64.b64encode(b"0" * 32).decode()
+        base["shadowtls"]["password"] = "shadow-secret"
+        state.write_text(json.dumps({"nodes": [base]}))
+        result = bash(f'generate_config_from_state {shlex.quote(str(output))} {shlex.quote(str(state))}')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(output.exists())
+
     def test_tfo_defaults_cli_generation_and_type_validation(self):
         node = {"name": "SS", "protocol": "shadowsocks", "domain": "example.com", "port": 8388,
                 "method": "aes-128-gcm", "password": "test", "traffic": {"monthly_limit": "unlimited"},

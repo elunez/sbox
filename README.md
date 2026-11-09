@@ -4,11 +4,11 @@
 
 ## 主要特性
 
-- **多协议入站支持**：支持 AnyTLS、Shadowsocks（含 2022-blake3 与传统 AEAD）、Trojan、Hysteria2、VLESS + REALITY、SOCKS5、HTTP / HTTPS。
-- **全能出站路由**：每个节点可独立指定出口方式，支持 Direct、AnyTLS、Shadowsocks、Trojan、Hysteria2、VLESS + REALITY、SOCKS5 / SOCKS5H、HTTP / HTTPS。
+- **多协议入站支持**：支持 AnyTLS、Shadowsocks（含 2022-blake3 与传统 AEAD）、Shadowsocks 2022 + ShadowTLS v3、Trojan、Hysteria2、VLESS + REALITY、SOCKS5、HTTP / HTTPS。
+- **全能出站路由**：每个节点可独立指定出口方式，支持 Direct、AnyTLS、Shadowsocks、Shadowsocks 2022 + ShadowTLS v3、Trojan、Hysteria2、VLESS + REALITY、SOCKS5 / SOCKS5H、HTTP / HTTPS。
 - **主备出口健康切换与闭环管理**：支持每个节点独立配置主出口与多级备用出口，提供完整的路线查看、添加、删除指定项与一键清空管理；配置了备用出口的节点每轮检测主出口和所有备用代理，探测目标为 `http://www.gstatic.com/generate_204`，本轮完成后等待 5 秒。当前出口连续两次失败后按优先级切到可用备用出口；更高优先级的备用连续两次成功后主动切回，例如备用3切回恢复的备用2；主出口连续两次成功后优先切回主出口。未知检测结果会打断连续计数。只有显式添加 Direct 备用出口时才允许回退 Direct；未添加 Direct 时，代理出口全部不可用也会保持当前出口。清空备用出口后自动撤销选择器并停止监控服务。
 - **旧版配置自动迁移**：升级管理脚本后，首次运行面板、`status`、`start` 或 `restart` 会自动识别并补齐主备出口健康检测路由；没有备用出口的旧配置保持原有单出口行为。
-- **动态域名与证书联动与生命周期管理**：新增或修改节点时支持绑定不同域名。对于需要证书的协议（AnyTLS、Trojan、Hy2），系统会自动检测证书，未申请时可一键通过 Let's Encrypt（首选 DNSPod Token DNS-01 API、次选 Cloudflare DNS-01 API、Web 目录 Webroot 或独立 80 端口 Standalone）免开放端口签发证书；提供独立的证书管理菜单，支持一键扫描并清理废弃节点的无用证书与 Certbot 自动续签任务，避免无效续期与报错；Shadowsocks 与 VLESS REALITY 无需证书，开箱即用。
+- **动态域名与证书联动与生命周期管理**：新增或修改节点时支持绑定不同域名。对于需要证书的协议（AnyTLS、Trojan、Hy2），系统会自动检测证书，未申请时可一键通过 Let's Encrypt（首选 DNSPod Token DNS-01 API、次选 Cloudflare DNS-01 API、Web 目录 Webroot 或独立 80 端口 Standalone）免开放端口签发证书；提供独立的证书管理菜单，支持一键扫描并清理废弃节点的无用证书与 Certbot 自动续签任务，避免无效续期与报错；Shadowsocks、Shadowsocks 2022 + ShadowTLS v3 与 VLESS REALITY 无需本地证书，开箱即用。
 - **精准流量监控与配额管理**：
   - 基于内核级 **nftables** 进行端口流量双向/单向高精统计；
   - 支持设置月度流量限额（如 100GB、1TB、unlimited），超额后自动阻断端口；
@@ -103,6 +103,18 @@ sing-box 1.13 及以上的系统 DNS 使用 `prefer_go`，避免依赖不可用�
 sbox
 ```
 （支持直接输入 `sbox` 快速调出面板，普通用户运行时会自动调起 sudo）
+
+### Shadowsocks 2022 + ShadowTLS v3
+
+新增节点时选择 `Shadowsocks 2022 + ShadowTLS v3`，脚本会生成三层入站：公网 ShadowTLS v3 TCP、内部 Shadowsocks 2022 TCP，以及同端口的 Shadowsocks UDP。默认启用 ShadowTLS strict mode，握手域名默认使用 `www.microsoft.com:443`，可在创建或完整重配节点时修改；握手域名必须支持 TLS 1.3。
+
+客户端信息会同时输出 Surge、Loon 和 sing-box 配置。Surge / Loon 的 UDP 使用同端口原生 Shadowsocks UDP；sing-box 参考配置使用 UDP-over-TCP v2，经 ShadowTLS TCP 隧道传输。ShadowTLS 密码与 Shadowsocks 2022 密钥相互独立，请同时妥善保存。
+
+非交互安装示例：
+
+```bash
+sudo sbox install --non-interactive --protocol shadowsocks-shadowtls --domain proxy.example.com --port 443 --ss-method 2022-blake3-aes-128-gcm --password 'SS2022_BASE64_KEY' --shadowtls-password 'SHADOWTLS_PASSWORD' --shadowtls-server www.microsoft.com --shadowtls-port 443
+```
 
 
 ## Realm2 中转管理

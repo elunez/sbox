@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.44"
+readonly SCRIPT_VERSION="0.0.45"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -79,6 +79,10 @@ SS_SERVER=""
 SS_PORT=""
 SS_METHOD=""
 SS_PASSWORD=""
+SHADOWTLS_PASSWORD=""
+SHADOWTLS_SERVER=""
+SHADOWTLS_PORT=""
+SHADOWTLS_STRICT_MODE=""
 NODE_UUID=""
 REALITY_PRIVATE_KEY=""
 REALITY_PUBLIC_KEY=""
@@ -844,6 +848,10 @@ validate_ss_method() {
   esac
 }
 
+validate_ss2022_shadowtls_method() {
+  [[ "$1" == "2022-blake3-aes-128-gcm" || "$1" == "2022-blake3-aes-256-gcm" ]]
+}
+
 validate_ss_password() {
   local method=$1 password=$2 pattern
   local -a keys=()
@@ -1136,6 +1144,7 @@ protocol_label() {
   case "$1" in
     anytls) printf "AnyTLS" ;;
     shadowsocks) printf "Shadowsocks" ;;
+    shadowsocks-shadowtls) printf "Shadowsocks 2022 + ShadowTLS v3" ;;
     trojan) printf "Trojan" ;;
     hysteria2) printf "Hysteria2" ;;
     vless-reality) printf "VLESS + REALITY" ;;
@@ -1152,6 +1161,7 @@ choose_protocol() {
   prompt_choice "$target" "$title" "$default" \
     "anytls|AnyTLS" \
     "shadowsocks|Shadowsocks" \
+    "shadowsocks-shadowtls|Shadowsocks 2022 + ShadowTLS v3" \
     "trojan|Trojan" \
     "hysteria2|Hysteria2" \
     "vless-reality|VLESS + REALITY" \
@@ -1166,6 +1176,7 @@ choose_outbound_protocol() {
     "direct|Direct" \
     "anytls|AnyTLS" \
     "shadowsocks|Shadowsocks" \
+    "shadowsocks-shadowtls|Shadowsocks 2022 + ShadowTLS v3" \
     "trojan|Trojan" \
     "hysteria2|Hysteria2" \
     "vless-reality|VLESS + REALITY" \
@@ -1182,6 +1193,13 @@ choose_ss_method() {
     "aes-256-gcm|aes-256-gcm (传统标准)" \
     "aes-128-gcm|aes-128-gcm" \
     "chacha20-ietf-poly1305|chacha20-ietf-poly1305"
+}
+
+choose_ss2022_method() {
+  local default_method=${SS_METHOD:-2022-blake3-aes-128-gcm}
+  prompt_choice SS_METHOD "Shadowsocks 2022 加密方法" "$default_method" \
+    "2022-blake3-aes-128-gcm|2022-blake3-aes-128-gcm (推荐，16字节密钥)" \
+    "2022-blake3-aes-256-gcm|2022-blake3-aes-256-gcm (32字节密钥)"
 }
 
 parse_proxy_link() {
@@ -1334,13 +1352,23 @@ def parse(link):
         port = int(port or 8388)
         if not host or not method or not password:
             raise ValueError("Shadowsocks 链接缺少主机、加密方式或密码")
-        return {
+        result = {
             "type": "shadowsocks",
             "server": host,
             "port": port,
             "method": method.lower(),
             "password": password
         }
+        shadow_password = params.get("shadow-tls-password") or params.get("shadowtls-password") or ""
+        if shadow_password:
+            result["type"] = "shadowsocks-shadowtls"
+            result["shadowtls"] = {
+                "version": int(params.get("shadow-tls-version") or 3),
+                "password": shadow_password,
+                "server_name": params.get("shadow-tls-sni") or params.get("sni") or host,
+                "strict_mode": True
+            }
+        return result
 
     elif scheme in ("socks5", "socks"):
         host = u.hostname or ""
@@ -1421,12 +1449,18 @@ EOF_PY
   }
 
   case "$p_type" in
-    shadowsocks)
+    shadowsocks|shadowsocks-shadowtls)
       local ss_m ss_p
       ss_m=$(jq -r '.method' <<<"$parsed_json")
       ss_p=$(jq -r '.password' <<<"$parsed_json")
       validate_ss_method "$ss_m" || { warn "解析失败：Shadowsocks 加密方法不受支持 ($ss_m)。"; return 1; }
       validate_ss_password "$ss_m" "$ss_p" || { warn "解析失败：Shadowsocks 密码格式不符合 $ss_m 要求。"; return 1; }
+      if [[ "$p_type" == "shadowsocks-shadowtls" ]]; then
+        validate_ss2022_shadowtls_method "$ss_m" || { warn "解析失败：ShadowTLS 组合仅支持 Surge/Loon 兼容的 Shadowsocks 2022 AES 方法。"; return 1; }
+        [[ "$(jq -r '.shadowtls.version // 0' <<<"$parsed_json")" == "3" ]] || { warn "解析失败：仅支持 ShadowTLS v3。"; return 1; }
+        [[ -n "$(jq -r '.shadowtls.password // empty' <<<"$parsed_json")" ]] || { warn "解析失败：ShadowTLS 密码不能为空。"; return 1; }
+        validate_domain "$(jq -r '.shadowtls.server_name // empty' <<<"$parsed_json")" || { warn "解析失败：ShadowTLS SNI 必须为有效域名。"; return 1; }
+      fi
       ;;
     vless-reality)
       local v_uuid v_pbk
@@ -1448,8 +1482,11 @@ EOF_PY
   printf "  服务器地址: %s\n" "$p_server"
   printf "  连接端口:   %s\n" "$p_port"
   case "$p_type" in
-    shadowsocks)
+    shadowsocks|shadowsocks-shadowtls)
       printf "  加密方式:   %s\n" "$(jq -r '.method' <<<"$parsed_json")"
+      if [[ "$p_type" == "shadowsocks-shadowtls" ]]; then
+        printf "  ShadowTLS:  v3 / %s\n" "$(jq -r '.shadowtls.server_name' <<<"$parsed_json")"
+      fi
       ;;
     anytls|trojan|hysteria2)
       local s_sni
@@ -3422,6 +3459,37 @@ collect_ss_settings() {
   collect_ss_tfo_settings "$old" || return 1
 }
 
+collect_ss_shadowtls_settings() {
+  local old=${1:-'{}'} current_method default_pass
+  current_method=$(jq -r '.method // "2022-blake3-aes-128-gcm"' <<<"$old")
+  validate_ss2022_shadowtls_method "$current_method" || current_method="2022-blake3-aes-128-gcm"
+  SS_METHOD=${SS_METHOD:-$current_method}
+  if (( ! NON_INTERACTIVE )); then choose_ss2022_method || return 1; fi
+  validate_ss2022_shadowtls_method "$SS_METHOD" || die "ShadowTLS 组合仅支持 Surge/Loon 兼容的 Shadowsocks 2022 AES 方法。"
+  validate_ss_method "$SS_METHOD" || die "不支持的 Shadowsocks 2022 加密方法：${SS_METHOD}"
+
+  default_pass=$(jq -r '.password // empty' <<<"$old")
+  NODE_PASSWORD=${NODE_PASSWORD:-${default_pass:-$(generate_ss_password "$SS_METHOD")}}
+  prompt_secret NODE_PASSWORD "Shadowsocks 2022 密钥" "$NODE_PASSWORD"
+  validate_ss_password "$SS_METHOD" "$NODE_PASSWORD" || die "Shadowsocks 2022 密钥格式不匹配。"
+
+  SHADOWTLS_PASSWORD=${SHADOWTLS_PASSWORD:-$(jq -r '.shadowtls.password // empty' <<<"$old")}
+  SHADOWTLS_PASSWORD=${SHADOWTLS_PASSWORD:-$(random_password)}
+  prompt_secret SHADOWTLS_PASSWORD "ShadowTLS v3 密码" "$SHADOWTLS_PASSWORD"
+  [[ -n "$SHADOWTLS_PASSWORD" ]] || die "ShadowTLS v3 密码不能为空。"
+
+  SHADOWTLS_SERVER=${SHADOWTLS_SERVER:-$(jq -r '.shadowtls.server_name // .shadowtls.handshake_server // "www.microsoft.com"' <<<"$old")}
+  prompt_value SHADOWTLS_SERVER "ShadowTLS 握手域名 / SNI (需支持 TLS 1.3)" "$SHADOWTLS_SERVER"
+  validate_domain "$SHADOWTLS_SERVER" || die "ShadowTLS 握手域名必须为有效域名。"
+
+  SHADOWTLS_PORT=${SHADOWTLS_PORT:-$(jq -r '.shadowtls.handshake_port // 443' <<<"$old")}
+  prompt_value SHADOWTLS_PORT "ShadowTLS 握手服务器端口" "$SHADOWTLS_PORT"
+  validate_port "$SHADOWTLS_PORT" || die "ShadowTLS 握手服务器端口无效。"
+  SHADOWTLS_STRICT_MODE=$(jq -r '.shadowtls.strict_mode // true' <<<"$old")
+  [[ "$SHADOWTLS_STRICT_MODE" == "true" || "$SHADOWTLS_STRICT_MODE" == "false" ]] || SHADOWTLS_STRICT_MODE="true"
+  collect_ss_tfo_settings "$old" || return 1
+}
+
 collect_ss_tfo_settings() {
   local old=${1:-'{}'}
   SS_TFO=${SS_TFO:-$(jq -r '.tcp_fast_open // false' <<<"$old")}
@@ -3445,7 +3513,7 @@ warn_ss_tfo_support() {
 
 collect_ss_outbound_tfo_settings() {
   local tfo_json=$1 old_outbound=${2:-'{}'} tfo_target=$3 outbound_tfo
-  if [[ "$(jq -r '.type // "direct"' <<<"$tfo_json")" == "shadowsocks" ]]; then
+  if [[ "$(jq -r '.type // "direct"' <<<"$tfo_json")" =~ ^shadowsocks(-shadowtls)?$ ]]; then
     # 新出口默认关闭；编辑时保留该出口的已有设置，命令行参数可显式覆盖。
     outbound_tfo=${SS_OUTBOUND_TFO:-$(jq -r '.tcp_fast_open // false' <<<"$old_outbound")}
     [[ "$outbound_tfo" == "true" || "$outbound_tfo" == "false" ]] || die "SS 出站 TFO 必须为 true 或 false。"
@@ -3467,6 +3535,9 @@ collect_inbound_settings() {
       ;;
     shadowsocks)
       collect_ss_settings "$old" || return 1
+      ;;
+    shadowsocks-shadowtls)
+      collect_ss_shadowtls_settings "$old" || return 1
       ;;
     vless-reality)
       collect_reality_settings "$old"
@@ -3624,6 +3695,33 @@ collect_outbound_settings() {
         validate_ss_password "$ss_method" "$ss_password" || die "Shadowsocks 出口密码格式不匹配。"
         outbound_json=$(jq -cn --arg server "$ss_server" --argjson port "$ss_port" --arg method "$ss_method" --arg password "$ss_password" \
           '{type:"shadowsocks",server:$server,port:$port,method:$method,password:$password}')
+        ;;
+      shadowsocks-shadowtls)
+        local sst_server sst_port sst_method sst_password st_password st_sni
+        sst_server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
+        sst_port=$(jq -r '.outbound.port // "443"' <<<"${old:-"{}"}")
+        sst_method=$(jq -r '.outbound.method // "2022-blake3-aes-128-gcm"' <<<"${old:-"{}"}")
+        validate_ss2022_shadowtls_method "$sst_method" || sst_method="2022-blake3-aes-128-gcm"
+        sst_password=$(jq -r '.outbound.password // empty' <<<"${old:-"{}"}")
+        st_password=$(jq -r '.outbound.shadowtls.password // empty' <<<"${old:-"{}"}")
+        st_sni=$(jq -r '.outbound.shadowtls.server_name // empty' <<<"${old:-"{}"}")
+        prompt_value sst_server "出口 ShadowTLS 服务器地址" "$sst_server"
+        prompt_value sst_port "出口 ShadowTLS 端口" "$sst_port"
+        SS_METHOD="$sst_method"
+        if (( ! NON_INTERACTIVE )); then choose_ss2022_method || return 1; fi
+        sst_method="$SS_METHOD"
+        sst_password=${sst_password:-$(generate_ss_password "$sst_method")}
+        prompt_secret sst_password "出口 Shadowsocks 2022 密钥" "$sst_password"
+        st_password=${st_password:-$(random_password)}
+        prompt_secret st_password "出口 ShadowTLS v3 密码" "$st_password"
+        prompt_value st_sni "出口 ShadowTLS SNI" "${st_sni:-www.microsoft.com}"
+        validate_host "$sst_server" && validate_port "$sst_port" || die "Shadowsocks 2022 + ShadowTLS 出口地址无效。"
+        validate_ss2022_shadowtls_method "$sst_method" || die "ShadowTLS 组合仅支持 Surge/Loon 兼容的 Shadowsocks 2022 AES 方法。"
+        validate_ss_password "$sst_method" "$sst_password" || die "Shadowsocks 2022 出口密钥格式不匹配。"
+        [[ -n "$st_password" ]] && validate_domain "$st_sni" || die "ShadowTLS v3 密码或 SNI 无效。"
+        outbound_json=$(jq -cn --arg server "$sst_server" --argjson port "$sst_port" --arg method "$sst_method" \
+          --arg password "$sst_password" --arg st_password "$st_password" --arg st_sni "$st_sni" \
+          '{type:"shadowsocks-shadowtls",server:$server,port:$port,method:$method,password:$password,shadowtls:{version:3,password:$st_password,server_name:$st_sni,strict_mode:true}}')
         ;;
       anytls|trojan|hysteria2)
         local server port password server_name
@@ -3847,6 +3945,7 @@ collect_node_json() {
     case "$PROTOCOL" in
       anytls|trojan|vless-reality) default_port="443" ;;
       shadowsocks) default_port="8388" ;;
+      shadowsocks-shadowtls) default_port="443" ;;
       hysteria2) default_port="8443" ;;
       socks5) default_port="1080" ;;
       http)
@@ -3883,6 +3982,13 @@ collect_node_json() {
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
         --arg method "$SS_METHOD" --arg password "$NODE_PASSWORD" --argjson tfo "$SS_TFO" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
         '{name:$name,protocol:$protocol,domain:$domain,port:$port,method:$method,password:$password,tcp_fast_open:$tfo,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
+      ;;
+    shadowsocks-shadowtls)
+      node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
+        --arg method "$SS_METHOD" --arg password "$NODE_PASSWORD" --argjson tfo "$SS_TFO" \
+        --arg st_password "$SHADOWTLS_PASSWORD" --arg st_server "$SHADOWTLS_SERVER" --argjson st_port "$SHADOWTLS_PORT" --argjson st_strict "$SHADOWTLS_STRICT_MODE" \
+        --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,method:$method,password:$password,tcp_fast_open:$tfo,shadowtls:{version:3,password:$st_password,server_name:$st_server,handshake_server:$st_server,handshake_port:$st_port,strict_mode:$st_strict},traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     socks5)
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
@@ -4007,7 +4113,7 @@ node_count() {
 validate_outbound_config() {
   local outbound_json=$1 label=${2:-出口} outbound_type
   outbound_type=$(jq -r '.type // "direct"' <<<"$outbound_json")
-  [[ "$outbound_type" == "direct" || "$outbound_type" == "socks5" || "$outbound_type" == "socks" || "$outbound_type" == "http" || "$outbound_type" == "shadowsocks" || "$outbound_type" == "anytls" || "$outbound_type" == "vless-reality" || "$outbound_type" == "trojan" || "$outbound_type" == "hysteria2" ]] || die "不支持的${label}协议：$outbound_type"
+  [[ "$outbound_type" == "direct" || "$outbound_type" == "socks5" || "$outbound_type" == "socks" || "$outbound_type" == "http" || "$outbound_type" == "shadowsocks" || "$outbound_type" == "shadowsocks-shadowtls" || "$outbound_type" == "anytls" || "$outbound_type" == "vless-reality" || "$outbound_type" == "trojan" || "$outbound_type" == "hysteria2" ]] || die "不支持的${label}协议：$outbound_type"
   if [[ "$outbound_type" != "direct" ]]; then
     validate_host "$(jq -r '.server // empty' <<<"$outbound_json")" || die "${label}服务器地址无效。"
     validate_port "$(jq -r '.port // empty' <<<"$outbound_json")" || die "${label}端口无效。"
@@ -4017,6 +4123,16 @@ validate_outbound_config() {
       validate_ss_method "$(jq -r '.method // empty' <<<"$outbound_json")" || die "${label} Shadowsocks 加密方法无效。"
       validate_ss_password "$(jq -r '.method' <<<"$outbound_json")" "$(jq -r '.password // empty' <<<"$outbound_json")" || die "${label} Shadowsocks 密码格式不匹配。"
       jq -e '(has("tcp_fast_open") | not) or (.tcp_fast_open | type == "boolean")' <<<"$outbound_json" >/dev/null || die "${label} Shadowsocks tcp_fast_open 必须为布尔值。"
+      ;;
+    shadowsocks-shadowtls)
+      local outbound_method
+      outbound_method=$(jq -r '.method // empty' <<<"$outbound_json")
+      validate_ss2022_shadowtls_method "$outbound_method" || die "${label} ShadowTLS 组合仅支持 Surge/Loon 兼容的 Shadowsocks 2022 AES 方法。"
+      validate_ss_password "$outbound_method" "$(jq -r '.password // empty' <<<"$outbound_json")" || die "${label} Shadowsocks 2022 密钥格式不匹配。"
+      [[ "$(jq -r '.shadowtls.version // 0' <<<"$outbound_json")" == "3" ]] || die "${label}仅支持 ShadowTLS v3。"
+      [[ -n "$(jq -r '.shadowtls.password // empty' <<<"$outbound_json")" ]] || die "${label} ShadowTLS 密码不能为空。"
+      validate_domain "$(jq -r '.shadowtls.server_name // empty' <<<"$outbound_json")" || die "${label} ShadowTLS SNI 无效。"
+      jq -e '(has("tcp_fast_open") | not) or (.tcp_fast_open | type == "boolean")' <<<"$outbound_json" >/dev/null || die "${label} tcp_fast_open 必须为布尔值。"
       ;;
     vless-reality)
       validate_uuid "$(jq -r '.uuid // empty' <<<"$outbound_json")" || die "${label} VLESS UUID 无效。"
@@ -4030,7 +4146,7 @@ validate_outbound_config() {
 
 validate_nodes_state() {
   local state_file=$1 node protocol
-  jq -e '(.nodes|type=="array") and (if (.nodes|length > 0) then (([.nodes[].port]|length==(unique|length)) and all(.nodes[]; (.name|type=="string" and length>0) and (.port|type=="number" and floor==. and .>=1 and .<=65535) and (.protocol|IN("anytls","shadowsocks","vless-reality","trojan","hysteria2","socks5","http")) and (.traffic.monthly_limit|type=="string") and (.traffic.reset_day==null or (.traffic.reset_day|type=="number" and floor==. and .>=1 and .<=31)))) else true end)' "$state_file" >/dev/null 2>&1 || die "节点状态校验失败：请检查协议类型、名称、端口、流量配置是否存在冲突或非法值。"
+  jq -e '(.nodes|type=="array") and (if (.nodes|length > 0) then (([.nodes[].port]|length==(unique|length)) and all(.nodes[]; (.name|type=="string" and length>0) and (.port|type=="number" and floor==. and .>=1 and .<=65535) and (.protocol|IN("anytls","shadowsocks","shadowsocks-shadowtls","vless-reality","trojan","hysteria2","socks5","http")) and (.traffic.monthly_limit|type=="string") and (.traffic.reset_day==null or (.traffic.reset_day|type=="number" and floor==. and .>=1 and .<=31)))) else true end)' "$state_file" >/dev/null 2>&1 || die "节点状态校验失败：请检查协议类型、名称、端口、流量配置是否存在冲突或非法值。"
   jq -e 'all(.nodes[]?; ((.backup_outbounds // []) | type == "array") and all((.backup_outbounds // [])[]?; type == "object"))' "$state_file" >/dev/null 2>&1 || die "节点状态校验失败：备用出口列表格式无效。"
   jq -e 'all(.nodes[]?; (has("tcp_fast_open") | not) or (.tcp_fast_open | type == "boolean"))' "$state_file" >/dev/null 2>&1 || die "节点状态校验失败：tcp_fast_open 必须为布尔值。"
   while IFS= read -r node; do
@@ -4057,6 +4173,17 @@ validate_nodes_state() {
       shadowsocks)
         validate_ss_method "$(jq -r '.method // empty' <<<"$node")" || die "Shadowsocks 加密方法无效。"
         validate_ss_password "$(jq -r '.method' <<<"$node")" "$(jq -r '.password // empty' <<<"$node")" || die "Shadowsocks 密码格式不匹配。"
+        ;;
+      shadowsocks-shadowtls)
+        local combo_method
+        combo_method=$(jq -r '.method // empty' <<<"$node")
+        validate_ss2022_shadowtls_method "$combo_method" || die "ShadowTLS 组合仅支持 Surge/Loon 兼容的 Shadowsocks 2022 AES 方法。"
+        validate_ss_password "$combo_method" "$(jq -r '.password // empty' <<<"$node")" || die "Shadowsocks 2022 密钥格式不匹配。"
+        [[ "$(jq -r '.shadowtls.version // 0' <<<"$node")" == "3" ]] || die "仅支持 ShadowTLS v3。"
+        [[ -n "$(jq -r '.shadowtls.password // empty' <<<"$node")" ]] || die "ShadowTLS v3 密码不能为空。"
+        validate_domain "$(jq -r '.shadowtls.server_name // empty' <<<"$node")" || die "ShadowTLS SNI 无效。"
+        validate_host "$(jq -r '.shadowtls.handshake_server // empty' <<<"$node")" || die "ShadowTLS 握手服务器无效。"
+        validate_port "$(jq -r '.shadowtls.handshake_port // empty' <<<"$node")" || die "ShadowTLS 握手端口无效。"
         ;;
       socks5|http)
         local u_val p_val
@@ -4243,6 +4370,41 @@ generate_config_from_state() {
       else
         empty
       end;
+    def inbounds($n; $i):
+      if $n.protocol == "shadowsocks-shadowtls" then
+        [
+          {
+            type: "shadowtls",
+            tag: ("shadowtls-in-" + (($i + 1)|tostring)),
+            listen: "::",
+            listen_port: $n.port,
+            tcp_fast_open: ($n.tcp_fast_open // false),
+            detour: ("in-" + (($i + 1)|tostring)),
+            version: 3,
+            users: [{name: $n.name, password: $n.shadowtls.password}],
+            handshake: {
+              server: $n.shadowtls.handshake_server,
+              server_port: $n.shadowtls.handshake_port
+            },
+            strict_mode: ($n.shadowtls.strict_mode // true)
+          },
+          {
+            type: "shadowsocks",
+            tag: ("in-" + (($i + 1)|tostring)),
+            method: $n.method,
+            password: $n.password
+          },
+          {
+            type: "shadowsocks",
+            tag: ("in-udp-" + (($i + 1)|tostring)),
+            listen: "::",
+            listen_port: $n.port,
+            network: "udp",
+            method: $n.method,
+            password: $n.password
+          }
+        ]
+      else [inbound($n; $i)] end;
     def outbound($o; $i; $prefix):
       if $o.type == "direct" then
         {type: "direct", tag: ($prefix + "-" + (($i + 1)|tostring))}
@@ -4273,6 +4435,16 @@ generate_config_from_state() {
           method: $o.method,
           password: $o.password,
           tcp_fast_open: ($o.tcp_fast_open // false)
+        }
+      elif $o.type == "shadowsocks-shadowtls" then
+        {
+          type: "shadowsocks",
+          tag: ($prefix + "-" + (($i + 1)|tostring)),
+          method: $o.method,
+          password: $o.password,
+          tcp_fast_open: ($o.tcp_fast_open // false),
+          detour: ($prefix + "-" + (($i + 1)|tostring) + "-shadowtls"),
+          udp_over_tcp: {enabled: true, version: 2}
         }
       elif $o.type == "anytls" then
         {
@@ -4342,14 +4514,35 @@ generate_config_from_state() {
             else {tag:dns_tag(.value; .key),address:(if (.value.dns.server | contains(":")) then "udp://[" + .value.dns.server + "]:53" else "udp://" + .value.dns.server + ":53" end),detour:"direct"} end]
         ),
         rules: (if $dns_level >= 1 then [] else [$nodes | to_entries[] | .key as $i | .value as $n |
-          {inbound:["in-" + (($i + 1)|tostring)],server:dns_tag($n; $i)},
-          {outbound:(["out-" + (($i + 1)|tostring), "direct-" + (($i + 1)|tostring)] + [($n.backup_outbounds // []) | to_entries[] | select((.value.type // "direct") != "direct") | "backup-" + (($i + 1)|tostring) + "-" + ((.key + 1)|tostring)]),server:dns_tag($n; $i)}] end),
+          {inbound:(["in-" + (($i + 1)|tostring)] + (if $n.protocol == "shadowsocks-shadowtls" then ["in-udp-" + (($i + 1)|tostring)] else [] end)),server:dns_tag($n; $i)},
+          {outbound:(["out-" + (($i + 1)|tostring), "direct-" + (($i + 1)|tostring)]
+            + (if ($n.outbound.type // "direct") == "shadowsocks-shadowtls" then ["out-" + (($i + 1)|tostring) + "-shadowtls"] else [] end)
+            + [($n.backup_outbounds // []) | to_entries[] | select((.value.type // "direct") != "direct") | "backup-" + (($i + 1)|tostring) + "-" + ((.key + 1)|tostring)]
+            + [($n.backup_outbounds // []) | to_entries[] | select(.value.type == "shadowsocks-shadowtls") | "backup-" + (($i + 1)|tostring) + "-" + ((.key + 1)|tostring) + "-shadowtls"]),server:dns_tag($n; $i)}] end),
         final:"sbox-system"
       } + (if $dns_level < 3 then {independent_cache:true} else {} end)),
-      inbounds: ([$nodes | to_entries[] | inbound(.value; .key)]),
+      inbounds: ([$nodes | to_entries[] | inbounds(.value; .key)[]]),
       outbounds: (
         ([$nodes | to_entries[] | .value as $n | .key as $i | outbound($n.outbound; $i; "out") | with_dns($n; $i)])
+        + ([$nodes | to_entries[] | select(.value.outbound.type == "shadowsocks-shadowtls") | .value as $n | .key as $i | {
+            type: "shadowtls",
+            tag: ("out-" + (($i + 1)|tostring) + "-shadowtls"),
+            server: $n.outbound.server,
+            server_port: $n.outbound.port,
+            version: 3,
+            password: $n.outbound.shadowtls.password,
+            tls: {enabled: true, server_name: $n.outbound.shadowtls.server_name}
+          } | with_dns($n; $i)])
         + ([$nodes | to_entries[] | .key as $node_index | .value as $n | .value.backup_outbounds // [] | to_entries[] | select((.value.type // "direct") != "direct") | outbound(.value; .key; ("backup-" + (($node_index + 1)|tostring))) | with_dns($n; $node_index)])
+        + ([$nodes | to_entries[] | .key as $node_index | .value as $n | .value.backup_outbounds // [] | to_entries[] | select(.value.type == "shadowsocks-shadowtls") | .key as $backup_index | .value as $o | {
+            type: "shadowtls",
+            tag: ("backup-" + (($node_index + 1)|tostring) + "-" + (($backup_index + 1)|tostring) + "-shadowtls"),
+            server: $o.server,
+            server_port: $o.port,
+            version: 3,
+            password: $o.shadowtls.password,
+            tls: {enabled: true, server_name: $o.shadowtls.server_name}
+          } | with_dns($n; $node_index)])
         + ([$nodes | to_entries[] | select((.value.outbound.type // "direct") != "direct" and any((.value.backup_outbounds // [])[]?; (.type // "direct") == "direct")) | .value as $n | .key as $i | {type:"direct",tag:("direct-" + (($i + 1)|tostring))} | with_dns($n; $i)])
         + ([$nodes | to_entries[] | .key as $node_index | select((.value.outbound.type // "direct") != "direct" and ((.value.backup_outbounds // []) | length > 0)) | {
             type: "selector",
@@ -4362,7 +4555,7 @@ generate_config_from_state() {
       ),
       route: ({
         rules: ([$nodes | to_entries[] | {
-          inbound: [("in-" + ((.key + 1)|tostring))],
+          inbound: ([("in-" + ((.key + 1)|tostring))] + (if .value.protocol == "shadowsocks-shadowtls" then [("in-udp-" + ((.key + 1)|tostring))] else [] end)),
           action: "route",
           outbound: (if ((.value.outbound.type // "direct") == "direct" or ((.value.backup_outbounds // []) | length == 0)) then
             ("out-" + ((.key + 1)|tostring))
@@ -4929,6 +5122,10 @@ add_node_flow() {
   NODE_USERNAME=""
   HTTP_TLS="false"
   SS_TFO=""
+  SHADOWTLS_PASSWORD=""
+  SHADOWTLS_SERVER=""
+  SHADOWTLS_PORT=""
+  SHADOWTLS_STRICT_MODE=""
   echo
   info "添加新节点……"
   if ! collect_node_json '{}' node; then
@@ -4983,6 +5180,7 @@ format_node_outbound_summary() {
       fi
       ;;
     shadowsocks) summary="Shadowsocks 代理 (${o_server}:${o_port})" ;;
+    shadowsocks-shadowtls) summary="Shadowsocks 2022 + ShadowTLS v3 (${o_server}:${o_port})" ;;
     anytls) summary="AnyTLS 代理 (${o_server}:${o_port})" ;;
     trojan) summary="Trojan 代理 (${o_server}:${o_port})" ;;
     hysteria2) summary="Hysteria2 代理 (${o_server}:${o_port})" ;;
@@ -5013,6 +5211,12 @@ format_node_credential_summary() {
       local m
       m=$(jq -r '.method // empty' <<<"$node")
       echo "加密: ${m}, 密码: 已设置"
+      ;;
+    shadowsocks-shadowtls)
+      local combo_m combo_sni
+      combo_m=$(jq -r '.method // empty' <<<"$node")
+      combo_sni=$(jq -r '.shadowtls.server_name // empty' <<<"$node")
+      echo "加密: ${combo_m}, ShadowTLS v3: ${combo_sni}"
       ;;
     vless-reality)
       local u s
@@ -5148,6 +5352,7 @@ edit_node_protocol() {
   case "$new_proto" in
     anytls|trojan|vless-reality) default_rec_port="443" ;;
     shadowsocks) default_rec_port="8388" ;;
+    shadowsocks-shadowtls) default_rec_port="443" ;;
     hysteria2) default_rec_port="8443" ;;
     socks5) default_rec_port="1080" ;;
     http)
@@ -5187,6 +5392,7 @@ edit_node_protocol() {
   PROTOCOL="$new_proto"
   HTTP_TLS="$http_tls"
   local new_pw="" new_user="" new_ss_method="" new_uuid="" new_priv="" new_pub="" new_sid="" new_hs_server="" new_hs_port=443
+  local new_st_password="" new_st_server="" new_st_port=443 new_st_strict="true"
   case "$new_proto" in
     anytls|trojan|hysteria2)
       new_pw=$(jq -r '.password // empty' <<<"$old")
@@ -5204,6 +5410,20 @@ edit_node_protocol() {
       validate_ss_password "$new_ss_method" "$new_pw" || { warn "Shadowsocks 密码格式不匹配。"; return 0; }
       SS_TFO=""
       collect_ss_tfo_settings "$old" || return 0
+      ;;
+    shadowsocks-shadowtls)
+      SS_METHOD=""
+      NODE_PASSWORD=""
+      SHADOWTLS_PASSWORD=""
+      SHADOWTLS_SERVER=""
+      SHADOWTLS_PORT=""
+      collect_ss_shadowtls_settings "$old" || return 0
+      new_ss_method="$SS_METHOD"
+      new_pw="$NODE_PASSWORD"
+      new_st_password="$SHADOWTLS_PASSWORD"
+      new_st_server="$SHADOWTLS_SERVER"
+      new_st_port="$SHADOWTLS_PORT"
+      new_st_strict="$SHADOWTLS_STRICT_MODE"
       ;;
     vless-reality)
       NODE_UUID=$(jq -r '.uuid // empty' <<<"$old")
@@ -5265,6 +5485,13 @@ edit_node_protocol() {
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
         --arg method "$new_ss_method" --arg password "$new_pw" --argjson tfo "$SS_TFO" --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
         '{name:$name,protocol:$protocol,domain:$domain,port:$port,method:$method,password:$password,tcp_fast_open:$tfo,traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
+      ;;
+    shadowsocks-shadowtls)
+      new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
+        --arg method "$new_ss_method" --arg password "$new_pw" --argjson tfo "$SS_TFO" \
+        --arg st_password "$new_st_password" --arg st_server "$new_st_server" --argjson st_port "$new_st_port" --argjson st_strict "$new_st_strict" \
+        --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,method:$method,password:$password,tcp_fast_open:$tfo,shadowtls:{version:3,password:$st_password,server_name:$st_server,handshake_server:$st_server,handshake_port:$st_port,strict_mode:$st_strict},traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     socks5)
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
@@ -5413,6 +5640,31 @@ edit_node_credentials() {
         0|"") return 0 ;;
         *) warn "无效选择。"; return 0 ;;
       esac
+      ;;
+    shadowsocks-shadowtls)
+      local combo_old_m combo_new_m combo_ss_pw combo_st_pw combo_sni combo_hs_port
+      combo_old_m=$(jq -r '.method // "2022-blake3-aes-128-gcm"' <<<"$old")
+      SS_METHOD="$combo_old_m"
+      choose_ss2022_method || return 0
+      combo_new_m="$SS_METHOD"
+      combo_ss_pw=$(jq -r '.password // empty' <<<"$old")
+      if [[ "$combo_new_m" != "$combo_old_m" ]]; then
+        combo_ss_pw=$(generate_ss_password "$combo_new_m")
+      fi
+      prompt_value combo_ss_pw "Shadowsocks 2022 密钥（输入 rand 自动生成）" "$combo_ss_pw"
+      [[ "$combo_ss_pw" != "rand" ]] || combo_ss_pw=$(generate_ss_password "$combo_new_m")
+      validate_ss_password "$combo_new_m" "$combo_ss_pw" || { warn "Shadowsocks 2022 密钥格式不匹配。"; return 0; }
+      combo_st_pw=$(jq -r '.shadowtls.password // empty' <<<"$old")
+      prompt_value combo_st_pw "ShadowTLS v3 密码（输入 rand 自动生成）" "$combo_st_pw"
+      [[ "$combo_st_pw" != "rand" ]] || combo_st_pw=$(random_password)
+      [[ -n "$combo_st_pw" ]] || { warn "ShadowTLS v3 密码不能为空。"; return 0; }
+      combo_sni=$(jq -r '.shadowtls.server_name // "www.microsoft.com"' <<<"$old")
+      combo_hs_port=$(jq -r '.shadowtls.handshake_port // 443' <<<"$old")
+      prompt_value combo_sni "ShadowTLS 握手域名 / SNI" "$combo_sni"
+      prompt_value combo_hs_port "ShadowTLS 握手服务器端口" "$combo_hs_port"
+      validate_domain "$combo_sni" && validate_port "$combo_hs_port" || { warn "ShadowTLS 握手参数无效。"; return 0; }
+      new_node=$(jq -c --arg m "$combo_new_m" --arg p "$combo_ss_pw" --arg sp "$combo_st_pw" --arg sni "$combo_sni" --argjson hp "$combo_hs_port" \
+        '.method=$m | .password=$p | .shadowtls.version=3 | .shadowtls.password=$sp | .shadowtls.server_name=$sni | .shadowtls.handshake_server=$sni | .shadowtls.handshake_port=$hp' <<<"$old")
       ;;
     vless-reality)
       local cur_uuid cur_priv cur_pub cur_sid cur_server cur_port r_sub_choice="1"
@@ -5750,6 +6002,10 @@ edit_node_wizard() {
   OUTBOUND=""
   SS_METHOD=""
   SS_TFO=""
+  SHADOWTLS_PASSWORD=""
+  SHADOWTLS_SERVER=""
+  SHADOWTLS_PORT=""
+  SHADOWTLS_STRICT_MODE=""
 
   echo
   info "完整重新配置节点：$(jq -r '.name' <<<"$old")……"
@@ -6202,6 +6458,17 @@ generate_client_outbound_json() {
       jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg m "$m" --arg pw "$pw" \
         '{type:"shadowsocks",tag:$tag,server:$s,server_port:$p,method:$m,password:$pw}'
       ;;
+    shadowsocks-shadowtls)
+      local combo_m combo_pw combo_st_pw combo_sni combo_st_tag
+      combo_m=$(jq -r '.method' <<<"$node")
+      combo_pw=$(jq -r '.password' <<<"$node")
+      combo_st_pw=$(jq -r '.shadowtls.password' <<<"$node")
+      combo_sni=$(jq -r '.shadowtls.server_name' <<<"$node")
+      combo_st_tag="${name}-shadowtls"
+      jq -n --arg tag "$name" --arg st_tag "$combo_st_tag" --arg s "$domain" --argjson p "$port" \
+        --arg m "$combo_m" --arg pw "$combo_pw" --arg st_pw "$combo_st_pw" --arg sni "$combo_sni" \
+        '[{type:"shadowsocks",tag:$tag,method:$m,password:$pw,detour:$st_tag,udp_over_tcp:{enabled:true,version:2}},{type:"shadowtls",tag:$st_tag,server:$s,server_port:$p,version:3,password:$st_pw,tls:{enabled:true,server_name:$sni,utls:{enabled:true,fingerprint:"chrome"}}}]'
+      ;;
     trojan)
       local pw
       pw=$(jq -r '.password' <<<"$node")
@@ -6302,6 +6569,25 @@ show_client() {
         ss_b64=$(printf "%s:%s" "$method" "$pass" | base64 | tr -d "\n")
         printf "  分享链接: ss://%s@%s:%s#%s\n" "$ss_b64" "$domain" "$port" "$(printf "%s" "$name" | jq -sRr @uri)"
         ;;
+      shadowsocks-shadowtls)
+        method=$(jq -r '.method' <<<"$node")
+        pass=$(jq -r '.password' <<<"$node")
+        local st_pass st_sni combo_name_uri combo_ss_b64
+        st_pass=$(jq -r '.shadowtls.password' <<<"$node")
+        st_sni=$(jq -r '.shadowtls.server_name' <<<"$node")
+        combo_name_uri=$(printf "%s" "$name" | jq -sRr @uri)
+        combo_ss_b64=$(printf "%s:%s" "$method" "$pass" | base64 | tr '+/' '-_' | tr -d '=\n')
+        printf "  加密方式: %s\n" "$method"
+        printf "  SS 2022 密钥: %s\n" "$pass"
+        printf "  ShadowTLS v3 密码: %s\n" "$st_pass"
+        printf "  ShadowTLS SNI: %s\n" "$st_sni"
+        printf "  Surge 配置: %s = ss, %s, %s, encrypt-method=%s, password=%s, shadow-tls-password=%s, shadow-tls-version=3, shadow-tls-sni=%s, udp-relay=true, udp-port=%s\n" \
+          "$name" "$domain" "$port" "$method" "$pass" "$st_pass" "$st_sni" "$port"
+        printf "  Loon 配置:  %s = Shadowsocks,%s,%s,%s,\"%s\",shadow-tls-password=\"%s\",shadow-tls-sni=%s,shadow-tls-version=3,udp-port=%s,udp=true,block-quic=false\n" \
+          "$name" "$domain" "$port" "$method" "$pass" "$st_pass" "$st_sni" "$port"
+        printf "  通用链接: ss://%s@%s:%s?shadow-tls-password=%s&shadow-tls-version=3&shadow-tls-sni=%s&udp-port=%s#%s\n" \
+          "$combo_ss_b64" "$domain" "$port" "$(printf "%s" "$st_pass" | jq -sRr @uri)" "$st_sni" "$port" "$combo_name_uri"
+        ;;
       vless-reality)
         uuid=$(jq -r '.uuid' <<<"$node")
         pbk=$(jq -r '.reality.public_key' <<<"$node")
@@ -6372,7 +6658,13 @@ show_client() {
     [[ -n "$node" ]] || continue
     local ob
     ob=$(generate_client_outbound_json "$node")
-    [[ "$ob" != "{}" ]] && all_client_outbounds=$(jq --argjson item "$ob" '. + [$item]' <<<"$all_client_outbounds")
+    if [[ "$ob" != "{}" ]]; then
+      if jq -e 'type == "array"' <<<"$ob" >/dev/null 2>&1; then
+        all_client_outbounds=$(jq --argjson items "$ob" '. + $items' <<<"$all_client_outbounds")
+      else
+        all_client_outbounds=$(jq --argjson item "$ob" '. + [$item]' <<<"$all_client_outbounds")
+      fi
+    fi
   done < <(jq -c '.[]?' <<<"$nodes")
   jq . <<<"$all_client_outbounds" 2>/dev/null || echo "$all_client_outbounds"
   printf "%s====================================================================%s\n" "$C_CYAN" "$C_RESET"
@@ -8030,11 +8322,14 @@ usage() {
   sudo sbox --version               # 显示脚本版本
 
 常用参数：
-  --protocol PROTOCOL     协议类型 (anytls / shadowsocks / trojan / hysteria2 / vless-reality / socks5 / http)
+  --protocol PROTOCOL     协议类型 (anytls / shadowsocks / shadowsocks-shadowtls / trojan / hysteria2 / vless-reality / socks5 / http)
   --ss-tfo                Shadowsocks 入站开启 TCP Fast Open
   --no-ss-tfo             Shadowsocks 入站关闭 TCP Fast Open (默认)
   --ss-outbound-tfo       Shadowsocks 出站开启 TCP Fast Open
   --no-ss-outbound-tfo    Shadowsocks 出站关闭 TCP Fast Open (默认)
+  --shadowtls-password P  ShadowTLS v3 密码
+  --shadowtls-server HOST ShadowTLS 握手域名 / SNI (默认 www.microsoft.com)
+  --shadowtls-port PORT   ShadowTLS 握手服务器端口 (默认 443)
   --dns-mode MODE         节点 DNS 模式 (system / custom，默认 system)
   --dns-server IP         自定义 DNS 服务器 IP (UDP 53)
   --dns-strategy MODE     域名地址策略 (default / ipv4_only / prefer_ipv4 / ipv6_only / prefer_ipv6)
@@ -8044,7 +8339,7 @@ usage() {
   --cert-mode MODE        证书申请模式 (dnspod / cf / webroot / standalone)
   --email EMAIL           ACME 证书邮箱
   --webroot PATH          Web 根目录
-  --outbound TYPE         出口模式 (direct / socks5 / http / shadowsocks / anytls / vless-reality / trojan / hysteria2)
+  --outbound TYPE         出口模式 (direct / socks5 / http / shadowsocks / shadowsocks-shadowtls / anytls / vless-reality / trojan / hysteria2)
   --dnspod-token TOKEN    DNSPod Token (格式: ID,Token)
   --dnspod-token-id ID    DNSPod Token ID
   --dnspod-token-key KEY  DNSPod Token Key
@@ -8074,6 +8369,9 @@ parse_options() {
       --no-ss-tfo) SS_TFO="false"; shift;;
       --ss-outbound-tfo) SS_OUTBOUND_TFO="true"; shift;;
       --no-ss-outbound-tfo) SS_OUTBOUND_TFO="false"; shift;;
+      --shadowtls-password) [[ $# -ge 2 ]] || die "--shadowtls-password 缺少值"; SHADOWTLS_PASSWORD=$2; shift 2;;
+      --shadowtls-server) [[ $# -ge 2 ]] || die "--shadowtls-server 缺少值"; SHADOWTLS_SERVER=$2; shift 2;;
+      --shadowtls-port) [[ $# -ge 2 ]] || die "--shadowtls-port 缺少值"; SHADOWTLS_PORT=$2; shift 2;;
       --dns-mode) [[ $# -ge 2 ]] || die "--dns-mode 缺少值"; DNS_MODE=$2; [[ "$DNS_MODE" == "system" || "$DNS_MODE" == "custom" ]] || die "DNS 模式仅支持 system 或 custom。"; shift 2;;
       --dns-server) [[ $# -ge 2 ]] || die "--dns-server 缺少值"; DNS_SERVER=$2; shift 2;;
       --dns-strategy) [[ $# -ge 2 ]] || die "--dns-strategy 缺少值"; DNS_STRATEGY=$2; [[ "$DNS_STRATEGY" =~ ^(default|ipv4_only|prefer_ipv4|ipv6_only|prefer_ipv6)$ ]] || die "域名地址策略仅支持 default、ipv4_only、prefer_ipv4、ipv6_only、prefer_ipv6。"; shift 2;;
