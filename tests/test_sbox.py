@@ -839,8 +839,10 @@ echo "$imported"''')
         result = bash(f'''current_nodes_json() {{ echo {shlex.quote(json.dumps([node]))}; }}
 show_client''')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Surge 配置:", result.stdout)
-        self.assertIn("Loon 配置:", result.stdout)
+        self.assertIn("分享链接:", result.stdout)
+        self.assertNotIn("Clash 分享链接:", result.stdout)
+        self.assertNotIn("Surge 配置:", result.stdout)
+        self.assertNotIn("Loon 配置:", result.stdout)
 
     def test_shadowtls_combo_rejects_non_2022_and_missing_shadow_password(self):
         base = {"name": "bad", "protocol": "shadowsocks-shadowtls", "domain": "example.com", "port": 443,

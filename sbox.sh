@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.45"
+readonly SCRIPT_VERSION="0.0.46"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -6581,11 +6581,7 @@ show_client() {
         printf "  SS 2022 密钥: %s\n" "$pass"
         printf "  ShadowTLS v3 密码: %s\n" "$st_pass"
         printf "  ShadowTLS SNI: %s\n" "$st_sni"
-        printf "  Surge 配置: %s = ss, %s, %s, encrypt-method=%s, password=%s, shadow-tls-password=%s, shadow-tls-version=3, shadow-tls-sni=%s, udp-relay=true, udp-port=%s\n" \
-          "$name" "$domain" "$port" "$method" "$pass" "$st_pass" "$st_sni" "$port"
-        printf "  Loon 配置:  %s = Shadowsocks,%s,%s,%s,\"%s\",shadow-tls-password=\"%s\",shadow-tls-sni=%s,shadow-tls-version=3,udp-port=%s,udp=true,block-quic=false\n" \
-          "$name" "$domain" "$port" "$method" "$pass" "$st_pass" "$st_sni" "$port"
-        printf "  通用链接: ss://%s@%s:%s?shadow-tls-password=%s&shadow-tls-version=3&shadow-tls-sni=%s&udp-port=%s#%s\n" \
+        printf "  分享链接: ss://%s@%s:%s?shadow-tls-password=%s&shadow-tls-version=3&shadow-tls-sni=%s&udp-port=%s#%s\n" \
           "$combo_ss_b64" "$domain" "$port" "$(printf "%s" "$st_pass" | jq -sRr @uri)" "$st_sni" "$port" "$combo_name_uri"
         ;;
       vless-reality)

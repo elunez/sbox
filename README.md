@@ -108,7 +108,7 @@ sbox
 
 新增节点时选择 `Shadowsocks 2022 + ShadowTLS v3`，脚本会生成三层入站：公网 ShadowTLS v3 TCP、内部 Shadowsocks 2022 TCP，以及同端口的 Shadowsocks UDP。默认启用 ShadowTLS strict mode，握手域名默认使用 `www.microsoft.com:443`，可在创建或完整重配节点时修改；握手域名必须支持 TLS 1.3。
 
-客户端信息会同时输出 Surge、Loon 和 sing-box 配置。Surge / Loon 的 UDP 使用同端口原生 Shadowsocks UDP；sing-box 参考配置使用 UDP-over-TCP v2，经 ShadowTLS TCP 隧道传输。ShadowTLS 密码与 Shadowsocks 2022 密钥相互独立，请同时妥善保存。
+节点分享信息只输出一条分享链接；页面底部仍会提供 sing-box 参考出站配置，并通过 UDP-over-TCP v2 经 ShadowTLS TCP 隧道传输。ShadowTLS 密码与 Shadowsocks 2022 密钥相互独立，请同时妥善保存。
 
 非交互安装示例：
 
