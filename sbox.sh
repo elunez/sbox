@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.47"
+readonly SCRIPT_VERSION="0.0.48"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -87,7 +87,7 @@ NODE_UUID=""
 REALITY_PRIVATE_KEY=""
 REALITY_PUBLIC_KEY=""
 REALITY_SHORT_ID=""
-REALITY_HANDSHAKE_SERVER="www.microsoft.com"
+REALITY_HANDSHAKE_SERVER="www.iq.com"
 REALITY_HANDSHAKE_PORT="443"
 TRAFFIC_LIMIT=""
 TRAFFIC_RESET_DAY=""
@@ -1023,8 +1023,8 @@ generate_reality_keypair() {
   local out priv pub
   if command -v sing-box >/dev/null 2>&1; then
     out=$(sing-box generate reality-keypair 2>/dev/null || true)
-    priv=$(echo "$out" | awk "/PrivateKey:/{print $2}" | head -n1)
-    pub=$(echo "$out" | awk "/PublicKey:/{print $2}" | head -n1)
+    priv=$(echo "$out" | awk '/PrivateKey:/{print $2}' | head -n1)
+    pub=$(echo "$out" | awk '/PublicKey:/{print $2}' | head -n1)
     if [[ -n "$priv" && -n "$pub" ]]; then
       printf "%s %s" "$priv" "$pub"
       return 0
@@ -3503,7 +3503,7 @@ collect_reality_settings() {
   REALITY_PRIVATE_KEY=$(jq -r '.reality.private_key // empty' <<<"${old:-"{}"}")
   REALITY_PUBLIC_KEY=$(jq -r '.reality.public_key // empty' <<<"${old:-"{}"}")
   REALITY_SHORT_ID=$(jq -r '.reality.short_id // empty' <<<"${old:-"{}"}")
-  REALITY_HANDSHAKE_SERVER=$(jq -r '.reality.handshake_server // "www.microsoft.com"' <<<"${old:-"{}"}")
+  REALITY_HANDSHAKE_SERVER=$(jq -r '.reality.handshake_server // "www.iq.com"' <<<"${old:-"{}"}")
   REALITY_HANDSHAKE_PORT=$(jq -r '.reality.handshake_port // 443' <<<"${old:-"{}"}")
   if [[ -z "$REALITY_PRIVATE_KEY" || -z "$REALITY_PUBLIC_KEY" ]]; then
     keypair=$(generate_reality_keypair)
@@ -3827,7 +3827,7 @@ collect_outbound_settings() {
         server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
         port=$(jq -r '.outbound.port // "443"' <<<"${old:-"{}"}")
         uuid=$(jq -r '.outbound.uuid // empty' <<<"${old:-"{}"}")
-        server_name=$(jq -r '.outbound.server_name // "www.microsoft.com"' <<<"${old:-"{}"}")
+        server_name=$(jq -r '.outbound.server_name // "www.iq.com"' <<<"${old:-"{}"}")
         public_key=$(jq -r '.outbound.public_key // empty' <<<"${old:-"{}"}")
         short_id=$(jq -r '.outbound.short_id // empty' <<<"${old:-"{}"}")
         prompt_value server "出口服务器地址" "$server"
@@ -5306,7 +5306,7 @@ format_node_credential_summary() {
     vless-reality)
       local u s
       u=$(jq -r '.uuid // empty' <<<"$node")
-      s=$(jq -r '.reality.handshake_server // "www.microsoft.com"' <<<"$node")
+      s=$(jq -r '.reality.handshake_server // "www.iq.com"' <<<"$node")
       echo "UUID: ${u:0:8}..., 伪装: ${s}"
       ;;
     socks5)
@@ -5515,7 +5515,7 @@ edit_node_protocol() {
       REALITY_PRIVATE_KEY=$(jq -r '.reality.private_key // empty' <<<"$old")
       REALITY_PUBLIC_KEY=$(jq -r '.reality.public_key // empty' <<<"$old")
       REALITY_SHORT_ID=$(jq -r '.reality.short_id // empty' <<<"$old")
-      REALITY_HANDSHAKE_SERVER=$(jq -r '.reality.handshake_server // "www.microsoft.com"' <<<"$old")
+      REALITY_HANDSHAKE_SERVER=$(jq -r '.reality.handshake_server // "www.iq.com"' <<<"$old")
       REALITY_HANDSHAKE_PORT=$(jq -r '.reality.handshake_port // 443' <<<"$old")
       collect_reality_settings "$old" || return 0
       new_uuid="$NODE_UUID"
@@ -5757,7 +5757,7 @@ edit_node_credentials() {
       cur_priv=$(jq -r '.reality.private_key // empty' <<<"$old")
       cur_pub=$(jq -r '.reality.public_key // empty' <<<"$old")
       cur_sid=$(jq -r '.reality.short_id // empty' <<<"$old")
-      cur_server=$(jq -r '.reality.handshake_server // "www.microsoft.com"' <<<"$old")
+      cur_server=$(jq -r '.reality.handshake_server // "www.iq.com"' <<<"$old")
       cur_port=$(jq -r '.reality.handshake_port // 443' <<<"$old")
       echo
       printf "%s=== VLESS + REALITY 凭据修改 ===%s\n" "$C_CYAN" "$C_RESET"

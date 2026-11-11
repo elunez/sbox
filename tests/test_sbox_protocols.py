@@ -36,6 +36,74 @@ def nodes():
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_reality_keypair_parsing_without_positional_arguments(self):
+        result = bash('''sing-box() {
+  [[ "$*" == "generate reality-keypair" ]] || return 99
+  printf '%s\\n' 'PrivateKey: test-private' 'PublicKey: test-public'
+}
+generate_reality_keypair''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "test-private test-public")
+        self.assertEqual(result.stderr, "")
+
+    def test_reality_settings_default_and_existing_handshake_domain(self):
+        for server in (None, "www.microsoft.com", "www.example.com"):
+            with self.subTest(server=server):
+                old = {"uuid": "11111111-1111-4111-8111-111111111111",
+                       "reality": {"private_key": "test-private", "public_key": "test-public",
+                                   "short_id": "abcd", "handshake_port": 8443}}
+                if server is not None:
+                    old["reality"]["handshake_server"] = server
+                result = bash(f'''NON_INTERACTIVE=1
+collect_reality_settings {shlex.quote(json.dumps(old))}
+printf '%s\\n' "$NODE_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PUBLIC_KEY" "$REALITY_SHORT_ID" "$REALITY_HANDSHAKE_SERVER" "$REALITY_HANDSHAKE_PORT"''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), [old["uuid"], "test-private", "test-public",
+                                                              "abcd", server or "www.iq.com", "8443"])
+
+    def test_switch_anytls_to_reality_generates_keys_and_keeps_node_settings(self):
+        original = nodes()[:2]
+        original[1]["port"] += 1
+        original[0]["dns"] = {"mode": "custom", "server": "8.8.8.8"}
+        original[0]["backup_outbounds"] = [{"type": "direct"}]
+        with tempfile.TemporaryDirectory() as directory:
+            saved_file = Path(directory) / "nodes.json"
+            inputs = "6\n" + "\n" * 7
+            result = bash(f'''current_nodes_json() {{ printf '%s\\n' {shlex.quote(json.dumps(original))}; }}
+sing-box() {{ printf '%s\\n' 'PrivateKey: test-private' 'PublicKey: test-public'; }}
+ensure_node_certificate() {{ return 0; }}
+firewall_remove_port() {{ :; }}
+save_nodes_json() {{ printf '%s\\n' "$1" > {shlex.quote(str(saved_file))}; }}
+edit_node_protocol 0 <<< {shlex.quote(inputs)}''')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("unbound variable", result.stderr)
+            self.assertNotIn("[警告]", result.stderr)
+            saved = json.loads(saved_file.read_text())
+        node = saved[0]
+        self.assertEqual(node["protocol"], "vless-reality")
+        self.assertEqual(node["reality"]["private_key"], "test-private")
+        self.assertEqual(node["reality"]["public_key"], "test-public")
+        self.assertEqual(node["reality"]["handshake_server"], "www.iq.com")
+        self.assertEqual(node["reality"]["handshake_port"], 443)
+        for key in ("name", "domain", "port", "dns", "traffic", "outbound", "backup_outbounds"):
+            self.assertEqual(node[key], original[0][key], key)
+        self.assertEqual(saved[1], original[1])
+
+    def test_reality_outbound_default_and_existing_sni(self):
+        for server in (None, "www.microsoft.com"):
+            with self.subTest(server=server):
+                outbound = {"type": "vless-reality", "server": "proxy.example.com", "port": 443,
+                            "uuid": "11111111-1111-4111-8111-111111111111",
+                            "public_key": "test-public", "short_id": "abcd"}
+                if server is not None:
+                    outbound["server_name"] = server
+                result = bash(f'''NON_INTERACTIVE=1
+OUTBOUND=vless-reality
+collect_outbound_settings {shlex.quote(json.dumps({"outbound": outbound}))} result
+printf '%s\\n' "$result"''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {**outbound, "server_name": server or "www.iq.com"})
+
     def test_script_update_rejects_older_or_invalid_versions_before_install(self):
         for version, status in [("0.0.1", 0), ("invalid", 1)]:
             with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:

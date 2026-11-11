@@ -26,7 +26,7 @@
 ## 控制面板布局
 
 ```text
-  Sbox · Sing-box 节点管理 v0.0.47
+  Sbox · Sing-box 节点管理 v0.0.48
 ------------------------------------
   0. 退出脚本
 ------------------------------------
@@ -61,7 +61,7 @@
 3. `cf` 模式通过 Cloudflare API（支持 API Token 或 Global Key + 邮箱）自动查询 Zone 并添加 TXT 记录，无需占用 80 端口；
 4. `webroot` 模式复用现有 Nginx / Apache 等 Web 根目录；
 5. `standalone` 模式临时监听 TCP 80 端口，适合未安装网站环境的机器；
-4. VLESS REALITY 协议使用真实知名域名（默认 `www.microsoft.com`）伪装 SNI 握手，无需本地签发证书。
+4. VLESS REALITY 协议使用真实网站域名（默认 `www.iq.com`）伪装 SNI 握手，无需本地签发证书；已有节点保存的握手域名会保留。
 
 ## 快速安装与使用
 
