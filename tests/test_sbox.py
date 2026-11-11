@@ -3,6 +3,7 @@ import concurrent.futures
 import base64
 import contextlib
 import io
+import hashlib
 import json
 import os
 import pty
@@ -1299,7 +1300,7 @@ sync_outbound_health_service''', env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["重启"])
 
-    def installation(self, archive_content, extra=""):
+    def installation(self, archive_content, extra="", alpine=False, config=None):
         install_dir = self.directory / "install"
         link_dir = self.directory / "links"
         install_dir.mkdir()
@@ -1307,8 +1308,9 @@ sync_outbound_health_service''', env=env)
         old = install_dir / "sing-box"
         old.write_text("old core")
         archive = self.directory / "core.tar.gz"
+        package = "sing-box-1.14.2-linux-amd64" + ("-musl" if alpine else "")
         with tarfile.open(archive, "w:gz") as fh:
-            for name, content in (("sing-box-1.14.2-linux-amd64/sing-box", archive_content),
+            for name, content in ((package + "/sing-box", archive_content),
                                   ("sing-box-1.14.2-linux-amd64/LICENSE", b"unused" * 10000)):
                 entry = tarfile.TarInfo(name)
                 entry.size = len(content)
@@ -1316,12 +1318,21 @@ sync_outbound_health_service''', env=env)
         start = SOURCE.index("install_singbox_binary() (")
         end = SOURCE.index("\napt_get_minimal()", start)
         function = SOURCE[start:end].replace("/usr/local/bin", str(install_dir)).replace("/usr/bin", str(link_dir))
+        metadata = self.directory / "release.json"
+        metadata.write_text(json.dumps({"tag_name": "v1.14.2", "assets": [{
+            "name": package + ".tar.gz",
+            "digest": "sha256:" + hashlib.sha256(archive.read_bytes()).hexdigest(),
+        }]}))
         code = function + f'''\nuname() {{ echo x86_64; }}
-curl() {{ cat {shlex.quote(str(archive))}; }}
+OS_ID={"alpine" if alpine else "debian"}
+archive_curl() {{ cat {shlex.quote(str(archive))}; }}
+curl() {{
+  if [[ "$*" == *api.github.com* ]]; then cat {shlex.quote(str(metadata))}; else archive_curl "$@"; fi
+}}
 ensure_service_file() {{ :; }}
 {extra}
 install_singbox_binary 1.14.2'''
-        result = bash(code)
+        result = bash(code, env=dict(os.environ, CONFIG_FILE=str(config or self.directory / "absent.json")))
         self.assertEqual(list(install_dir.glob(".sing-box.*")), [])
         self.assertEqual(sorted(path.name for path in install_dir.iterdir()), ["sing-box"])
         return result, old
@@ -1334,7 +1345,7 @@ install_singbox_binary 1.14.2'''
     def test_download_fallback_uses_fresh_stream_and_longer_timeout(self):
         log = self.directory / "downloads"
         archive = shlex.quote(str(self.directory / "core.tar.gz"))
-        extra = f'''curl() {{
+        extra = f'''archive_curl() {{
   printf '%s\\n' "$*" >> {shlex.quote(str(log))}
   if [[ "$*" == *gh.zyun.vip* ]]; then head -c 30 {archive}; return 28; fi
   cat {archive}
@@ -1354,7 +1365,7 @@ install_singbox_binary 1.14.2'''
         archive = shlex.quote(str(self.directory / "core.tar.gz"))
         extra = f'''SBOX_DOWNLOAD_MIRROR=https://mirror.example/
 SBOX_DOWNLOAD_TIMEOUT=1200
-curl() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; cat {archive}; }}'''
+archive_curl() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; cat {archive}; }}'''
         result, _ = self.installation(b"#!/bin/sh\necho 'sing-box version 1.14.2'\n", extra)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = log.read_text().splitlines()
@@ -1368,7 +1379,7 @@ curl() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; cat {archive}; }}'''
         self.assertEqual(core.read_text(), "old core")
 
     def test_download_failure_even_after_complete_payload_keeps_old_binary(self):
-        result, core = self.installation(b"#!/bin/sh\necho version\n", "curl() { command cat " + shlex.quote(str(self.directory / "core.tar.gz")) + "; return 23; }")
+        result, core = self.installation(b"#!/bin/sh\necho version\n", "archive_curl() { command cat " + shlex.quote(str(self.directory / "core.tar.gz")) + "; return 23; }")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(core.read_text(), "old core")
 
@@ -1378,7 +1389,33 @@ curl() {{ printf '%s\\n' "$*" >> {shlex.quote(str(log))}; cat {archive}; }}'''
         self.assertEqual(core.read_text(), "old core")
 
     def test_corrupt_archive_keeps_old_binary(self):
-        result, core = self.installation(b"#!/bin/sh\necho version\n", 'curl() { printf "corrupt archive"; }')
+        result, core = self.installation(b"#!/bin/sh\necho version\n", 'archive_curl() { printf "corrupt archive"; }')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(core.read_text(), "old core")
+
+    def test_install_selects_official_musl_archive_on_alpine(self):
+        result, core = self.installation(b"#!/bin/sh\necho 'sing-box version 1.14.2'\n", alpine=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("linux-amd64-musl", result.stdout)
+
+    def test_checksum_mismatch_never_executes_new_binary(self):
+        marker = self.directory / "executed"
+        binary = f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\necho 'sing-box version 1.14.2'\n".encode()
+        extra = 'curl() { if [[ "$*" == *api.github.com* ]]; then printf \'%s\' \'{"tag_name":"v1.14.2","assets":[{"name":"sing-box-1.14.2-linux-amd64.tar.gz","digest":"sha256:' + "0" * 64 + '\"}]}\'; else archive_curl "$@"; fi; }'
+        result, core = self.installation(binary, extra)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(core.read_text(), "old core")
+        self.assertFalse(marker.exists())
+
+    def test_incompatible_config_keeps_old_core(self):
+        config = self.directory / "existing.json"
+        config.write_text("{}")
+        result, core = self.installation(b'#!/bin/sh\n[ "$1" != check ] || exit 1\necho "sing-box version 1.14.2"\n', config=config)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(core.read_text(), "old core")
+
+    def test_wrong_version_keeps_old_core(self):
+        result, core = self.installation(b'#!/bin/sh\necho "sing-box version 9.9.9"\n')
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(core.read_text(), "old core")
 

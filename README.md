@@ -26,7 +26,7 @@
 ## 控制面板布局
 
 ```text
-  Sbox · Sing-box 节点管理 v0.0.22
+  Sbox · Sing-box 节点管理 v0.0.47
 ------------------------------------
   0. 退出脚本
 ------------------------------------
@@ -77,7 +77,11 @@ sudo apt-get update && sudo apt-get install -y curl
 curl -fsSLO https://raw.githubusercontent.com/elunez/sbox/main/sbox.sh && chmod +x sbox.sh && sudo ./sbox.sh
 ```
 
-核心采用流式下载，只解压二进制到 `/usr/local/bin` 的临时文件，不落盘压缩包和完整解压目录，避免容量受限的 `/tmp`（tmpfs）导致安装失败。新核心校验可执行后直接替换旧文件；失败或正常退出时清理临时文件。请确保目标分区仍有足够空间存放一个新核心。首次安装保留完整依赖列表；更新核心时仅补齐缺失依赖，依赖齐全则跳过包管理器，核心只下载一次。APT 安装会减少索引和缓存占用；DNF/YUM 安装后不保留下载包缓存。
+核心采用流式下载，只解压二进制到 `/usr/local/bin` 的临时文件，不落盘压缩包和完整解压目录，避免容量受限的 `/tmp`（tmpfs）导致安装失败。压缩流先按 GitHub 官方发行元数据中的 SHA-256 校验，再检查核心版本与现有配置兼容性；检查通过后才替换旧文件。官方元数据或校验信息不可用时停止安装，不回退到未经校验的下载。Alpine 使用官方原生 musl 构建，不再为核心安装 `gcompat`，也不切换系统软件源。
+
+更新核心时临时保留旧文件；原服务运行中则重启并检查状态，失败时恢复旧核心并尝试重新启动。原服务已停止时保持停止状态。回滚备份优先使用同分区硬链接，目标分区仍需有空间存放一个新核心。首次安装保留完整依赖列表；更新核心时仅补齐缺失依赖，依赖齐全则跳过包管理器。APT 安装会减少索引和缓存占用；DNF/YUM 安装后不保留下载包缓存。
+
+Alpine 的 OpenRC 服务使用 `supervise-daemon` 监护 sing-box，异常退出后延迟 5 秒恢复，60 秒内最多重试 5 次，避免持续启动失败时无限循环。此机制适用于全部协议，不需要用定时重启代替异常恢复。脚本自更新会拒绝低于当前版本的下载内容，避免镜像缓存导致降级。
 
 APT 下载失败的文件最多重试 3 次，HTTP/HTTPS 连接或数据等待超时为 30 秒；持续传输的慢速下载不受 30 秒总时长限制。参数只用于脚本本次 APT 调用，不修改系统软件源或全局 APT 配置。重试耗尽仍会报错并停止安装，不跳过失败的依赖，也不重复整个安装事务。
 
@@ -109,6 +113,8 @@ sbox
 新增节点时选择 `Shadowsocks 2022 + ShadowTLS v3`，脚本会生成三层入站：公网 ShadowTLS v3 TCP、内部 Shadowsocks 2022 TCP，以及同端口的 Shadowsocks UDP。默认启用 ShadowTLS strict mode，握手域名默认使用 `www.microsoft.com:443`，可在创建或完整重配节点时修改；握手域名必须支持 TLS 1.3。
 
 节点分享信息只输出一条分享链接；页面底部仍会提供 sing-box 参考出站配置，并通过 UDP-over-TCP v2 经 ShadowTLS TCP 隧道传输。ShadowTLS 密码与 Shadowsocks 2022 密钥相互独立，请同时妥善保存。
+
+所有协议的分享链接统一处理 IPv6 地址及名称、用户名、密码中的特殊字符；Trojan 和 Hysteria2 的参考出站配置使用各自节点密码。导入链接时，脚本不支持的传输方式、ShadowSocks 插件、Hy2 混淆或跳过证书验证参数会明确报错，避免静默丢弃参数后保存成无法连接的节点。ShadowTLS 分享链接继续使用独立查询参数格式。
 
 非交互安装示例：
 
@@ -431,3 +437,12 @@ journalctl -u sbox-outbound-monitor.service -f
 - 流量重置历史审计日志：`/etc/sbox/traffic_reset.log`
 - 配置备份归档目录：`/etc/sbox/backups/`
 - 系统服务单元：`/etc/systemd/system/sing-box.service` 与 `/etc/systemd/system/sbox-outbound-monitor.service`（Systemd），或对应的 `/etc/init.d/` 服务（OpenRC）
+
+## 本地回归检查
+
+以下检查使用临时目录和模拟下载、服务，不安装依赖，不访问网络或真实服务器配置：
+
+```bash
+bash -n sbox.sh
+python3 -m unittest discover -s tests -p 'test_sbox*.py'
+```

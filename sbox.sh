@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.46"
+readonly SCRIPT_VERSION="0.0.47"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -1217,11 +1217,10 @@ def decode_b64(s):
     missing = len(s) % 4
     if missing:
         s += "=" * (4 - missing)
-    for fn in (base64.urlsafe_b64decode, base64.b64decode):
-        try:
-            return fn(s.encode()).decode("utf-8", errors="ignore")
-        except Exception:
-            pass
+    try:
+        return base64.b64decode(s.encode(), altchars=b"-_", validate=True).decode("utf-8")
+    except (ValueError, UnicodeError):
+        pass
     return ""
 
 def parse(link):
@@ -1230,12 +1229,26 @@ def parse(link):
         raise ValueError("链接为空")
     u = urllib.parse.urlsplit(link)
     scheme = u.scheme.lower()
-    params = dict(urllib.parse.parse_qsl(u.query))
+    pairs = urllib.parse.parse_qsl(u.query, keep_blank_values=True)
+    if len({key for key, _ in pairs}) != len(pairs):
+        raise ValueError("分享链接包含重复参数")
+    params = dict(pairs)
+    for key in ("insecure", "allowInsecure", "skip-cert-verify"):
+        if params.get(key, "0").lower() not in ("0", "false", ""):
+            raise ValueError("暂不支持跳过证书验证的出口，请使用可信证书")
+    if scheme in ("anytls", "trojan", "http", "https"):
+        if params.get("type", "tcp") not in ("tcp", "") or params.get("security", "tls") not in ("tls", ""):
+            raise ValueError("该出口仅支持普通 TCP/TLS，不支持 REALITY、WS 或 gRPC")
+    if scheme in ("hy2", "hysteria2") and any(params.get(key) for key in ("obfs", "obfs-password", "obfsParam", "mport", "ports")):
+        raise ValueError("暂不支持 Hysteria2 混淆或端口跳跃，请使用单端口链接")
+
+    def get_port(default):
+        return u.port if u.port is not None else default
 
     if scheme in ("anytls",):
         password = urllib.parse.unquote(u.username or "")
         host = u.hostname or ""
-        port = int(u.port or 443)
+        port = get_port(443)
         sni = params.get("sni") or params.get("peer") or host
         if not host or not password:
             raise ValueError("AnyTLS 链接缺少主机或认证密码")
@@ -1250,7 +1263,7 @@ def parse(link):
     elif scheme in ("hy2", "hysteria2"):
         password = urllib.parse.unquote(u.username or "")
         host = u.hostname or ""
-        port = int(u.port or 443)
+        port = get_port(443)
         sni = params.get("sni") or params.get("peer") or host
         if not host or not password:
             raise ValueError("Hysteria2 链接缺少主机或认证密码")
@@ -1265,7 +1278,7 @@ def parse(link):
     elif scheme in ("trojan",):
         password = urllib.parse.unquote(u.username or "")
         host = u.hostname or ""
-        port = int(u.port or 443)
+        port = get_port(443)
         sni = params.get("sni") or params.get("peer") or host
         if not host or not password:
             raise ValueError("Trojan 链接缺少主机或密码")
@@ -1284,7 +1297,7 @@ def parse(link):
         params = dict(pairs)
         uuid = urllib.parse.unquote(u.username or "")
         host = u.hostname or ""
-        port = int(u.port or 443)
+        port = get_port(443)
         sni = params.get("sni") or host
         pbk = params.get("pbk") or params.get("public_key") or ""
         sid = params.get("sid") or params.get("short_id") or ""
@@ -1315,41 +1328,20 @@ def parse(link):
 
     elif scheme in ("ss",):
         raw_netloc = u.netloc
-        host = u.hostname or ""
-        port = u.port
-        userinfo = u.username or ""
-        method = ""
-        password = ""
-
-        if ("@" not in raw_netloc) and raw_netloc:
-            decoded = decode_b64(raw_netloc)
-            if "@" in decoded:
-                userpart, hostpart = decoded.rsplit("@", 1)
-                if ":" in userpart:
-                    method, password = userpart.split(":", 1)
-                if ":" in hostpart:
-                    host, port_str = hostpart.split(":", 1)
-                    try:
-                        port = int(port_str)
-                    except ValueError:
-                        port = 8388
-                else:
-                    host = hostpart
-                    port = 8388
-
-        if not method and userinfo:
-            decoded = decode_b64(userinfo)
-            if ":" in decoded:
-                method, password = decoded.split(":", 1)
-            elif ":" in userinfo:
-                method, password = userinfo.split(":", 1)
-            else:
-                password = decoded or userinfo
-
-        if not password and u.password:
-            password = u.password
-
-        port = int(port or 8388)
+        if "@" not in raw_netloc:
+            userpart, hostpart = decode_b64(raw_netloc).rsplit("@", 1)
+            endpoint = urllib.parse.urlsplit("ss://" + hostpart)
+            host = endpoint.hostname or ""
+            port = endpoint.port if endpoint.port is not None else 8388
+        else:
+            userpart = raw_netloc.rsplit("@", 1)[0]
+            userpart = (urllib.parse.unquote(userpart) if ":" in userpart
+                        else decode_b64(urllib.parse.unquote(userpart)))
+            host = u.hostname or ""
+            port = get_port(8388)
+        method, password = userpart.split(":", 1)
+        if params.get("plugin"):
+            raise ValueError("暂不支持 SIP002 插件参数，请使用独立 ShadowTLS 参数；不会降级为普通 SS")
         if not host or not method or not password:
             raise ValueError("Shadowsocks 链接缺少主机、加密方式或密码")
         result = {
@@ -1360,7 +1352,9 @@ def parse(link):
             "password": password
         }
         shadow_password = params.get("shadow-tls-password") or params.get("shadowtls-password") or ""
-        if shadow_password:
+        if any(key in params for key in ("shadow-tls-password", "shadowtls-password", "shadow-tls-version", "shadow-tls-sni")):
+            if not shadow_password:
+                raise ValueError("ShadowTLS 缺少独立密码")
             result["type"] = "shadowsocks-shadowtls"
             result["shadowtls"] = {
                 "version": int(params.get("shadow-tls-version") or 3),
@@ -1372,7 +1366,7 @@ def parse(link):
 
     elif scheme in ("socks5", "socks"):
         host = u.hostname or ""
-        port = int(u.port or 1080)
+        port = get_port(1080)
         username = urllib.parse.unquote(u.username or "")
         password = urllib.parse.unquote(u.password or "")
         if username and not password and ":" in username:
@@ -1395,7 +1389,7 @@ def parse(link):
         host = u.hostname or ""
         is_tls = (scheme == "https")
         default_port = 8443 if is_tls else 8080
-        port = int(u.port or (443 if is_tls else default_port))
+        port = get_port(443 if is_tls else default_port)
         username = urllib.parse.unquote(u.username or "")
         password = urllib.parse.unquote(u.password or "")
         sni = params.get("sni") or host
@@ -2719,8 +2713,11 @@ name="sing-box"
 description="sing-box service"
 command="${bin_path}"
 command_args="-D /var/lib/sing-box -c ${CONFIG_FILE} run"
-command_background="true"
+supervisor="supervise-daemon"
 pidfile="/run/sing-box.pid"
+respawn_delay=5
+respawn_max=5
+respawn_period=60
 output_log="/var/log/sing-box.log"
 error_log="/var/log/sing-box.log"
 
@@ -2851,22 +2848,36 @@ install_singbox_binary() (
     *) die "不支持的 CPU 架构：$raw_arch" ;;
   esac
 
-  local ver="$target_ver"
-  if [[ -z "$ver" || "$ver" == "FORCE" ]]; then
-    info "获取 sing-box 最新版本信息……"
-    ver=$(curl -fsSL --connect-timeout 8 -m 15 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null | jq -r '.tag_name // empty' | sed 's/^v//' || true)
-    if [[ -z "$ver" || "$ver" == "null" ]]; then
-      ver="1.11.4"
-    fi
+  local ver="$target_ver" release_json release_url
+  release_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+  if [[ -n "$ver" && "$ver" != "FORCE" ]]; then
+    ver=${ver#v}
+    [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || die "核心版本号无效。"
+    release_url="https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${ver}"
   fi
+  release_json=$(curl -fsSL --connect-timeout 8 -m 20 "$release_url") || die "无法读取官方发行元数据，旧核心未替换。"
+  if [[ -z "$ver" || "$ver" == "FORCE" ]]; then
+    ver=$(jq -er '.tag_name' <<<"$release_json" | sed 's/^v//') || die "官方发行版本信息无效。"
+  fi
+  [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]] || die "官方发行版本号无效。"
+  [[ "$(jq -r '.tag_name' <<<"$release_json")" == "v${ver}" ]] || die "官方发行版本不匹配。"
 
-  info "正在下载 sing-box v${ver} (linux-${arch}) 核心……"
   local pkg_name="sing-box-${ver}-linux-${arch}"
-  local bin="" installed_ver u
+  # Alpine 使用同一官方发行中的 musl 构建，不混用 Edge 软件源。
+  if [[ "$OS_ID" == "alpine" ]]; then pkg_name="${pkg_name}-musl"; fi
+  local digest expected_hash
+  digest=$(jq -er --arg name "${pkg_name}.tar.gz" '.assets[] | select(.name == $name) | .digest' <<<"$release_json") || die "官方发行缺少目标平台文件或 SHA-256，请选择提供校验信息的版本。"
+  [[ "$digest" =~ ^sha256:([a-fA-F0-9]{64})$ ]] || die "官方核心 SHA-256 无效，已停止安装。"
+  expected_hash=${BASH_REMATCH[1]}
+  expected_hash=$(printf '%s' "$expected_hash" | tr 'A-F' 'a-f')
+  info "正在下载并校验 sing-box v${ver} (${pkg_name}) 核心……"
+  local bin="" hash_file="" installed_ver u
   # 在目标分区暂存，校验后直接重命名；不落盘压缩包，也不复制第二份新核心。
   install -d -m 0755 /usr/local/bin /usr/bin
   bin=$(mktemp /usr/local/bin/.sing-box.XXXXXX) || die "无法创建核心临时文件，请检查 /usr/local/bin 所在分区的空间和权限。"
   trap "rm -f -- $(printf '%q' "$bin")" EXIT
+  hash_file=$(mktemp /usr/local/bin/.sing-box-hash.XXXXXX) || die "无法创建校验临时文件。"
+  trap "rm -f -- $(printf '%q' "$bin") $(printf '%q' "$hash_file")" EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
@@ -2890,11 +2901,25 @@ install_singbox_binary() (
     source_index=$((source_index + 1))
     info "尝试下载源 ${source_index}/${#urls[@]} (最长 ${download_timeout} 秒，持续低速 30 秒后切换)……"
     # 不使用 curl --retry：流式解压时直接重试会把多次响应拼接成损坏的压缩流。
-    if curl -fSL --connect-timeout 10 --max-time "$download_timeout" --speed-limit 1024 --speed-time 30 "$u" | tar -xzOf - "${pkg_name}/sing-box" >"$bin"; then
-      if [[ -s "$bin" ]]; then
+    # 同步散列压缩流，只落盘一个新核心和几十字节摘要；完整下载成功后才允许运行。
+    if curl -fSL --connect-timeout 10 --max-time "$download_timeout" --speed-limit 1024 --speed-time 30 "$u" | python3 -c '
+import hashlib, sys
+digest = hashlib.sha256()
+while True:
+    block = sys.stdin.buffer.read(65536)
+    if not block:
+        break
+    digest.update(block)
+    sys.stdout.buffer.write(block)
+sys.stdout.buffer.flush()
+with open(sys.argv[1], "w") as output:
+    output.write(digest.hexdigest())
+' "$hash_file" | tar -xzOf - "${pkg_name}/sing-box" >"$bin"; then
+      if [[ -s "$bin" && "$(cat "$hash_file")" == "$expected_hash" ]]; then
         dl_ok=1
         break
       fi
+      warn "核心 SHA-256 校验失败。"
     fi
     warn "当前下载源下载或解压失败，尝试下一来源。"
     : >"$bin" || die "无法写入核心临时文件，请检查磁盘空间和权限。"
@@ -2906,7 +2931,10 @@ install_singbox_binary() (
   fi
   chmod 0755 "$bin" || die "无法设置核心执行权限。"
   installed_ver=$("$bin" version 2>/dev/null) || die "新核心无法执行，旧核心未替换，请检查架构兼容性。"
-  [[ -n "$installed_ver" ]] || die "新核心版本校验失败，旧核心未替换。"
+  [[ "$(awk 'NR==1 {print $3}' <<<"$installed_ver")" == "$ver" ]] || die "新核心版本不匹配，旧核心未替换。"
+  if [[ -s "$CONFIG_FILE" ]]; then
+    "$bin" check -c "$CONFIG_FILE" || die "新核心不兼容现有配置，旧核心未替换。"
+  fi
   installed_ver=${installed_ver%%$'\n'*}
   mv -f "$bin" /usr/local/bin/sing-box || die "替换核心失败，请检查目标分区空间和权限。"
   ln -sf /usr/local/bin/sing-box /usr/bin/sing-box 2>/dev/null || true
@@ -2933,7 +2961,7 @@ install_dependencies() {
   case "$PKG_MGR" in
     apt) packages=(ca-certificates curl gnupg jq openssl certbot iproute2 nftables cron python3 tar gzip) ;;
     dnf|yum) packages=(ca-certificates curl gnupg2 jq openssl certbot iproute nftables cronie python3 tar gzip chrony) ;;
-    apk) packages=(bash ca-certificates curl gnupg jq openssl certbot iproute2 nftables tzdata python3 tar gzip coreutils dcron gcompat chrony) ;;
+    apk) packages=(bash ca-certificates curl gnupg jq openssl certbot iproute2 nftables tzdata python3 tar gzip coreutils dcron chrony) ;;
   esac
 
   # 更新核心只补缺失依赖；首次安装仍使用原有完整依赖列表。
@@ -2999,15 +3027,72 @@ install_dependencies_and_core() {
   install_singbox_binary
 }
 
-upgrade_sing_box() {
+upgrade_sing_box() (
   preflight
   install_dependencies update
+  # 事务变量保留到子 shell 的 EXIT trap；不依赖退出时已释放的 local 作用域。
+  old_bin="" backup="" was_running=0 path="" index=""
+  core_paths=(/usr/local/bin/sing-box /usr/bin/sing-box)
+  if command -v sing-box >/dev/null 2>&1; then
+    old_bin=$(command -v sing-box)
+    if [[ -f "$old_bin" ]]; then
+      backup=$(mktemp -d /usr/local/bin/.sbox-upgrade.XXXXXX) || die "无法创建核心回滚目录。"
+      for index in 0 1; do
+        path=${core_paths[$index]}
+        if [[ -L "$path" ]]; then
+          cp -P "$path" "$backup/$index" || die "无法备份核心链接。"
+        elif [[ -f "$path" ]]; then
+          ln "$path" "$backup/$index" || die "无法保留旧核心，已停止升级。"
+        fi
+      done
+    fi
+  fi
+  service_is_running && was_running=1
+  rollback_core() {
+    local status=$? core_changed=0
+    trap - EXIT
+    if (( status != 0 )) && [[ -n "$backup" && -d "$backup" ]]; then
+      for index in 0 1; do
+        path=${core_paths[$index]}
+        if [[ -e "$backup/$index" || -L "$backup/$index" ]]; then
+          if [[ -L "$backup/$index" && -L "$path" && "$(readlink "$backup/$index")" == "$(readlink "$path")" ]]; then
+            rm -f "$backup/$index"
+          elif [[ ! -L "$backup/$index" && ! -L "$path" && "$backup/$index" -ef "$path" ]]; then
+            rm -f "$backup/$index"
+          else
+            core_changed=1
+            mv -f "$backup/$index" "$path" || { warn "恢复核心失败，备份保留在 $backup。"; exit 1; }
+          fi
+        elif [[ -e "$path" || -L "$path" ]]; then
+          core_changed=1
+          rm -f "$path"
+        fi
+      done
+      warn "升级失败，已恢复旧核心。"
+      if (( was_running && core_changed )); then
+        service_restart "$SYSTEMD_SERVICE" || warn "旧核心重启失败，请检查服务日志。"
+        sync_outbound_health_service || true
+      fi
+    fi
+    if [[ -n "$backup" ]]; then
+      rm -f "$backup/0" "$backup/1"
+      rmdir "$backup"
+    fi
+    exit "$status"
+  }
+  trap rollback_core EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   info "正在检查并更新 sing-box 核心……"
-  install_singbox_binary "FORCE"
+  install_singbox_binary "FORCE" || die "核心安装失败。"
   if [[ -s "$CONFIG_FILE" ]]; then
-    sing-box check -c "$CONFIG_FILE" || die "新版本下配置校验失败，请检查 ${CONFIG_FILE}。"
-    service_stop "$OUTBOUND_HEALTH_SERVICE"
-    service_restart "$SYSTEMD_SERVICE"
+    sing-box check -c "$CONFIG_FILE" || die "新版本下配置校验失败。"
+    if (( was_running )); then
+      service_stop "$OUTBOUND_HEALTH_SERVICE"
+      service_restart "$SYSTEMD_SERVICE" || die "新核心服务启动失败。"
+      sleep 1
+      service_is_running || die "新核心启动后异常退出。"
+    fi
   fi
   migrate_outbound_health_config 2>/dev/null || true
   sync_outbound_health_service 2>/dev/null || true
@@ -3015,7 +3100,7 @@ upgrade_sing_box() {
   local new_ver
   new_ver=$(sing-box version 2>/dev/null | head -n 1 || echo "未知")
   ok "sing-box 核心已更新：${new_ver}"
-}
+)
 
 size_to_bytes() {
   local size_str=$1
@@ -6472,13 +6557,13 @@ generate_client_outbound_json() {
     trojan)
       local pw
       pw=$(jq -r '.password' <<<"$node")
-      jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg pw "$pass" \
+      jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg pw "$pw" \
         '{type:"trojan",tag:$tag,server:$s,server_port:$p,password:$pw,tls:{enabled:true,server_name:$s}}'
       ;;
     hysteria2)
       local pw
       pw=$(jq -r '.password' <<<"$node")
-      jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg pw "$pass" \
+      jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg pw "$pw" \
         '{type:"hysteria2",tag:$tag,server:$s,server_port:$p,password:$pw,tls:{enabled:true,server_name:$s}}'
       ;;
     vless-reality)
@@ -6526,8 +6611,58 @@ generate_client_outbound_json() {
       fi
       ;;
     *)
-      echo "{}"
+      die "无法导出不支持的协议：$proto"
       ;;
+  esac
+}
+
+generate_share_link() {
+  local node=$1 proto host port name password method auth sni
+  proto=$(jq -r '.protocol' <<<"$node")
+  host=$(jq -r '.domain' <<<"$node")
+  host=${host#\[}; host=${host%\]}
+  [[ "$host" != *:* ]] || host="[$host]"
+  port=$(jq -r '.port' <<<"$node")
+  name=$(jq -jr '.name' <<<"$node" | jq -sRr @uri)
+  password=$(jq -r '.password // ""' <<<"$node")
+  sni=$(jq -jr '.domain' <<<"$node" | jq -sRr @uri)
+  case "$proto" in
+    anytls|trojan|hysteria2)
+      password=$(printf '%s' "$password" | jq -sRr @uri)
+      [[ "$proto" != "hysteria2" ]] || proto="hy2"
+      printf '%s://%s@%s:%s?sni=%s#%s\n' "$proto" "$password" "$host" "$port" "$sni" "$name"
+      ;;
+    shadowsocks|shadowsocks-shadowtls)
+      method=$(jq -r '.method' <<<"$node")
+      auth=$(printf '%s:%s' "$method" "$password" | base64 | tr '+/' '-_' | tr -d '=\n')
+      printf 'ss://%s@%s:%s' "$auth" "$host" "$port"
+      if [[ "$proto" == "shadowsocks-shadowtls" ]]; then
+        password=$(jq -jr '.shadowtls.password' <<<"$node" | jq -sRr @uri)
+        sni=$(jq -jr '.shadowtls.server_name' <<<"$node" | jq -sRr @uri)
+        printf '?shadow-tls-password=%s&shadow-tls-version=3&shadow-tls-sni=%s&udp-port=%s' "$password" "$sni" "$port"
+      fi
+      printf '#%s\n' "$name"
+      ;;
+    vless-reality)
+      local uuid pbk sid
+      uuid=$(jq -r '.uuid' <<<"$node")
+      pbk=$(jq -r '.reality.public_key' <<<"$node")
+      sid=$(jq -r '.reality.short_id' <<<"$node")
+      sni=$(jq -jr '.reality.handshake_server' <<<"$node" | jq -sRr @uri)
+      printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' "$uuid" "$host" "$port" "$sni" "$pbk" "$sid" "$name"
+      ;;
+    socks5|http)
+      local username scheme="$proto"
+      username=$(jq -r '.username // ""' <<<"$node")
+      if [[ "$proto" == "http" && "$(jq -r '.tls // false' <<<"$node")" == "true" ]]; then scheme="https"; fi
+      auth=""
+      if [[ -n "$username" ]]; then
+        auth="$(printf '%s' "$username" | jq -sRr @uri):$(printf '%s' "$password" | jq -sRr @uri)"
+        auth="${auth}@"
+      fi
+      printf '%s://%s%s:%s#%s\n' "$scheme" "$auth" "$host" "$port" "$name"
+      ;;
+    *) die "无法导出不支持的协议：$proto" ;;
   esac
 }
 
@@ -6558,31 +6693,23 @@ show_client() {
         else
           printf "  Padding 混淆: 系统默认 (stop=8)\n"
         fi
-        printf "  分享链接: anytls://%s@%s:%s?sni=%s#%s\n" "$pass" "$domain" "$port" "$domain" "$(printf "%s" "$name" | jq -sRr @uri)"
         ;;
       shadowsocks)
         method=$(jq -r '.method' <<<"$node")
         pass=$(jq -r '.password' <<<"$node")
         printf "  加密方式: %s\n" "$method"
         printf "  连接密码: %s\n" "$pass"
-        local ss_b64
-        ss_b64=$(printf "%s:%s" "$method" "$pass" | base64 | tr -d "\n")
-        printf "  分享链接: ss://%s@%s:%s#%s\n" "$ss_b64" "$domain" "$port" "$(printf "%s" "$name" | jq -sRr @uri)"
         ;;
       shadowsocks-shadowtls)
         method=$(jq -r '.method' <<<"$node")
         pass=$(jq -r '.password' <<<"$node")
-        local st_pass st_sni combo_name_uri combo_ss_b64
+        local st_pass st_sni
         st_pass=$(jq -r '.shadowtls.password' <<<"$node")
         st_sni=$(jq -r '.shadowtls.server_name' <<<"$node")
-        combo_name_uri=$(printf "%s" "$name" | jq -sRr @uri)
-        combo_ss_b64=$(printf "%s:%s" "$method" "$pass" | base64 | tr '+/' '-_' | tr -d '=\n')
         printf "  加密方式: %s\n" "$method"
         printf "  SS 2022 密钥: %s\n" "$pass"
         printf "  ShadowTLS v3 密码: %s\n" "$st_pass"
         printf "  ShadowTLS SNI: %s\n" "$st_sni"
-        printf "  分享链接: ss://%s@%s:%s?shadow-tls-password=%s&shadow-tls-version=3&shadow-tls-sni=%s&udp-port=%s#%s\n" \
-          "$combo_ss_b64" "$domain" "$port" "$(printf "%s" "$st_pass" | jq -sRr @uri)" "$st_sni" "$port" "$combo_name_uri"
         ;;
       vless-reality)
         uuid=$(jq -r '.uuid' <<<"$node")
@@ -6594,18 +6721,14 @@ show_client() {
         printf "  REALITY 公钥: %s\n" "$pbk"
         printf "  REALITY ShortId: %s\n" "$sid"
         printf "  伪装 SNI: %s\n" "$sni"
-        printf "  分享链接: vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n" \
-          "$uuid" "$domain" "$port" "$sni" "$pbk" "$sid" "$(printf "%s" "$name" | jq -sRr @uri)"
         ;;
       trojan)
         pass=$(jq -r '.password' <<<"$node")
         printf "  Trojan 密码: %s\n" "$pass"
-        printf "  分享链接: trojan://%s@%s:%s?sni=%s#%s\n" "$pass" "$domain" "$port" "$domain" "$(printf "%s" "$name" | jq -sRr @uri)"
         ;;
       hysteria2)
         pass=$(jq -r '.password' <<<"$node")
         printf "  Hysteria2 认证: %s\n" "$pass"
-        printf "  分享链接: hy2://%s@%s:%s?sni=%s&insecure=0#%s\n" "$pass" "$domain" "$port" "$domain" "$(printf "%s" "$name" | jq -sRr @uri)"
         ;;
       socks5)
         local s_user s_pass
@@ -6614,12 +6737,8 @@ show_client() {
         if [[ -n "$s_user" ]]; then
           printf "  认证用户名: %s\n" "$s_user"
           printf "  认证密码:   %s\n" "$s_pass"
-          local s_auth
-          s_auth=$(printf "%s:%s" "$s_user" "$s_pass" | base64 | tr -d "\n")
-          printf "  分享链接:   socks5://%s@%s:%s#%s\n" "$s_auth" "$domain" "$port" "$(printf "%s" "$name" | jq -sRr @uri)"
         else
           printf "  认证方式:   免密无认证\n"
-          printf "  分享链接:   socks5://%s:%s#%s\n" "$domain" "$port" "$(printf "%s" "$name" | jq -sRr @uri)"
         fi
         ;;
       http)
@@ -6636,15 +6755,12 @@ show_client() {
         if [[ -n "$h_user" ]]; then
           printf "  认证用户名: %s\n" "$h_user"
           printf "  认证密码:   %s\n" "$h_pass"
-          local h_auth
-          h_auth=$(printf "%s:%s" "$h_user" "$h_pass" | base64 | tr -d "\n")
-          printf "  分享链接:   %s://%s@%s:%s#%s\n" "$scheme" "$h_auth" "$domain" "$port" "$(printf "%s" "$name" | jq -sRr @uri)"
         else
           printf "  认证方式:   免密无认证\n"
-          printf "  分享链接:   %s://%s:%s#%s\n" "$scheme" "$domain" "$port" "$(printf "%s" "$name" | jq -sRr @uri)"
         fi
         ;;
     esac
+    printf '  分享链接: %s\n' "$(generate_share_link "$node")"
     index=$((index + 1))
   done < <(jq -c '.[]?' <<<"$nodes")
   echo
@@ -8111,6 +8227,17 @@ update_self_script() {
     rm -f "$tmp_file"
     warn "检查更新失败：无法解析远程脚本版本号。"
     return 1
+  fi
+
+  [[ "$remote_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { rm -f "$tmp_file"; warn "远程脚本版本格式无效。"; return 1; }
+  if ! awk -v current="$SCRIPT_VERSION" -v remote="$remote_version" 'BEGIN {
+    split(current, a, "."); split(remote, b, ".");
+    for (i=1; i<=3; i++) { if (b[i]+0 > a[i]+0) exit 0; if (b[i]+0 < a[i]+0) exit 1 }
+    exit 0
+  }'; then
+    rm -f "$tmp_file"
+    info "远程脚本 v${remote_version} 早于当前 v${SCRIPT_VERSION}，跳过降级。"
+    return 0
   fi
 
   if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
