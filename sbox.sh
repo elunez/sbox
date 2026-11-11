@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.48"
+readonly SCRIPT_VERSION="0.0.49"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -4551,6 +4551,7 @@ generate_config_from_state() {
           tls: {
             enabled: true,
             server_name: $o.server_name,
+            utls: {enabled: true, fingerprint: ($o["client-fingerprint"] // "safari")},
             reality: {
               enabled: true,
               public_key: $o.public_key,
@@ -6544,15 +6545,16 @@ generate_client_outbound_json() {
         '{type:"shadowsocks",tag:$tag,server:$s,server_port:$p,method:$m,password:$pw}'
       ;;
     shadowsocks-shadowtls)
-      local combo_m combo_pw combo_st_pw combo_sni combo_st_tag
+      local combo_m combo_pw combo_st_pw combo_sni combo_st_tag combo_fp
       combo_m=$(jq -r '.method' <<<"$node")
       combo_pw=$(jq -r '.password' <<<"$node")
       combo_st_pw=$(jq -r '.shadowtls.password' <<<"$node")
       combo_sni=$(jq -r '.shadowtls.server_name' <<<"$node")
+      combo_fp=$(jq -r '.["client-fingerprint"] // "safari"' <<<"$node")
       combo_st_tag="${name}-shadowtls"
       jq -n --arg tag "$name" --arg st_tag "$combo_st_tag" --arg s "$domain" --argjson p "$port" \
-        --arg m "$combo_m" --arg pw "$combo_pw" --arg st_pw "$combo_st_pw" --arg sni "$combo_sni" \
-        '[{type:"shadowsocks",tag:$tag,method:$m,password:$pw,detour:$st_tag,udp_over_tcp:{enabled:true,version:2}},{type:"shadowtls",tag:$st_tag,server:$s,server_port:$p,version:3,password:$st_pw,tls:{enabled:true,server_name:$sni,utls:{enabled:true,fingerprint:"chrome"}}}]'
+        --arg m "$combo_m" --arg pw "$combo_pw" --arg st_pw "$combo_st_pw" --arg sni "$combo_sni" --arg fp "$combo_fp" \
+        '[{type:"shadowsocks",tag:$tag,method:$m,password:$pw,detour:$st_tag,udp_over_tcp:{enabled:true,version:2}},{type:"shadowtls",tag:$st_tag,server:$s,server_port:$p,version:3,password:$st_pw,tls:{enabled:true,server_name:$sni,utls:{enabled:true,fingerprint:$fp}}}]'
       ;;
     trojan)
       local pw
@@ -6567,13 +6569,14 @@ generate_client_outbound_json() {
         '{type:"hysteria2",tag:$tag,server:$s,server_port:$p,password:$pw,tls:{enabled:true,server_name:$s}}'
       ;;
     vless-reality)
-      local uuid pbk sid sni
+      local uuid pbk sid sni fp
       uuid=$(jq -r '.uuid' <<<"$node")
       pbk=$(jq -r '.reality.public_key' <<<"$node")
       sid=$(jq -r '.reality.short_id' <<<"$node")
       sni=$(jq -r '.reality.handshake_server' <<<"$node")
-      jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg u "$uuid" --arg pbk "$pbk" --arg sid "$sid" --arg sni "$sni" \
-        '{type:"vless",tag:$tag,server:$s,server_port:$p,uuid:$u,flow:"xtls-rprx-vision",tls:{enabled:true,server_name:$sni,reality:{enabled:true,public_key:$pbk,short_id:$sid}},packet_encoding:"xudp"}'
+      fp=$(jq -r '.["client-fingerprint"] // "safari"' <<<"$node")
+      jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg u "$uuid" --arg pbk "$pbk" --arg sid "$sid" --arg sni "$sni" --arg fp "$fp" \
+        '{type:"vless",tag:$tag,server:$s,server_port:$p,uuid:$u,flow:"xtls-rprx-vision",tls:{enabled:true,server_name:$sni,utls:{enabled:true,fingerprint:$fp},reality:{enabled:true,public_key:$pbk,short_id:$sid}},packet_encoding:"xudp"}'
       ;;
     socks5)
       local u pw
@@ -6644,12 +6647,13 @@ generate_share_link() {
       printf '#%s\n' "$name"
       ;;
     vless-reality)
-      local uuid pbk sid
+      local uuid pbk sid fp
       uuid=$(jq -r '.uuid' <<<"$node")
       pbk=$(jq -r '.reality.public_key' <<<"$node")
       sid=$(jq -r '.reality.short_id' <<<"$node")
       sni=$(jq -jr '.reality.handshake_server' <<<"$node" | jq -sRr @uri)
-      printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' "$uuid" "$host" "$port" "$sni" "$pbk" "$sid" "$name"
+      fp=$(jq -jr '.["client-fingerprint"] // "safari"' <<<"$node" | jq -sRr @uri)
+      printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=tcp#%s\n' "$uuid" "$host" "$port" "$sni" "$fp" "$pbk" "$sid" "$name"
       ;;
     socks5|http)
       local username scheme="$proto"

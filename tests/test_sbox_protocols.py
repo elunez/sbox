@@ -6,7 +6,7 @@ from pathlib import Path
 import shlex
 import tempfile
 import unittest
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from test_sbox import SOURCE, bash
 
@@ -36,6 +36,24 @@ def nodes():
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_client_fingerprint_defaults_to_safari_and_preserves_explicit_values(self):
+        for proto in ("vless-reality", "shadowsocks-shadowtls"):
+            for fingerprint in (None, "firefox", "chrome"):
+                with self.subTest(protocol=proto, fingerprint=fingerprint):
+                    node = next(item for item in nodes() if item["protocol"] == proto)
+                    if fingerprint is not None:
+                        node["client-fingerprint"] = fingerprint
+                    result = bash(f'generate_client_outbound_json {shlex.quote(json.dumps(node))}')
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    client = json.loads(result.stdout)
+                    if isinstance(client, list):
+                        client = client[1]
+                    self.assertEqual(client["tls"]["utls"], {"enabled": True, "fingerprint": fingerprint or "safari"})
+                    if proto == "vless-reality":
+                        result = bash(f'generate_share_link {shlex.quote(json.dumps(node))}')
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(parse_qs(urlsplit(result.stdout.strip()).query)["fp"], [fingerprint or "safari"])
+
     def test_reality_keypair_parsing_without_positional_arguments(self):
         result = bash('''sing-box() {
   [[ "$*" == "generate reality-keypair" ]] || return 99
@@ -183,6 +201,9 @@ generate_config_from_state {shlex.quote(str(config))} {shlex.quote(str(state))}'
             public = [inbound for inbound in output["inbounds"] if inbound.get("listen_port") == node["port"]]
             self.assertTrue(public, node["protocol"])
         self.assertTrue({"anytls", "trojan", "hysteria2", "shadowsocks", "shadowtls", "vless", "socks", "http", "direct", "selector"}.issubset({out["type"] for out in output["outbounds"]}))
+        for outbound in output["outbounds"]:
+            if outbound["type"] == "vless":
+                self.assertEqual(outbound["tls"]["utls"], {"enabled": True, "fingerprint": "safari"})
 
     def test_unsupported_link_options_fail_instead_of_silent_downgrade(self):
         uris = [
