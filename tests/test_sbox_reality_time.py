@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import subprocess
 import tempfile
@@ -157,6 +158,9 @@ install_deploy_hook() { :; }
 sync_traffic_cron() { :; }
 sync_traffic_rules() { :; }
 sync_anytls_default_padding() { :; }
+ensure_service_file() { :; }
+service_is_running() { return 1; }
+is_ntp_service_active() { return 0; }
 service_is_installed() { return 1; }
 sing-box() {
   if [[ "$1" == version ]]; then echo 'sing-box version 1.11.4'; fi
@@ -176,10 +180,11 @@ curl() {
         remote = self.root / "remote.sh"
         remote.write_text(source.replace(guarded_main, overrides + "\n" + guarded_main))
         old = self.root / "old.sh"
-        old_source = remote.read_text().replace('readonly SCRIPT_VERSION="0.0.50"', 'readonly SCRIPT_VERSION="0.0.49"')
+        old_source = re.sub(r'^readonly SCRIPT_VERSION="[0-9.]+"', 'readonly SCRIPT_VERSION="0.0.0"',
+                            remote.read_text(), count=1, flags=re.MULTILINE)
         # 模拟旧脚本本身不懂新字段，只能由安装的新脚本执行迁移。
         old.write_text(old_source.replace(guarded_main,
-                                         'migrate_outbound_health_config() { :; }\n' + guarded_main))
+                                         'sync_after_script_update() { :; }\n' + guarded_main))
         result = bash(f'generate_config_from_state {shlex.quote(str(self.config))}', self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
         original = json.loads(self.config.read_text())

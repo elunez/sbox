@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.50"
+readonly SCRIPT_VERSION="0.0.51"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -263,6 +263,20 @@ service_daemon_reload() {
   fi
 }
 
+write_managed_file() {
+  local target=$1 mode=$2 tmp
+  MANAGED_FILE_CHANGED=0
+  tmp=$(mktemp) || return 1
+  if ! cat >"$tmp"; then rm -f "$tmp"; return 1; fi
+  if [[ -f "$target" ]] && cmp -s "$tmp" "$target"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  if ! install -m "$mode" "$tmp" "$target"; then rm -f "$tmp"; return 1; fi
+  rm -f "$tmp"
+  MANAGED_FILE_CHANGED=1
+}
+
 outbound_health_node_count() {
   [[ -r "$STATE_FILE" ]] || { echo 0; return 0; }
   jq '[.nodes[]? | select((.outbound.type // "direct") != "direct" and ((.backup_outbounds // []) | length > 0))] | length' "$STATE_FILE" 2>/dev/null || echo 0
@@ -288,7 +302,7 @@ ensure_outbound_health_secret() {
 
 install_outbound_health_monitor_script() {
   install -d -m 0700 "$STATE_DIR" "$OUTBOUND_HEALTH_RUNTIME_DIR"
-  cat >"$OUTBOUND_HEALTH_SCRIPT" <<'PY_OUTBOUND_HEALTH_EOF'
+  write_managed_file "$OUTBOUND_HEALTH_SCRIPT" 0700 <<'PY_OUTBOUND_HEALTH_EOF' || return 1
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """sbox 主备出口健康监控：按优先级切换，仅在显式配置时回退 Direct。"""
@@ -516,15 +530,15 @@ def main():
 if __name__ == "__main__":
     main()
 PY_OUTBOUND_HEALTH_EOF
-  chmod 0700 "$OUTBOUND_HEALTH_SCRIPT"
 }
 
 ensure_outbound_health_service_file() {
   local py_bin
   py_bin=$(command -v python3 || echo "/usr/bin/python3")
-  install_outbound_health_monitor_script
+  install_outbound_health_monitor_script || return 1
+  HEALTH_SERVICE_FILE_CHANGED=0
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    cat >"/etc/systemd/system/${OUTBOUND_HEALTH_SERVICE}" <<EOF
+    write_managed_file "/etc/systemd/system/${OUTBOUND_HEALTH_SERVICE}" 0644 <<EOF || return 1
 [Unit]
 Description=sbox outbound health monitor
 After=network-online.target sing-box.service
@@ -555,7 +569,7 @@ WantedBy=multi-user.target
 EOF
   else
     local rc_file="/etc/init.d/${OUTBOUND_HEALTH_SERVICE%.service}"
-    cat >"$rc_file" <<EOF
+    write_managed_file "$rc_file" 0755 <<EOF || return 1
 #!/sbin/openrc-run
 description="sbox outbound health monitor"
 command="${py_bin}"
@@ -577,37 +591,46 @@ depend() {
   after sing-box
 }
 EOF
-    chmod 0755 "$rc_file"
   fi
-  service_daemon_reload
+  HEALTH_SERVICE_FILE_CHANGED=$MANAGED_FILE_CHANGED
+  if (( HEALTH_SERVICE_FILE_CHANGED )); then service_daemon_reload; fi
 }
 
 sync_outbound_health_service() {
-  local count previous_script=""
+  local preserve_state=${1:-0} was_running=${2:-0} count previous_script="" unit_file
   count=$(outbound_health_node_count)
   if (( count > 0 )); then
     [[ -s "$CONFIG_FILE" ]] || return 0
     if ! outbound_health_config_ready; then
       return 0
     fi
-    ensure_outbound_health_secret >/dev/null
+    ensure_outbound_health_secret >/dev/null || return 1
     [[ ! -f "$OUTBOUND_HEALTH_SCRIPT" ]] || previous_script=$(cat "$OUTBOUND_HEALTH_SCRIPT")
-    ensure_outbound_health_service_file
-    service_enable "$OUTBOUND_HEALTH_SERVICE"
-    if service_is_running "$OUTBOUND_HEALTH_SERVICE" && [[ "$previous_script" != "$(cat "$OUTBOUND_HEALTH_SCRIPT")" ]]; then
-      service_restart "$OUTBOUND_HEALTH_SERVICE" || return 1
+    ensure_outbound_health_service_file || return 1
+    if (( preserve_state )); then
+      # 更新附属文件不改变用户原有的开机启用状态；只恢复原先运行的监控。
+      if (( ! was_running )); then return 0; fi
     else
-      service_start "$OUTBOUND_HEALTH_SERVICE" >/dev/null 2>&1 || true
+      service_enable "$OUTBOUND_HEALTH_SERVICE"
+    fi
+    if service_is_running "$OUTBOUND_HEALTH_SERVICE"; then
+      if [[ "$previous_script" != "$(cat "$OUTBOUND_HEALTH_SCRIPT")" ]] || (( ${HEALTH_SERVICE_FILE_CHANGED:-0} )); then
+        service_restart "$OUTBOUND_HEALTH_SERVICE" || return 1
+      fi
+    else
+      service_start "$OUTBOUND_HEALTH_SERVICE" || return 1
     fi
   else
-    service_disable "$OUTBOUND_HEALTH_SERVICE"
-    rm -f "$OUTBOUND_HEALTH_STATE_FILE"
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-      rm -f "/etc/systemd/system/${OUTBOUND_HEALTH_SERVICE}"
+      unit_file="/etc/systemd/system/${OUTBOUND_HEALTH_SERVICE}"
     else
-      rm -f "/etc/init.d/${OUTBOUND_HEALTH_SERVICE%.service}"
+      unit_file="/etc/init.d/${OUTBOUND_HEALTH_SERVICE%.service}"
     fi
-    service_daemon_reload
+    if [[ -f "$unit_file" ]] || service_is_running "$OUTBOUND_HEALTH_SERVICE"; then
+      service_disable "$OUTBOUND_HEALTH_SERVICE"
+      rm -f "$unit_file" "$OUTBOUND_HEALTH_STATE_FILE"
+      service_daemon_reload
+    fi
   fi
 }
 
@@ -704,21 +727,22 @@ migrate_outbound_health_config() {
 }
 
 migrate_legacy_state() {
-  install -d -m 0700 "$STATE_DIR" "$BACKUP_DIR"
+  install -d -m 0700 "$STATE_DIR" "$BACKUP_DIR" || return 1
+  [[ ! -f "${STATE_DIR}/legacy-layout-v1.done" ]] || return 0
 
   # 1. 迁移旧版状态与凭据数据
   if [[ -f "/etc/sing-box/state.json" && ! -f "$STATE_FILE" ]]; then
-    mv "/etc/sing-box/state.json" "$STATE_FILE"
+    mv "/etc/sing-box/state.json" "$STATE_FILE" || return 1
   fi
   rm -f "/etc/sing-box/state.json" >/dev/null 2>&1 || true
 
   if [[ -f "/etc/sing-box/api.json" && ! -f "$API_CONFIG_FILE" ]]; then
-    mv "/etc/sing-box/api.json" "$API_CONFIG_FILE"
+    mv "/etc/sing-box/api.json" "$API_CONFIG_FILE" || return 1
   fi
   rm -f "/etc/sing-box/api.json" >/dev/null 2>&1 || true
 
   if [[ -f "/etc/sing-box/dnspod.json" && ! -f "$DNSPOD_CREDENTIAL_FILE" ]]; then
-    mv "/etc/sing-box/dnspod.json" "$DNSPOD_CREDENTIAL_FILE"
+    mv "/etc/sing-box/dnspod.json" "$DNSPOD_CREDENTIAL_FILE" || return 1
   fi
   rm -f "/etc/sing-box/dnspod.json" >/dev/null 2>&1 || true
   rm -f "/etc/sing-box/traffic_data.json" >/dev/null 2>&1 || true
@@ -728,29 +752,19 @@ migrate_legacy_state() {
   for item in dnspod-auth dnspod-cleanup dnspod-hook traffic_reset.log; do
     if [[ -f "/etc/sing-box/${item}" ]]; then
       if [[ ! -f "${STATE_DIR}/${item}" ]]; then
-        mv "/etc/sing-box/${item}" "${STATE_DIR}/${item}" 2>/dev/null || true
+        mv "/etc/sing-box/${item}" "${STATE_DIR}/${item}" || return 1
       else
         rm -f "/etc/sing-box/${item}" >/dev/null 2>&1 || true
       fi
     fi
   done
   if [[ -d "/etc/sing-box/backups" ]]; then
-    cp -a /etc/sing-box/backups/* "$BACKUP_DIR/" 2>/dev/null || true
-    rm -rf /etc/sing-box/backups 2>/dev/null || true
+    cp -a /etc/sing-box/backups/. "$BACKUP_DIR/" || return 1
+    rm -rf /etc/sing-box/backups || return 1
   fi
 
-  # 3. 强力清除 /etc/sing-box 下除 config.json 之外的所有 .json 文件
-  # 防止 sing-box 在任何情况下因加载配置目录中多余的 json 文件而崩溃
-  if [[ -d "/etc/sing-box" ]]; then
-    local orphan_json
-    shopt -s nullglob
-    for orphan_json in /etc/sing-box/*.json; do
-      if [[ "${orphan_json##*/}" != "config.json" ]]; then
-        mv "$orphan_json" "${BACKUP_DIR}/" 2>/dev/null || rm -f "$orphan_json"
-      fi
-    done
-    shopt -u nullglob
-  fi
+  # 服务仅通过 -c 加载 config.json，不再扫描或删除用户的其他 JSON 文件。
+  : >"${STATE_DIR}/legacy-layout-v1.done"
 }
 
 is_ntp_service_active() {
@@ -817,7 +831,11 @@ preflight() {
   require_root
   detect_os
   ensure_sbox_cli
-  auto_heal_service
+  if [[ "${SBOX_UPDATE_SYNC_DONE:-0}" == "1" ]]; then
+    unset SBOX_UPDATE_SYNC_DONE
+  else
+    auto_heal_service
+  fi
 }
 
 validate_domain() {
@@ -1559,7 +1577,7 @@ write_dnspod_credentials() {
 
 install_dnspod_hooks() {
   install -d -m 0700 "$STATE_DIR"
-  cat > "$DNSPOD_HOOK" <<'EOF'
+  write_managed_file "$DNSPOD_HOOK" 0700 <<'EOF' || return 1
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
@@ -1804,17 +1822,14 @@ main() {
 
 main "$@"
 EOF
-  chmod 0700 "$DNSPOD_HOOK"
-  cat > "$DNSPOD_AUTH_HOOK" <<EOF
+  write_managed_file "$DNSPOD_AUTH_HOOK" 0700 <<EOF || return 1
 #!/usr/bin/env bash
 exec "${DNSPOD_HOOK}" auth
 EOF
-  chmod 0700 "$DNSPOD_AUTH_HOOK"
-  cat > "$DNSPOD_CLEANUP_HOOK" <<EOF
+  write_managed_file "$DNSPOD_CLEANUP_HOOK" 0700 <<EOF || return 1
 #!/usr/bin/env bash
 exec "${DNSPOD_HOOK}" cleanup
 EOF
-  chmod 0700 "$DNSPOD_CLEANUP_HOOK"
 }
 
 collect_dnspod_settings() {
@@ -1872,7 +1887,7 @@ write_cf_credentials() {
 
 install_cf_hooks() {
   install -d -m 0700 "$STATE_DIR"
-  cat > "$CF_HOOK" <<'EOF'
+  write_managed_file "$CF_HOOK" 0700 <<'EOF' || return 1
 #!/usr/bin/env bash
 set -Eeuo pipefail
 umask 077
@@ -2064,17 +2079,14 @@ main() {
 
 main "$@"
 EOF
-  chmod 0700 "$CF_HOOK"
-  cat > "$CF_AUTH_HOOK" <<EOF
+  write_managed_file "$CF_AUTH_HOOK" 0700 <<EOF || return 1
 #!/usr/bin/env bash
 exec "${CF_HOOK}" auth
 EOF
-  chmod 0700 "$CF_AUTH_HOOK"
-  cat > "$CF_CLEANUP_HOOK" <<EOF
+  write_managed_file "$CF_CLEANUP_HOOK" 0700 <<EOF || return 1
 #!/usr/bin/env bash
 exec "${CF_HOOK}" cleanup
 EOF
-  chmod 0700 "$CF_CLEANUP_HOOK"
 }
 
 collect_cf_settings() {
@@ -2443,7 +2455,7 @@ issue_certificate() {
 
 install_deploy_hook() {
   install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
-  cat >"$DEPLOY_HOOK" <<'EOF'
+  write_managed_file "$DEPLOY_HOOK" 0755 <<'EOF' || return 1
 #!/usr/bin/env bash
 set -Eeuo pipefail
 STATE_FILE=/etc/sbox/state.json
@@ -2467,7 +2479,6 @@ if [[ -s "$CONFIG_FILE" ]] && command -v sing-box >/dev/null 2>&1; then
   fi
 fi
 EOF
-  chmod 0755 "$DEPLOY_HOOK"
 }
 
 ensure_node_certificate() {
@@ -2680,16 +2691,17 @@ EOF
 }
 
 ensure_service_file() {
-  local bin_path
+  local preserve_state=${1:-0} bin_path
+  CORE_SERVICE_FILE_CHANGED=0
   bin_path=$(command -v sing-box || echo "/usr/local/bin/sing-box")
-  install -d -m 0750 /var/lib/sing-box
-  install -d -m 0755 /var/log
+  install -d -m 0750 /var/lib/sing-box || return 1
+  install -d -m 0755 /var/log || return 1
 
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     local unit_file="/etc/systemd/system/${SYSTEMD_SERVICE}"
     if [[ ! -f "$unit_file" ]] || ! grep -q "\-c ${CONFIG_FILE}" "$unit_file" 2>/dev/null || ! grep -q "LogRateLimitIntervalSec" "$unit_file" 2>/dev/null || ! grep -q "time-sync.target" "$unit_file" 2>/dev/null || ! grep -q "CAP_NET_RAW" "$unit_file" 2>/dev/null; then
       info "配置 ${SYSTEMD_SERVICE} 服务单元……"
-      cat > "$unit_file" <<EOF
+      write_managed_file "$unit_file" 0644 <<EOF || return 1
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
@@ -2711,12 +2723,13 @@ LogRateLimitBurst=500
 [Install]
 WantedBy=multi-user.target
 EOF
-      systemctl daemon-reload
-      systemctl enable "${SYSTEMD_SERVICE}" >/dev/null 2>&1 || true
+      CORE_SERVICE_FILE_CHANGED=$MANAGED_FILE_CHANGED
+      service_daemon_reload
+      if (( ! preserve_state )); then service_enable "$SYSTEMD_SERVICE"; fi
     fi
   else
     local rc_file="/etc/init.d/sing-box"
-    cat > "$rc_file" <<EOF
+    write_managed_file "$rc_file" 0755 <<EOF || return 1
 #!/sbin/openrc-run
 name="sing-box"
 description="sing-box service"
@@ -2739,8 +2752,8 @@ start_pre() {
     /usr/local/bin/sbox --sync-traffic >/dev/null 2>&1 || true
 }
 EOF
-    chmod 0755 "$rc_file"
-    rc-update add sing-box default >/dev/null 2>&1 || true
+    CORE_SERVICE_FILE_CHANGED=$MANAGED_FILE_CHANGED
+    if (( ! preserve_state )); then service_enable "$SYSTEMD_SERVICE"; fi
   fi
 }
 
@@ -3395,14 +3408,21 @@ sync_traffic_cron() {
     [[ -n "$any_reset" ]] && has_reset_node=1
   fi
 
-  local tmp
+  local tmp existing
   tmp=$(mktemp)
-  (crontab -l 2>/dev/null || true) | awk -v tag="${CRON_TAG}" 'index($0, tag) == 0' >"$tmp" || true
+  existing=$(mktemp)
+  crontab -l >"$existing" 2>/dev/null || true
+  awk -v tag="${CRON_TAG}" 'index($0, tag) == 0' "$existing" >"$tmp"
   if (( has_reset_node )); then
     echo "5 0 * * * ${SCRIPT_INSTALL_PATH} --check-traffic-reset >/dev/null 2>&1 # ${CRON_TAG}-global" >>"$tmp"
   fi
-  crontab "$tmp" >/dev/null 2>&1 || true
-  rm -f "$tmp"
+  if ! cmp -s "$tmp" "$existing"; then
+    if ! crontab "$tmp"; then
+      rm -f "$tmp" "$existing"
+      return 1
+    fi
+  fi
+  rm -f "$tmp" "$existing"
 }
 
 remove_traffic_cron() {
@@ -4136,7 +4156,7 @@ ensure_state_schema() {
   local tmp top_domain
   tmp=$(mktemp)
   top_domain=$(json_get "$STATE_FILE" '.domain')
-  if jq --arg top_domain "$top_domain" '
+  if jq --arg top_domain "$top_domain" --argjson legacy_padding "$LEGACY_ANYTLS_PADDING_JSON" '
     .version = 3 |
     .nodes = (.nodes | map(
       . + {
@@ -4159,6 +4179,7 @@ ensure_state_schema() {
       if .protocol == "vless-reality" and ((.reality // {}) | has("max_time_difference") | not) then
         .reality.max_time_difference = "1m"
       else . end |
+      if .protocol == "anytls" and .padding_scheme == $legacy_padding then del(.padding_scheme) else . end |
       .backup_outbounds = (
         [.backup_outbounds[]? | select(type == "object" and (.type // "direct") != "direct")]
         + (if any(.backup_outbounds[]?; type == "object" and (.type // "direct") == "direct") then [{type:"direct"}] else [] end)
@@ -4166,8 +4187,11 @@ ensure_state_schema() {
     ))
   ' "$STATE_FILE" >"$tmp"; then
     if ! cmp -s "$tmp" "$STATE_FILE"; then
-      install -m 0600 "$tmp" "$STATE_FILE"
+      if ! install -m 0600 "$tmp" "$STATE_FILE"; then rm -f "$tmp"; return 1; fi
     fi
+  else
+    rm -f "$tmp"
+    return 1
   fi
   rm -f "$tmp"
 }
@@ -4685,15 +4709,17 @@ generate_config_from_state() {
 
 backup_config() {
   [[ -e "$CONFIG_FILE" ]] || return 0
-  install -d -m 0700 "$BACKUP_DIR"
+  install -d -m 0700 "$BACKUP_DIR" || return 1
   local backup
-  backup=$(mktemp "${BACKUP_DIR}/config.$(date +%Y%m%d-%H%M%S).XXXXXX")
-  cp -a "$CONFIG_FILE" "$backup"
+  backup=$(mktemp "${BACKUP_DIR}/config.$(date +%Y%m%d-%H%M%S).XXXXXX") || return 1
+  if ! cp -a "$CONFIG_FILE" "$backup"; then rm -f "$backup"; return 1; fi
   printf "%s" "$backup"
 }
 
 apply_config() {
-  local candidate=$1 backup="" group
+  local candidate=$1 preserve_state=${2:-0} backup="" group was_running=0 health_running=0
+  service_is_running "$SYSTEMD_SERVICE" && was_running=1
+  service_is_running "$OUTBOUND_HEALTH_SERVICE" && health_running=1
   group=$(service_group)
   sing-box check -c "$candidate" || die "配置校验未通过，已放弃应用更改。"
   if jq -e 'any(.inbounds[]?; .type == "shadowsocks" and .tcp_fast_open == true)' "$candidate" >/dev/null 2>&1; then
@@ -4702,9 +4728,11 @@ apply_config() {
   if jq -e 'any(.outbounds[]?; .type == "shadowsocks" and .tcp_fast_open == true)' "$candidate" >/dev/null 2>&1; then
     warn_ss_tfo_support client
   fi
-  backup=$(backup_config)
-  install -d -m 0750 -o root -g "$group" "$CONFIG_DIR"
-  install -m 0640 -o root -g "$group" "$candidate" "$CONFIG_FILE"
+  backup=$(backup_config) || die "配置备份失败，已放弃应用更改。"
+  migrate_legacy_state || die "旧版数据迁移失败。"
+  ensure_service_file "$preserve_state" || die "服务文件更新失败。"
+  install -d -m 0750 -o root -g "$group" "$CONFIG_DIR" || die "无法创建配置目录。"
+  install -m 0640 -o root -g "$group" "$candidate" "$CONFIG_FILE" || die "无法安装配置文件。"
   if ! sing-box check -c "$CONFIG_FILE"; then
     if [[ -n "$backup" ]]; then
       cp -a "$backup" "$CONFIG_FILE"
@@ -4713,10 +4741,11 @@ apply_config() {
     fi
     die "安装后配置校验失败，已自动恢复原配置。"
   fi
-  migrate_legacy_state
-  ensure_service_file
-  service_daemon_reload
-  service_enable "$SYSTEMD_SERVICE"
+  if (( ! preserve_state )); then service_enable "$SYSTEMD_SERVICE"; fi
+  if (( preserve_state && ! was_running )); then
+    ok "sing-box 配置已更新，服务保持停止状态。"
+    return 0
+  fi
   service_stop "$OUTBOUND_HEALTH_SERVICE"
   # 配置内容或出口顺序变化后，不复用旧出口对应的连续成功/失败计数。
   rm -f "$OUTBOUND_HEALTH_STATE_FILE"
@@ -4730,7 +4759,11 @@ apply_config() {
     if [[ -n "$backup" ]]; then
       cp -a "$backup" "$CONFIG_FILE"
       service_restart "$SYSTEMD_SERVICE" || true
-      sync_outbound_health_service || true
+      if (( preserve_state )); then
+        if (( health_running )); then service_start "$OUTBOUND_HEALTH_SERVICE" || true; fi
+      else
+        sync_outbound_health_service || true
+      fi
       die "新配置无法启动服务，已自动回滚备份。"
     fi
     die "sing-box 启动失败。"
@@ -4746,12 +4779,16 @@ apply_config() {
     if [[ -n "$backup" ]]; then
       cp -a "$backup" "$CONFIG_FILE"
       service_restart "$SYSTEMD_SERVICE" || true
-      sync_outbound_health_service || true
+      if (( preserve_state )); then
+        if (( health_running )); then service_start "$OUTBOUND_HEALTH_SERVICE" || true; fi
+      else
+        sync_outbound_health_service || true
+      fi
       die "新配置启动后异常退出，已自动回滚备份。请检查上方日志。"
     fi
     die "sing-box 服务启动后异常退出，请检查上方日志排查原因。"
   fi
-  sync_outbound_health_service
+  if (( ! preserve_state )); then sync_outbound_health_service; fi
   ok "sing-box 配置文件已生效并成功加载，服务正常运行中。"
 }
 
@@ -4831,29 +4868,15 @@ sync_anytls_default_padding() {
   [[ -r "$STATE_FILE" ]] || return 0
   state_has_nodes || return 0
 
-  local nodes modified=0
+  local nodes
   nodes=$(current_nodes_json 2>/dev/null || echo "[]")
   [[ "$nodes" != "[]" ]] || return 0
 
-  # 1. 检查 state.json 中是否有节点被显式写入了旧版默认规则
-  # 若显式配置刚好是旧版默认规则，清除该节点的 padding_scheme 使其自动采用最新默认；
-  # 若是用户配置的其他自定义规则（如美西规则或任意定制 padding），则予以保留绝对不修改。
-  if jq -e --argjson leg "$LEGACY_ANYTLS_PADDING_JSON" '
-    any(.[]?; .protocol == "anytls" and (.padding_scheme // null) != null and .padding_scheme == $leg)
-  ' <<<"$nodes" >/dev/null 2>&1; then
-    nodes=$(jq -c --argjson leg "$LEGACY_ANYTLS_PADDING_JSON" '
-      map(if .protocol == "anytls" and (.padding_scheme // null) != null and .padding_scheme == $leg then del(.padding_scheme) else . end)
-    ' <<<"$nodes")
-    modified=1
-  fi
-
-  # 2. 检查当前 config.json 中 AnyTLS 默认节点是否需要同步更新
+  # 旧默认规则的迁移由 ensure_state_schema 统一处理；此处只检查运行配置。
   local current_default_pad need_refresh_config=0
   current_default_pad=$(get_default_padding_scheme_json)
 
-  if (( modified )); then
-    need_refresh_config=1
-  elif [[ -s "$CONFIG_FILE" ]]; then
+  if [[ -s "$CONFIG_FILE" ]]; then
     local default_ports
     default_ports=$(jq -c '[.[]? | select(.protocol == "anytls" and ((.padding_scheme // null) == null or (.padding_scheme | length) == 0)) | .port]' <<<"$nodes" 2>/dev/null || echo "[]")
     if [[ "$default_ports" != "[]" && -n "$default_ports" ]]; then
@@ -4871,12 +4894,6 @@ sync_anytls_default_padding() {
       info "检测到 AnyTLS 默认混淆规则变更或需同步，正在自动生成新配置并重载服务..."
       save_nodes_json "$nodes"
       ok "AnyTLS 默认混淆规则已自动同步更新并重载生效！"
-    elif (( modified )); then
-      local tmp
-      tmp=$(mktemp)
-      jq --argjson nodes "$nodes" '.nodes = $nodes' "$STATE_FILE" >"$tmp"
-      install -m 0600 "$tmp" "$STATE_FILE"
-      rm -f "$tmp"
     fi
   fi
 }
@@ -7128,8 +7145,10 @@ PY_TRAFFIC_EOF
 
 install_api_server_script() {
   install -d -m 0750 "$API_DIR"
-  traffic_collector_source > "$API_SCRIPT_FILE"
-  cat >> "$API_SCRIPT_FILE" << 'PY_SERVER_EOF'
+  local tmp
+  tmp=$(mktemp) || return 1
+  traffic_collector_source >"$tmp"
+  cat >>"$tmp" << 'PY_SERVER_EOF'
 import http.server
 import socket
 import socketserver
@@ -7285,7 +7304,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nAPI Server stopped.")
 PY_SERVER_EOF
-  chmod +x "$API_SCRIPT_FILE"
+  if ! write_managed_file "$API_SCRIPT_FILE" 0700 <"$tmp"; then rm -f "$tmp"; return 1; fi
+  rm -f "$tmp"
 }
 
 ensure_python3() {
@@ -7321,9 +7341,10 @@ ensure_python3() {
 
 ensure_api_service_file() {
   local py_bin
+  API_SERVICE_FILE_CHANGED=0
   py_bin=$(command -v python3 || echo "/usr/bin/python3")
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    cat > "/etc/systemd/system/${API_SYSTEMD_SERVICE}" <<EOF
+    write_managed_file "/etc/systemd/system/${API_SYSTEMD_SERVICE}" 0644 <<EOF || return 1
 [Unit]
 Description=sbox Traffic API Server
 After=network.target sing-box.service
@@ -7344,10 +7365,9 @@ StandardError=journal
 [Install]
 WantedBy=multi-user.target
 EOF
-    service_daemon_reload
   else
     local rc_file="/etc/init.d/sbox-api"
-    cat > "$rc_file" <<EOF
+    write_managed_file "$rc_file" 0755 <<EOF || return 1
 #!/sbin/openrc-run
 description="sbox Traffic API Server"
 command="${py_bin}"
@@ -7366,8 +7386,9 @@ depend() {
   after sing-box
 }
 EOF
-    chmod 0755 "$rc_file"
   fi
+  API_SERVICE_FILE_CHANGED=$MANAGED_FILE_CHANGED
+  if (( API_SERVICE_FILE_CHANGED )); then service_daemon_reload; fi
 }
 
 install_api_service() {
@@ -7424,15 +7445,13 @@ restart_api_service() {
 
 refresh_api_service() {
   [[ -f "$API_SCRIPT_FILE" ]] || return 0
-  # 升级旧 API 脚本时保持启停状态，已迁移的服务不重复重启。
-  if ! grep -q '^TRAFFIC_COLLECTOR_VERSION = 2$' "$API_SCRIPT_FILE"; then
-    local running=0
-    service_is_running "$API_SYSTEMD_SERVICE" && running=1
-    install_api_server_script
-    ensure_api_service_file
-    if (( running )); then
-      service_restart "$API_SYSTEMD_SERVICE"
-    fi
+  local running=0 script_changed=0
+  service_is_running "$API_SYSTEMD_SERVICE" && running=1
+  install_api_server_script || return 1
+  script_changed=$MANAGED_FILE_CHANGED
+  ensure_api_service_file || return 1
+  if (( running && (script_changed || ${API_SERVICE_FILE_CHANGED:-0}) )); then
+    service_restart "$API_SYSTEMD_SERVICE" || return 1
   fi
 }
 
@@ -8227,6 +8246,58 @@ uninstall_flow() {
   exit 0
 }
 
+sync_after_script_update() (
+  # 由安装后的新版本统一迁移；保留旧入口，兼容旧版更新程序的调用。
+  require_root
+  detect_os
+  migrate_legacy_state || exit 1
+  # 子进程内变量不使用 local，确保退出清理时仍可读取回滚状态。
+  work_dir="" state_committed=0 had_state=0 running=0 health_running=0 unit_changed=0
+  work_dir=$(mktemp -d) || exit 1
+  trap 'result=$?; if (( ! state_committed && had_state )); then cp -a "$work_dir/state.json" "$STATE_FILE" || result=1; fi; rm -rf "$work_dir"; exit "$result"' EXIT
+  if [[ -f "$STATE_FILE" ]]; then
+    cp -a "$STATE_FILE" "$work_dir/state.json" || exit 1
+    had_state=1
+    if ! jq -e '.nodes | type == "array"' "$STATE_FILE" >/dev/null 2>&1; then
+      warn "节点状态文件无效，已保留现有配置。"
+      exit 1
+    fi
+  fi
+  ensure_state_schema || exit 1
+  service_is_running "$SYSTEMD_SERVICE" && running=1
+  service_is_running "$OUTBOUND_HEALTH_SERVICE" && health_running=1
+  if state_has_nodes && [[ -s "$CONFIG_FILE" ]]; then
+    command -v sing-box >/dev/null 2>&1 || { warn "未找到 sing-box 核心，无法同步运行配置。"; exit 1; }
+    generate_config_from_state "$work_dir/config.json" "$STATE_FILE" || exit 1
+    jq -S . "$work_dir/config.json" >"$work_dir/new.json" || exit 1
+    jq -S . "$CONFIG_FILE" >"$work_dir/current.json" || exit 1
+    if ! cmp -s "$work_dir/new.json" "$work_dir/current.json"; then
+      info "检测到运行配置变化，正在校验并应用……"
+      apply_config "$work_dir/config.json" 1 || exit 1
+    else
+      # 配置未变时只更新过时的服务模板，保持原有启停和开机启用状态。
+      sing-box check -c "$work_dir/config.json" || exit 1
+      ensure_service_file 1 || exit 1
+      unit_changed=${CORE_SERVICE_FILE_CHANGED:-0}
+      if (( running && unit_changed )); then apply_config "$work_dir/config.json" 1 || exit 1; fi
+    fi
+  fi
+  state_committed=1
+  # 不重建 nft/tc 规则；需要重启时由服务的启动钩子恢复流量规则。
+  if [[ -r "$STATE_FILE" ]]; then sync_traffic_cron || exit 1; fi
+  if [[ -f "$DEPLOY_HOOK" ]] || { [[ -r "$STATE_FILE" ]] && jq -e 'any(.nodes[]?; (.protocol // "anytls") == "anytls" or .protocol == "trojan" or .protocol == "hysteria2" or (.protocol == "http" and .tls == true))' "$STATE_FILE" >/dev/null 2>&1; }; then
+    install_deploy_hook || exit 1
+  fi
+  if [[ -r "$DNSPOD_CREDENTIAL_FILE" ]]; then install_dnspod_hooks || exit 1; fi
+  if [[ -r "$CF_CREDENTIAL_FILE" ]]; then install_cf_hooks || exit 1; fi
+  sync_outbound_health_service 1 "$health_running" || exit 1
+  refresh_api_service || exit 1
+  if state_has_nodes && ! is_ntp_service_active; then
+    warn "未检测到运行中的校时服务，请检查系统时间；脚本更新不会安装校时软件或强制修改时间。"
+  fi
+  ok "更新后同步完成：配置与附属文件按需更新，保留原有服务启停状态。"
+)
+
 update_self_script() {
   local mode="${1:-cli}"
   require_root
@@ -8235,9 +8306,6 @@ update_self_script() {
   local tmp_file ts
   ts=$(date +%s)
   tmp_file=$(mktemp "/tmp/sbox_update_XXXXXX.sh" 2>/dev/null || echo "/tmp/sbox_update_$$.sh")
-
-  # 发送 purge 请求以清理 jsdelivr 边缘缓存
-  curl -fsSL -m 3 "https://purge.jsdelivr.net/gh/elunez/sbox@main/sbox.sh" >/dev/null 2>&1 || true
 
   local raw_urls=(
     "https://raw.githubusercontent.com/elunez/sbox/main/sbox.sh?v=${ts}"
@@ -8304,7 +8372,7 @@ update_self_script() {
   fi
 
   install -d -m 0755 /usr/local/bin /usr/bin
-  install -m 0755 "$tmp_file" "$SCRIPT_INSTALL_PATH"
+  if ! install -m 0755 "$tmp_file" "$SCRIPT_INSTALL_PATH"; then rm -f "$tmp_file"; return 1; fi
   ln -sf "$SCRIPT_INSTALL_PATH" "$SCRIPT_SYMLINK_PATH" 2>/dev/null || true
 
   local real_self
@@ -8318,7 +8386,7 @@ update_self_script() {
   ok "sbox 脚本已成功更新至 v${remote_version}！"
 
   # 自动同步远端 AnyTLS 默认混淆策略配置文件 (anytls_padding.conf)
-  local pad_tmp
+  local pad_tmp pad_downloaded=0
   pad_tmp=$(mktemp "/tmp/sbox_pad_XXXXXX.conf" 2>/dev/null || echo "/tmp/sbox_pad_$$.conf")
   local pad_urls=(
     "https://raw.githubusercontent.com/elunez/sbox/main/conf/anytls_padding.conf?v=${ts}"
@@ -8333,31 +8401,19 @@ update_self_script() {
       if parsed_pad=$(parse_padding_scheme_file "$pad_tmp" 2>/dev/null) && jq -e 'type == "array" and length > 0' <<<"$parsed_pad" >/dev/null 2>&1; then
         if ! cmp -s "$pad_tmp" "$PADDING_CONF_FILE" 2>/dev/null; then
           install -d -m 0700 "$STATE_DIR"
-          install -m 0644 "$pad_tmp" "$PADDING_CONF_FILE"
+          if ! install -m 0644 "$pad_tmp" "$PADDING_CONF_FILE"; then rm -f "$pad_tmp"; return 1; fi
           info "检测到远端 AnyTLS 混淆策略配置文件更新，已同步至本地。"
         fi
+        pad_downloaded=1
         break
       fi
     fi
     rm -f "$pad_tmp"
   done
   rm -f "$pad_tmp"
+  if (( ! pad_downloaded )); then warn "远端 AnyTLS 混淆规则下载或校验失败，继续使用本地规则。"; fi
 
-  # 自动同步刷新定时任务、证书续期钩子与防火墙规则
-  if service_is_installed || [[ -r "$STATE_FILE" ]]; then
-    ensure_time_sync_service 2>/dev/null || true
-    install_deploy_hook 2>/dev/null || true
-    [[ -r "$DNSPOD_CREDENTIAL_FILE" ]] && install_dnspod_hooks 2>/dev/null || true
-    [[ -r "$CF_CREDENTIAL_FILE" ]] && install_cf_hooks 2>/dev/null || true
-    sync_traffic_cron 2>/dev/null || true
-    sync_traffic_rules 2>/dev/null || true
-    sync_anytls_default_padding 2>/dev/null || true
-    migrate_outbound_health_config 2>/dev/null || true
-    sync_outbound_health_service 2>/dev/null || true
-    info "后台定时重置任务、时间同步与证书续签钩子已同步刷新。"
-  fi
-
-  # 使用新脚本自身迁移配置，旧版本也能立即接入新增的 REALITY 等设置。
+  # 旧进程只下载和安装，由新脚本一次性同步配置与附属文件。
   if [[ -x "$SCRIPT_INSTALL_PATH" ]]; then
     if ! "$SCRIPT_INSTALL_PATH" --migrate-outbound-health; then
       warn "脚本已更新，但运行配置同步失败，请检查报错后重新运行 sbox。"
@@ -8374,9 +8430,9 @@ update_self_script() {
     info "正在自动打开 sbox 管理面板..."
     sleep 1
     if [[ -x "$SCRIPT_INSTALL_PATH" ]]; then
-      exec "$SCRIPT_INSTALL_PATH"
+      SBOX_UPDATE_SYNC_DONE=1 exec "$SCRIPT_INSTALL_PATH"
     else
-      exec "$0"
+      SBOX_UPDATE_SYNC_DONE=1 exec "$0"
     fi
   else
     ok "sbox 命令行工具已更新完成。"
@@ -8654,16 +8710,7 @@ main() {
       exit 0
       ;;
     --migrate-outbound-health)
-      require_root
-      detect_os
-      migrate_legacy_state
-      ensure_state_schema
-      if state_has_nodes && [[ -s "$CONFIG_FILE" ]]; then
-        migrate_outbound_health_config || exit 1
-      fi
-      sync_outbound_health_service 2>/dev/null || true
-      refresh_api_service
-      exit 0
+      sync_after_script_update
       ;;
     --check-traffic-reset)
       require_root
