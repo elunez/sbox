@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.51"
+readonly SCRIPT_VERSION="0.0.52"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -8295,13 +8295,12 @@ sync_after_script_update() (
   if state_has_nodes && ! is_ntp_service_active; then
     warn "未检测到运行中的校时服务，请检查系统时间；脚本更新不会安装校时软件或强制修改时间。"
   fi
-  ok "更新后同步完成：配置与附属文件按需更新，保留原有服务启停状态。"
+  exit 0
 )
 
 update_self_script() {
   local mode="${1:-cli}"
   require_root
-  echo
   info "正在检查 sbox 脚本更新..."
   local tmp_file ts
   ts=$(date +%s)
@@ -8383,7 +8382,6 @@ update_self_script() {
   fi
 
   rm -f "$tmp_file"
-  ok "sbox 脚本已成功更新至 v${remote_version}！"
 
   # 自动同步远端 AnyTLS 默认混淆策略配置文件 (anytls_padding.conf)
   local pad_tmp pad_downloaded=0
@@ -8420,14 +8418,14 @@ update_self_script() {
       return 1
     fi
   fi
+  ok "sbox 已更新至 v${remote_version}，配置同步完成。"
 
   if [[ "$mode" == "silent" || "$mode" == "quiet" ]]; then
     return 0
   fi
 
   if [[ -t 0 ]]; then
-    echo
-    info "正在自动打开 sbox 管理面板..."
+    info "正在打开 sbox 管理面板..."
     sleep 1
     if [[ -x "$SCRIPT_INSTALL_PATH" ]]; then
       SBOX_UPDATE_SYNC_DONE=1 exec "$SCRIPT_INSTALL_PATH"
@@ -8435,7 +8433,6 @@ update_self_script() {
       SBOX_UPDATE_SYNC_DONE=1 exec "$0"
     fi
   else
-    ok "sbox 命令行工具已更新完成。"
     return 0
   fi
 }
