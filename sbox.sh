@@ -5,7 +5,7 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.49"
+readonly SCRIPT_VERSION="0.0.50"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
@@ -89,6 +89,7 @@ REALITY_PUBLIC_KEY=""
 REALITY_SHORT_ID=""
 REALITY_HANDSHAKE_SERVER="www.iq.com"
 REALITY_HANDSHAKE_PORT="443"
+REALITY_MAX_TIME_DIFFERENCE=""
 TRAFFIC_LIMIT=""
 TRAFFIC_RESET_DAY=""
 SKIP_PROTOCOL_PROMPT=0
@@ -663,6 +664,10 @@ outbound_health_config_ready() {
     and any(.dns.servers[]?; .tag == "sbox-system" and
       (if $dns_level >= 1 then .type == "local" and (if $dns_level >= 2 then .prefer_go == true else .prefer_go == null end) else .address == "local" end))
     and (if $dns_level < 3 then .dns.independent_cache == true else .dns.independent_cache == null end)
+    and (([.inbounds[]? | select(.type == "vless" and .tls.reality.enabled == true) |
+      {tag, max_time_difference:(.tls.reality.max_time_difference // "")}] | sort_by(.tag)) ==
+      ([$state[0].nodes | to_entries[] | select(.value.protocol == "vless-reality") |
+        {tag:("in-" + ((.key + 1)|tostring)), max_time_difference:(.value.reality.max_time_difference // "1m")} ] | sort_by(.tag)))
     and (([.dns.servers[]? | select(.tag | startswith("dns-")) | {tag,server:(.server // .address)}] | sort_by(.tag)) ==
       ([$state[0].nodes | to_entries[] | select((.value.dns.mode // "system") == "custom") |
         {tag:("dns-" + ((.key + 1)|tostring)),server:(if $dns_level >= 1 then .value.dns.server else
@@ -688,8 +693,12 @@ migrate_outbound_health_config() {
     return 1
   fi
   if command -v sing-box >/dev/null 2>&1 && sing-box check -c "$candidate" >/dev/null 2>&1; then
-    info "检测到 DNS 或出口健康路由需要同步，正在更新配置并平滑重载……"
+    info "检测到 DNS、REALITY 或出口健康路由需要同步，正在更新配置并重载……"
     apply_config "$candidate"
+  else
+    rm -f "$candidate"
+    warn "配置同步预检未通过，保留现有运行配置，请检查 sing-box 核心与节点设置。"
+    return 1
   fi
   rm -f "$candidate"
 }
@@ -3494,6 +3503,11 @@ collect_traffic_settings() {
   fi
 }
 
+validate_reality_max_time_difference() {
+  # 支持常用 Go duration 整数单位和组合；空字符串或 0s 关闭校验。
+  [[ -z "$1" || "$1" =~ ^([0-9]+(ms|s|m|h))+$ ]]
+}
+
 collect_reality_settings() {
   local old=${1:-} keypair priv pub
   NODE_UUID=$(jq -r '.uuid // empty' <<<"${old:-"{}"}")
@@ -3505,6 +3519,8 @@ collect_reality_settings() {
   REALITY_SHORT_ID=$(jq -r '.reality.short_id // empty' <<<"${old:-"{}"}")
   REALITY_HANDSHAKE_SERVER=$(jq -r '.reality.handshake_server // "www.iq.com"' <<<"${old:-"{}"}")
   REALITY_HANDSHAKE_PORT=$(jq -r '.reality.handshake_port // 443' <<<"${old:-"{}"}")
+  REALITY_MAX_TIME_DIFFERENCE=${REALITY_MAX_TIME_DIFFERENCE:-$(jq -r '.reality.max_time_difference // "1m"' <<<"${old:-"{}"}")}
+  validate_reality_max_time_difference "$REALITY_MAX_TIME_DIFFERENCE" || die "REALITY 时间偏差无效，请使用 1m、30s、2m30s 或 0s（关闭）。"
   if [[ -z "$REALITY_PRIVATE_KEY" || -z "$REALITY_PUBLIC_KEY" ]]; then
     keypair=$(generate_reality_keypair)
     priv=$(echo "$keypair" | awk '{print $1}')
@@ -4060,8 +4076,9 @@ collect_node_json() {
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
         --arg uuid "$NODE_UUID" --arg private_key "$REALITY_PRIVATE_KEY" --arg public_key "$REALITY_PUBLIC_KEY" \
         --arg short_id "$REALITY_SHORT_ID" --arg handshake_server "$REALITY_HANDSHAKE_SERVER" --argjson handshake_port "$REALITY_HANDSHAKE_PORT" \
+        --arg max_time_difference "$REALITY_MAX_TIME_DIFFERENCE" \
         --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,uuid:$uuid,reality:{private_key:$private_key,public_key:$public_key,short_id:$short_id,handshake_server:$handshake_server,handshake_port:$handshake_port},traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,uuid:$uuid,reality:{private_key:$private_key,public_key:$public_key,short_id:$short_id,handshake_server:$handshake_server,handshake_port:$handshake_port,max_time_difference:$max_time_difference},traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     shadowsocks)
       node_json=$(jq -cn --arg name "$NODE_NAME" --arg protocol "$PROTOCOL" --arg domain "$NODE_DOMAIN" --argjson port "$NODE_PORT" \
@@ -4139,6 +4156,9 @@ ensure_state_schema() {
         outbound: (if (.outbound.type // "direct") == "ss" then (.outbound + {type:"shadowsocks"}) else (.outbound // {type:"direct"}) end),
         dns: (if has("dns") then .dns else {mode:"system"} end)
       } |
+      if .protocol == "vless-reality" and ((.reality // {}) | has("max_time_difference") | not) then
+        .reality.max_time_difference = "1m"
+      else . end |
       .backup_outbounds = (
         [.backup_outbounds[]? | select(type == "object" and (.type // "direct") != "direct")]
         + (if any(.backup_outbounds[]?; type == "object" and (.type // "direct") == "direct") then [{type:"direct"}] else [] end)
@@ -4254,6 +4274,8 @@ validate_nodes_state() {
       vless-reality)
         validate_uuid "$(jq -r '.uuid // empty' <<<"$node")" || die "VLESS UUID 无效。"
         [[ -n "$(jq -r '.reality.private_key // empty' <<<"$node")" && -n "$(jq -r '.reality.public_key // empty' <<<"$node")" ]] || die "REALITY 密钥不能为空。"
+        jq -e '(.reality | has("max_time_difference") | not) or (.reality.max_time_difference | type == "string")' <<<"$node" >/dev/null || die "REALITY max_time_difference 必须为时长字符串。"
+        validate_reality_max_time_difference "$(jq -r '.reality.max_time_difference // "1m"' <<<"$node")" || die "REALITY 时间偏差无效，请使用 1m、30s、2m30s 或 0s（关闭）。"
         ;;
       shadowsocks)
         validate_ss_method "$(jq -r '.method // empty' <<<"$node")" || die "Shadowsocks 加密方法无效。"
@@ -4415,7 +4437,8 @@ generate_config_from_state() {
                 server_port: $n.reality.handshake_port
               },
               private_key: $n.reality.private_key,
-              short_id: [$n.reality.short_id]
+              short_id: [$n.reality.short_id],
+              max_time_difference: ($n.reality.max_time_difference // "1m")
             }
           }
         }
@@ -5383,6 +5406,9 @@ print_node_summary_card() {
   printf "  监听端口: %s\n" "$port"
   printf "  连接地址: %s\n" "$domain"
   printf "  认证凭据: %s\n" "$cred_str"
+  if [[ "$raw_proto" == "vless-reality" ]]; then
+    printf "  REALITY 时间偏差: %s\n" "$(jq -r '.reality.max_time_difference // "1m" | if . == "" or test("^([0]+(ms|s|m|h))+$") then "关闭" else . end' <<<"$node")"
+  fi
   if [[ -n "$pad_str" ]]; then
     printf "  混淆策略: %s\n" "$pad_str"
   fi
@@ -5564,8 +5590,9 @@ edit_node_protocol() {
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
         --arg uuid "$new_uuid" --arg private_key "$new_priv" --arg public_key "$new_pub" \
         --arg short_id "$new_sid" --arg handshake_server "$new_hs_server" --argjson handshake_port "$new_hs_port" \
+        --arg max_time_difference "$REALITY_MAX_TIME_DIFFERENCE" \
         --argjson traffic "$traffic" --argjson outbound "$outbound" --argjson backup_outbounds "$backup_outbounds" \
-        '{name:$name,protocol:$protocol,domain:$domain,port:$port,uuid:$uuid,reality:{private_key:$private_key,public_key:$public_key,short_id:$short_id,handshake_server:$handshake_server,handshake_port:$handshake_port},traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
+        '{name:$name,protocol:$protocol,domain:$domain,port:$port,uuid:$uuid,reality:{private_key:$private_key,public_key:$public_key,short_id:$short_id,handshake_server:$handshake_server,handshake_port:$handshake_port,max_time_difference:$max_time_difference},traffic:$traffic,outbound:$outbound,backup_outbounds:$backup_outbounds}')
       ;;
     shadowsocks)
       new_node=$(jq -cn --arg name "$name" --arg protocol "$new_proto" --arg domain "$new_domain" --argjson port "$new_port" \
@@ -5766,8 +5793,9 @@ edit_node_credentials() {
       printf "  2) 重新生成 REALITY 密钥对与 Short ID\n"
       printf "  3) 修改 REALITY 握手伪装域名及端口\n"
       printf "  4) 自定义全部 REALITY 参数\n"
+      printf "  5) 修改 REALITY 最大时间偏差\n"
       printf "  0) 取消返回\n"
-      prompt_value r_sub_choice "请选择 [0-4，默认: 1]" "1"
+      prompt_value r_sub_choice "请选择 [0-5，默认: 1]" "1"
       case "$r_sub_choice" in
         1)
           local new_u=""
@@ -5806,9 +5834,19 @@ edit_node_credentials() {
           REALITY_HANDSHAKE_SERVER="$cur_server"
           REALITY_HANDSHAKE_PORT="$cur_port"
           collect_reality_settings "$old" || return 0
+          prompt_value REALITY_MAX_TIME_DIFFERENCE "REALITY 最大时间偏差（如 1m、30s，0s 关闭）" "$REALITY_MAX_TIME_DIFFERENCE"
+          validate_reality_max_time_difference "$REALITY_MAX_TIME_DIFFERENCE" || { warn "REALITY 时间偏差格式无效。"; return 0; }
           new_node=$(jq -c --arg u "$NODE_UUID" --arg priv "$REALITY_PRIVATE_KEY" --arg pub "$REALITY_PUBLIC_KEY" \
             --arg sid "$REALITY_SHORT_ID" --arg s "$REALITY_HANDSHAKE_SERVER" --argjson p "$REALITY_HANDSHAKE_PORT" \
-            '.uuid = $u | .reality.private_key = $priv | .reality.public_key = $pub | .reality.short_id = $sid | .reality.handshake_server = $s | .reality.handshake_port = $p' <<<"$old")
+            --arg max_time_difference "$REALITY_MAX_TIME_DIFFERENCE" \
+            '.uuid = $u | .reality.private_key = $priv | .reality.public_key = $pub | .reality.short_id = $sid | .reality.handshake_server = $s | .reality.handshake_port = $p | .reality.max_time_difference = $max_time_difference' <<<"$old")
+          ;;
+        5)
+          local time_difference
+          time_difference=$(jq -r '.reality.max_time_difference // "1m" | if . == "" then "0s" else . end' <<<"$old")
+          prompt_value time_difference "REALITY 最大时间偏差（如 1m、30s，0s 关闭）" "$time_difference"
+          validate_reality_max_time_difference "$time_difference" || { warn "REALITY 时间偏差格式无效。"; return 0; }
+          new_node=$(jq -c --arg value "$time_difference" '.reality.max_time_difference = $value' <<<"$old")
           ;;
         0|"") return 0 ;;
         *) warn "无效选择。"; return 0 ;;
@@ -8319,9 +8357,12 @@ update_self_script() {
     info "后台定时重置任务、时间同步与证书续签钩子已同步刷新。"
   fi
 
-  # 使用新脚本自身执行一次迁移，确保旧版本升级后立即接入出口健康监控。
+  # 使用新脚本自身迁移配置，旧版本也能立即接入新增的 REALITY 等设置。
   if [[ -x "$SCRIPT_INSTALL_PATH" ]]; then
-    "$SCRIPT_INSTALL_PATH" --migrate-outbound-health >/dev/null 2>&1 || true
+    if ! "$SCRIPT_INSTALL_PATH" --migrate-outbound-health; then
+      warn "脚本已更新，但运行配置同步失败，请检查报错后重新运行 sbox。"
+      return 1
+    fi
   fi
 
   if [[ "$mode" == "silent" || "$mode" == "quiet" ]]; then
@@ -8457,6 +8498,7 @@ usage() {
   --shadowtls-password P  ShadowTLS v3 密码
   --shadowtls-server HOST ShadowTLS 握手域名 / SNI (默认 www.microsoft.com)
   --shadowtls-port PORT   ShadowTLS 握手服务器端口 (默认 443)
+  --reality-max-time-difference TIME  REALITY 服务端最大时间偏差 (默认 1m，0s 关闭)
   --dns-mode MODE         节点 DNS 模式 (system / custom，默认 system)
   --dns-server IP         自定义 DNS 服务器 IP (UDP 53)
   --dns-strategy MODE     域名地址策略 (default / ipv4_only / prefer_ipv4 / ipv6_only / prefer_ipv6)
@@ -8499,6 +8541,7 @@ parse_options() {
       --shadowtls-password) [[ $# -ge 2 ]] || die "--shadowtls-password 缺少值"; SHADOWTLS_PASSWORD=$2; shift 2;;
       --shadowtls-server) [[ $# -ge 2 ]] || die "--shadowtls-server 缺少值"; SHADOWTLS_SERVER=$2; shift 2;;
       --shadowtls-port) [[ $# -ge 2 ]] || die "--shadowtls-port 缺少值"; SHADOWTLS_PORT=$2; shift 2;;
+      --reality-max-time-difference) [[ $# -ge 2 && -n "$2" ]] || die "--reality-max-time-difference 缺少值"; REALITY_MAX_TIME_DIFFERENCE=$2; validate_reality_max_time_difference "$REALITY_MAX_TIME_DIFFERENCE" || die "REALITY 时间偏差无效，请使用 1m、30s、2m30s 或 0s（关闭）。"; shift 2;;
       --dns-mode) [[ $# -ge 2 ]] || die "--dns-mode 缺少值"; DNS_MODE=$2; [[ "$DNS_MODE" == "system" || "$DNS_MODE" == "custom" ]] || die "DNS 模式仅支持 system 或 custom。"; shift 2;;
       --dns-server) [[ $# -ge 2 ]] || die "--dns-server 缺少值"; DNS_SERVER=$2; shift 2;;
       --dns-strategy) [[ $# -ge 2 ]] || die "--dns-strategy 缺少值"; DNS_STRATEGY=$2; [[ "$DNS_STRATEGY" =~ ^(default|ipv4_only|prefer_ipv4|ipv6_only|prefer_ipv6)$ ]] || die "域名地址策略仅支持 default、ipv4_only、prefer_ipv4、ipv6_only、prefer_ipv6。"; shift 2;;
@@ -8615,7 +8658,9 @@ main() {
       detect_os
       migrate_legacy_state
       ensure_state_schema
-      migrate_outbound_health_config 2>/dev/null || true
+      if state_has_nodes && [[ -s "$CONFIG_FILE" ]]; then
+        migrate_outbound_health_config || exit 1
+      fi
       sync_outbound_health_service 2>/dev/null || true
       refresh_api_service
       exit 0

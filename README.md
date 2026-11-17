@@ -63,6 +63,14 @@
 5. `standalone` 模式临时监听 TCP 80 端口，适合未安装网站环境的机器；
 4. VLESS REALITY 协议使用真实网站域名（默认 `www.iq.com`）伪装 SNI 握手，无需本地签发证书；已有节点保存的握手域名会保留。分享链接、客户端配置及 REALITY 出口默认使用 Safari 指纹（`safari`）；明确设置的 `client-fingerprint` 会保留。ShadowTLS 客户端配置的默认指纹同样为 `safari`。
 
+### REALITY 握手时间校验
+
+从 `0.0.50` 起，REALITY 服务端默认设置 `max_time_difference: "1m"`，允许客户端与服务端最多相差 1 分钟。它缩小旧握手可通过时间检查的窗口，不替代 REALITY 认证，也不单独保证防重放。服务器与客户端均应启用自动校时；时间偏差超过阈值会导致合法连接失败。
+
+发布新版后，在服务器执行 `sudo sbox update`，更新程序会调用新脚本迁移已有配置：仅给缺少该字段的 REALITY 节点补上 `1m`，保留已保存的自定义值、空字符串或 `0s` 关闭设置；配置通过核心检查后才应用，并沿用配置备份和启动失败回滚流程。不改 UUID、REALITY 密钥、Short ID 或分享链接，不需要重新导入客户端。仅更新脚本，不升级 sing-box 核心。
+
+可在「节点管理 → 修改配置 → 认证凭据 → 修改 REALITY 最大时间偏差」中修改，节点摘要会显示当前值。支持 `30s`、`2m`、`2m30s` 等整数时长，`0s` 关闭校验。新建节点不增加提问，采用默认值；命令行安装可加 `--reality-max-time-difference 30s`。此参数只写入服务端 REALITY 入站，不写入代理出口或客户端参考配置。字段含义见 [sing-box 文档](https://sing-box.sagernet.org/configuration/shared/tls/#max_time_difference)。
+
 ## 快速安装与使用
 
 安装基础下载工具（Debian/Ubuntu 最小化系统）：
