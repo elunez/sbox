@@ -5,12 +5,14 @@ umask 077
 ORIG_CLI_ARGS=("$@")
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="0.0.52"
+readonly SCRIPT_VERSION="0.0.53"
 readonly SCRIPT_INSTALL_PATH="/usr/local/bin/sbox"
 readonly SCRIPT_SYMLINK_PATH="/usr/bin/sbox"
 
 readonly DEFAULT_ANYTLS_PADDING_JSON='["stop=8","0=32-80","1=80-240","2=200-480,c,240-580,c,100-280","3=60-180,c,100-260","4=80-220","5=56-180","6=40-150","7=28-120"]'
 readonly LEGACY_ANYTLS_PADDING_JSON='["stop=8","0=32-76","1=84-252","2=204-508,c,276-668,c,116-332","3=68-204,c,124-324","4=88-268","5=60-204","6=44-172","7=28-140"]'
+
+readonly DEFAULT_REALITY_HANDSHAKE_SERVER="www.iq.com"
 
 readonly CONFIG_DIR="${CONFIG_DIR:-/etc/sing-box}"
 readonly CONFIG_FILE="${CONFIG_FILE:-${CONFIG_DIR}/config.json}"
@@ -87,7 +89,7 @@ NODE_UUID=""
 REALITY_PRIVATE_KEY=""
 REALITY_PUBLIC_KEY=""
 REALITY_SHORT_ID=""
-REALITY_HANDSHAKE_SERVER="www.iq.com"
+REALITY_HANDSHAKE_SERVER="$DEFAULT_REALITY_HANDSHAKE_SERVER"
 REALITY_HANDSHAKE_PORT="443"
 REALITY_MAX_TIME_DIFFERENCE=""
 TRAFFIC_LIMIT=""
@@ -1092,12 +1094,20 @@ prompt_value() {
     return
   fi
   if [[ -n "$default" ]]; then
-    read -r -p "${label} [默认: ${default}]: " value
+    read -r -p "${label} [${4:-默认: ${default}}]: " value
     value=${value:-$default}
   else
     read -r -p "${label}: " value
   fi
   printf -v "$target" "%s" "$value"
+}
+
+prompt_reality_server() {
+  if [[ "$3" == "$DEFAULT_REALITY_HANDSHAKE_SERVER" ]]; then
+    prompt_value "$1" "$2" "$3" "回车使用默认域名"
+  else
+    prompt_value "$1" "$2" "$3"
+  fi
 }
 
 prompt_secret() {
@@ -1517,10 +1527,13 @@ EOF_PY
     vless-reality)
       printf "  UUID:       %s\n" "$(jq -r '.uuid' <<<"$parsed_json")"
       printf "  REALITY公钥:%s\n" "$(jq -r '.public_key' <<<"$parsed_json")"
-      local sid
+      local sid reality_sni
       sid=$(jq -r '.short_id // empty' <<<"$parsed_json")
       [[ -n "$sid" ]] && printf "  Short ID:   %s\n" "$sid"
-      printf "  伪装域名:   %s\n" "$(jq -r '.server_name' <<<"$parsed_json")"
+      reality_sni=$(jq -r '.server_name' <<<"$parsed_json")
+      if [[ "$reality_sni" != "$DEFAULT_REALITY_HANDSHAKE_SERVER" ]]; then
+        printf "  伪装域名:   %s\n" "$reality_sni"
+      fi
       ;;
     socks5|http)
       local u_name
@@ -3537,7 +3550,7 @@ collect_reality_settings() {
   REALITY_PRIVATE_KEY=$(jq -r '.reality.private_key // empty' <<<"${old:-"{}"}")
   REALITY_PUBLIC_KEY=$(jq -r '.reality.public_key // empty' <<<"${old:-"{}"}")
   REALITY_SHORT_ID=$(jq -r '.reality.short_id // empty' <<<"${old:-"{}"}")
-  REALITY_HANDSHAKE_SERVER=$(jq -r '.reality.handshake_server // "www.iq.com"' <<<"${old:-"{}"}")
+  REALITY_HANDSHAKE_SERVER=$(jq -r --arg default "$DEFAULT_REALITY_HANDSHAKE_SERVER" '.reality.handshake_server // $default' <<<"${old:-"{}"}")
   REALITY_HANDSHAKE_PORT=$(jq -r '.reality.handshake_port // 443' <<<"${old:-"{}"}")
   REALITY_MAX_TIME_DIFFERENCE=${REALITY_MAX_TIME_DIFFERENCE:-$(jq -r '.reality.max_time_difference // "1m"' <<<"${old:-"{}"}")}
   validate_reality_max_time_difference "$REALITY_MAX_TIME_DIFFERENCE" || die "REALITY 时间偏差无效，请使用 1m、30s、2m30s 或 0s（关闭）。"
@@ -3551,7 +3564,7 @@ collect_reality_settings() {
   prompt_secret REALITY_PRIVATE_KEY "REALITY 私钥 (Private Key)" "$REALITY_PRIVATE_KEY"
   prompt_value REALITY_PUBLIC_KEY "REALITY 公钥 (Public Key)" "$REALITY_PUBLIC_KEY"
   prompt_value REALITY_SHORT_ID "REALITY Short ID (Hex)" "${REALITY_SHORT_ID:-$(openssl rand -hex 8)}"
-  prompt_value REALITY_HANDSHAKE_SERVER "REALITY 握手伪装域名" "$REALITY_HANDSHAKE_SERVER"
+  prompt_reality_server REALITY_HANDSHAKE_SERVER "REALITY 握手伪装域名" "$REALITY_HANDSHAKE_SERVER"
   prompt_value REALITY_HANDSHAKE_PORT "REALITY 握手端口" "$REALITY_HANDSHAKE_PORT"
   validate_host "$REALITY_HANDSHAKE_SERVER" || die "REALITY 握手域名无效。"
   validate_port "$REALITY_HANDSHAKE_PORT" || die "REALITY 握手端口无效。"
@@ -3863,13 +3876,13 @@ collect_outbound_settings() {
         server=$(jq -r '.outbound.server // empty' <<<"${old:-"{}"}")
         port=$(jq -r '.outbound.port // "443"' <<<"${old:-"{}"}")
         uuid=$(jq -r '.outbound.uuid // empty' <<<"${old:-"{}"}")
-        server_name=$(jq -r '.outbound.server_name // "www.iq.com"' <<<"${old:-"{}"}")
+        server_name=$(jq -r --arg default "$DEFAULT_REALITY_HANDSHAKE_SERVER" '.outbound.server_name // $default' <<<"${old:-"{}"}")
         public_key=$(jq -r '.outbound.public_key // empty' <<<"${old:-"{}"}")
         short_id=$(jq -r '.outbound.short_id // empty' <<<"${old:-"{}"}")
         prompt_value server "出口服务器地址" "$server"
         prompt_value port "出口端口" "$port"
         prompt_value uuid "出口 VLESS UUID" "$uuid"
-        prompt_value server_name "出口 REALITY SNI 握手域名" "$server_name"
+        prompt_reality_server server_name "出口 REALITY SNI 握手域名" "$server_name"
         prompt_value public_key "出口 REALITY 公钥" "$public_key"
         prompt_value short_id "出口 REALITY Short ID" "$short_id"
         validate_host "$server" && validate_port "$port" && validate_uuid "$uuid" || die "VLESS 出口参数无效。"
@@ -4598,7 +4611,7 @@ generate_config_from_state() {
           tls: {
             enabled: true,
             server_name: $o.server_name,
-            utls: {enabled: true, fingerprint: ($o["client-fingerprint"] // "safari")},
+            utls: {enabled: true, fingerprint: ($o["client-fingerprint"] // "chrome")},
             reality: {
               enabled: true,
               public_key: $o.public_key,
@@ -5347,8 +5360,12 @@ format_node_credential_summary() {
     vless-reality)
       local u s
       u=$(jq -r '.uuid // empty' <<<"$node")
-      s=$(jq -r '.reality.handshake_server // "www.iq.com"' <<<"$node")
-      echo "UUID: ${u:0:8}..., 伪装: ${s}"
+      s=$(jq -r '.reality.handshake_server // empty' <<<"$node")
+      if [[ -n "$s" && "$s" != "$DEFAULT_REALITY_HANDSHAKE_SERVER" ]]; then
+        echo "UUID: ${u:0:8}..., 伪装: ${s}"
+      else
+        echo "UUID: ${u:0:8}..."
+      fi
       ;;
     socks5)
       local u
@@ -5559,7 +5576,7 @@ edit_node_protocol() {
       REALITY_PRIVATE_KEY=$(jq -r '.reality.private_key // empty' <<<"$old")
       REALITY_PUBLIC_KEY=$(jq -r '.reality.public_key // empty' <<<"$old")
       REALITY_SHORT_ID=$(jq -r '.reality.short_id // empty' <<<"$old")
-      REALITY_HANDSHAKE_SERVER=$(jq -r '.reality.handshake_server // "www.iq.com"' <<<"$old")
+      REALITY_HANDSHAKE_SERVER=$(jq -r --arg default "$DEFAULT_REALITY_HANDSHAKE_SERVER" '.reality.handshake_server // $default' <<<"$old")
       REALITY_HANDSHAKE_PORT=$(jq -r '.reality.handshake_port // 443' <<<"$old")
       collect_reality_settings "$old" || return 0
       new_uuid="$NODE_UUID"
@@ -5802,7 +5819,7 @@ edit_node_credentials() {
       cur_priv=$(jq -r '.reality.private_key // empty' <<<"$old")
       cur_pub=$(jq -r '.reality.public_key // empty' <<<"$old")
       cur_sid=$(jq -r '.reality.short_id // empty' <<<"$old")
-      cur_server=$(jq -r '.reality.handshake_server // "www.iq.com"' <<<"$old")
+      cur_server=$(jq -r --arg default "$DEFAULT_REALITY_HANDSHAKE_SERVER" '.reality.handshake_server // $default' <<<"$old")
       cur_port=$(jq -r '.reality.handshake_port // 443' <<<"$old")
       echo
       printf "%s=== VLESS + REALITY 凭据修改 ===%s\n" "$C_CYAN" "$C_RESET"
@@ -5837,7 +5854,7 @@ edit_node_credentials() {
           ;;
         3)
           local s="$cur_server" p="$cur_port"
-          prompt_value s "REALITY 握手伪装域名" "$cur_server"
+          prompt_reality_server s "REALITY 握手伪装域名" "$cur_server"
           prompt_value p "REALITY 握手端口" "$cur_port"
           validate_host "$s" && validate_port "$p" || { warn "握手域名或端口无效。"; return 0; }
           new_node=$(jq -c --arg s "$s" --argjson p "$p" \
@@ -6605,7 +6622,7 @@ generate_client_outbound_json() {
       combo_pw=$(jq -r '.password' <<<"$node")
       combo_st_pw=$(jq -r '.shadowtls.password' <<<"$node")
       combo_sni=$(jq -r '.shadowtls.server_name' <<<"$node")
-      combo_fp=$(jq -r '.["client-fingerprint"] // "safari"' <<<"$node")
+      combo_fp=$(jq -r '.["client-fingerprint"] // "chrome"' <<<"$node")
       combo_st_tag="${name}-shadowtls"
       jq -n --arg tag "$name" --arg st_tag "$combo_st_tag" --arg s "$domain" --argjson p "$port" \
         --arg m "$combo_m" --arg pw "$combo_pw" --arg st_pw "$combo_st_pw" --arg sni "$combo_sni" --arg fp "$combo_fp" \
@@ -6629,7 +6646,7 @@ generate_client_outbound_json() {
       pbk=$(jq -r '.reality.public_key' <<<"$node")
       sid=$(jq -r '.reality.short_id' <<<"$node")
       sni=$(jq -r '.reality.handshake_server' <<<"$node")
-      fp=$(jq -r '.["client-fingerprint"] // "safari"' <<<"$node")
+      fp=$(jq -r '.["client-fingerprint"] // "chrome"' <<<"$node")
       jq -n --arg tag "$name" --arg s "$domain" --argjson p "$port" --arg u "$uuid" --arg pbk "$pbk" --arg sid "$sid" --arg sni "$sni" --arg fp "$fp" \
         '{type:"vless",tag:$tag,server:$s,server_port:$p,uuid:$u,flow:"xtls-rprx-vision",tls:{enabled:true,server_name:$sni,utls:{enabled:true,fingerprint:$fp},reality:{enabled:true,public_key:$pbk,short_id:$sid}},packet_encoding:"xudp"}'
       ;;
@@ -6707,7 +6724,7 @@ generate_share_link() {
       pbk=$(jq -r '.reality.public_key' <<<"$node")
       sid=$(jq -r '.reality.short_id' <<<"$node")
       sni=$(jq -jr '.reality.handshake_server' <<<"$node" | jq -sRr @uri)
-      fp=$(jq -jr '.["client-fingerprint"] // "safari"' <<<"$node" | jq -sRr @uri)
+      fp=$(jq -jr '.["client-fingerprint"] // "chrome"' <<<"$node" | jq -sRr @uri)
       printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s&type=tcp#%s\n' "$uuid" "$host" "$port" "$sni" "$fp" "$pbk" "$sid" "$name"
       ;;
     socks5|http)
@@ -6774,12 +6791,14 @@ show_client() {
         uuid=$(jq -r '.uuid' <<<"$node")
         pbk=$(jq -r '.reality.public_key' <<<"$node")
         sid=$(jq -r '.reality.short_id' <<<"$node")
-        sni=$(jq -r '.reality.handshake_server' <<<"$node")
+        sni=$(jq -r '.reality.handshake_server // empty' <<<"$node")
         printf "  UUID: %s\n" "$uuid"
         printf "  Flow: xtls-rprx-vision\n"
         printf "  REALITY 公钥: %s\n" "$pbk"
         printf "  REALITY ShortId: %s\n" "$sid"
-        printf "  伪装 SNI: %s\n" "$sni"
+        if [[ -n "$sni" && "$sni" != "$DEFAULT_REALITY_HANDSHAKE_SERVER" ]]; then
+          printf "  伪装 SNI: %s\n" "$sni"
+        fi
         ;;
       trojan)
         pass=$(jq -r '.password' <<<"$node")

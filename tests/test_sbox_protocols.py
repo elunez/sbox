@@ -36,9 +36,9 @@ def nodes():
 
 
 class ProtocolTests(unittest.TestCase):
-    def test_client_fingerprint_defaults_to_safari_and_preserves_explicit_values(self):
+    def test_client_fingerprint_defaults_to_chrome_and_preserves_explicit_values(self):
         for proto in ("vless-reality", "shadowsocks-shadowtls"):
-            for fingerprint in (None, "firefox", "chrome"):
+            for fingerprint in (None, "safari", "firefox"):
                 with self.subTest(protocol=proto, fingerprint=fingerprint):
                     node = next(item for item in nodes() if item["protocol"] == proto)
                     if fingerprint is not None:
@@ -48,11 +48,11 @@ class ProtocolTests(unittest.TestCase):
                     client = json.loads(result.stdout)
                     if isinstance(client, list):
                         client = client[1]
-                    self.assertEqual(client["tls"]["utls"], {"enabled": True, "fingerprint": fingerprint or "safari"})
+                    self.assertEqual(client["tls"]["utls"], {"enabled": True, "fingerprint": fingerprint or "chrome"})
                     if proto == "vless-reality":
                         result = bash(f'generate_share_link {shlex.quote(json.dumps(node))}')
                         self.assertEqual(result.returncode, 0, result.stderr)
-                        self.assertEqual(parse_qs(urlsplit(result.stdout.strip()).query)["fp"], [fingerprint or "safari"])
+                        self.assertEqual(parse_qs(urlsplit(result.stdout.strip()).query)["fp"], [fingerprint or "chrome"])
 
     def test_reality_keypair_parsing_without_positional_arguments(self):
         result = bash('''sing-box() {
@@ -78,6 +78,38 @@ printf '%s\\n' "$NODE_UUID" "$REALITY_PRIVATE_KEY" "$REALITY_PUBLIC_KEY" "$REALI
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.splitlines(), [old["uuid"], "test-private", "test-public",
                                                               "abcd", server or "www.iq.com", "8443"])
+
+    def test_reality_handshake_prompt_hides_builtin_default_and_accepts_input(self):
+        for server, answer, hint in (("www.iq.com", "", "回车使用默认域名"),
+                                     ("www.iq.com", "custom.example.com", "回车使用默认域名"),
+                                     ("custom.example.com", "", "默认: custom.example.com")):
+            with self.subTest(server=server, answer=answer):
+                result = bash(f'''read() {{
+  printf '%s\\n' "$3" >&2
+  builtin read "$@"
+}}
+prompt_reality_server server "REALITY 握手伪装域名" {shlex.quote(server)} <<< {shlex.quote(answer)}
+printf '%s\\n' "$server"''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr.strip(), f"REALITY 握手伪装域名 [{hint}]:")
+                self.assertEqual(result.stdout.strip(), answer or server)
+
+    def test_reality_displays_custom_sni_and_keeps_builtin_sni_in_exports(self):
+        for server in ("www.iq.com", "custom.example.com"):
+            with self.subTest(server=server):
+                node = next(item for item in nodes() if item["protocol"] == "vless-reality")
+                node["reality"]["handshake_server"] = server
+                result = bash(f'''fixture={shlex.quote(json.dumps(node))}
+current_nodes_json() {{ jq -cn --argjson node "$fixture" '[$node]'; }}
+ensure_python3() {{ :; }}
+format_node_credential_summary "$fixture"
+show_client
+parse_proxy_link "$(generate_share_link "$fixture")" imported''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for label in ("伪装: ", "伪装 SNI: ", "伪装域名:   "):
+                    self.assertEqual(label + server in result.stdout, server == "custom.example.com")
+                self.assertIn(f"sni={server}&", result.stdout)
+                self.assertIn(f'"server_name": "{server}"', result.stdout)
 
     def test_switch_anytls_to_reality_generates_keys_and_keeps_node_settings(self):
         original = nodes()[:2]
@@ -184,7 +216,10 @@ printf '%s\\n' "$parsed"''')
             outbounds.append(out)
         fixture.append({**fixture[0]})
         for index, node in enumerate(fixture):
-            node.update(name=f"节点{index}", port=20000 + index, outbound=outbounds[index],
+            primary = outbounds[index]
+            if primary["type"] == "vless-reality":
+                primary = {**primary, "client-fingerprint": "safari"}
+            node.update(name=f"节点{index}", port=20000 + index, outbound=primary,
                         backup_outbounds=outbounds[1:])
         with tempfile.TemporaryDirectory() as directory:
             state, config = Path(directory) / "state.json", Path(directory) / "config.json"
@@ -203,7 +238,8 @@ generate_config_from_state {shlex.quote(str(config))} {shlex.quote(str(state))}'
         self.assertTrue({"anytls", "trojan", "hysteria2", "shadowsocks", "shadowtls", "vless", "socks", "http", "direct", "selector"}.issubset({out["type"] for out in output["outbounds"]}))
         for outbound in output["outbounds"]:
             if outbound["type"] == "vless":
-                self.assertEqual(outbound["tls"]["utls"], {"enabled": True, "fingerprint": "safari"})
+                fingerprint = "safari" if outbound["tag"].startswith("out-") else "chrome"
+                self.assertEqual(outbound["tls"]["utls"], {"enabled": True, "fingerprint": fingerprint})
 
     def test_unsupported_link_options_fail_instead_of_silent_downgrade(self):
         uris = [
